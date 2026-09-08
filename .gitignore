@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------------------
+# Data. Never committed, without exception.
+#
+# Real invoices carry supplier names, bank-adjacent remittance text, contact
+# details, and commercial terms. Third-party corpora carry licences this repo
+# has no right to redistribute under. Both problems are permanent once a file
+# is in git history, so the whole tree is excluded and only the empty skeleton
+# is tracked.
+# ---------------------------------------------------------------------------
+# `data/**` rather than `data/`: git will not descend into an excluded
+# directory, so the negations below would never be reached. Excluding the
+# contents and re-including the directories themselves keeps the empty skeleton
+# in the repository while every document stays out of it.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# Corpora dropped at the repository root rather than under data/. They belong
+# in data/, but this catches a batch unzipped in the wrong place.
+Batch*_GoldenDataset/
+
+# Documents anywhere in the tree, belt and braces.
+*.pdf
+*.PDF
+*.tif
+*.tiff
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/index.csv
+data/**/MANIFEST.json
+
+# Model and eval outputs
+outputs/
+runs/
+*.jsonl
+.deepeval/
+.deepeval_telemetry.txt
+.deepeval-cache.json
+temp_test_run_data.json
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store

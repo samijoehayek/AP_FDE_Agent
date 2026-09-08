@@ -1,0 +1,187 @@
+[project]
+name = "ap-agent"
+version = "0.1.0"
+description = "Accounts-payable invoice processing: LLM extraction, deterministic matching, human-in-the-loop approvals, tamper-evident audit trail."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Sami Joe Hayek" }]
+
+dependencies = [
+    "alembic>=1.19.2",
+    "anthropic>=1.4.0",
+    "datasets>=5.0.1",
+    "httpx>=0.28.1",
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+    "psycopg[binary]>=3.3.5",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "pymupdf>=1.28.2",
+    "python-ulid>=4.0.1",
+    "pyyaml>=6.0.3",
+    "reportlab>=5.0.1",
+    "sqlalchemy>=2.0.52",
+    "structlog>=26.1.0",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+ap-agent = "ap_agent.cli:app"
+
+[dependency-groups]
+dev = [
+    "deepeval>=4.2.2",
+    "pre-commit>=4.6.2",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.6",
+    "types-pyyaml>=6.0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ap_agent"
+module-root = "src"
+
+# ---------------------------------------------------------------------------
+# Ruff: lint + format. Rule set is deliberately strict; every ignore is
+# justified inline so a reviewer can see what was traded away and why.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["src/ap_agent/db/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "F",     # pyflakes
+    "E", "W",# pycodestyle
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "ANN",   # flake8-annotations - every public signature is typed
+    "S",     # flake8-bandit
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "C4",    # flake8-comprehensions
+    "DTZ",   # flake8-datetimez - naive datetimes are a bug in an audit trail
+    "EM",    # flake8-errmsg
+    "ISC",   # flake8-implicit-str-concat
+    "PIE",   # flake8-pie
+    "PT",    # flake8-pytest-style
+    "RET",   # flake8-return
+    "SIM",   # flake8-simplify
+    "TC",    # flake8-type-checking
+    "ARG",   # flake8-unused-arguments
+    "PTH",   # flake8-use-pathlib
+    "ERA",   # eradicate - no commented-out code
+    "PL",    # pylint
+    "TRY",   # tryceratops
+    "FLY",   # flynt
+    "PERF",  # perflint
+    "FURB",  # refurb
+    "RUF",   # ruff-specific
+    "D",     # pydocstyle - modules in this repo document their responsibility
+]
+ignore = [
+    "D107",   # __init__ docstring: covered by the class docstring
+    "D203",   # incompatible with D211 (no blank line before class docstring)
+    "D213",   # incompatible with D212 (summary on first line)
+    "COM812", # trailing-comma-missing: conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",    # assert is the point of a test
+    "D100", "D101", "D102", "D103", "D104",  # test names carry the documentation
+    "PLR2004", # magic values are the fixtures
+    "ANN401",  # **overrides: Any is the point of a payload-building helper
+    "TC001", "TC002", "TC003",  # indirection with no runtime payoff in a test
+    "EM101", "TRY003",  # a raise in a stub is the fixture, not an error path
+]
+"scripts/**/*.py" = ["T201"]  # scripts print to stdout on purpose
+# Typer reads annotations at runtime to build the CLI, so TC00x would break these.
+"src/ap_agent/cli.py" = ["TC001", "TC002", "TC003"]
+"scripts/*.py" = ["TC001", "TC002", "TC003"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["ap_agent", "scripts"]
+
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic and SQLAlchemy resolve annotations at runtime, so an import moved into
+# a TYPE_CHECKING block breaks the model rather than tidying it. Ruff matches on
+# the base class named in the file, so this package's own bases are listed too.
+runtime-evaluated-base-classes = [
+    "pydantic.BaseModel",
+    "sqlalchemy.orm.DeclarativeBase",
+    "ap_agent.contracts.common.StrictModel",
+    "ap_agent.tools.base.ToolInput",
+    "ap_agent.tools.base.ToolOutput",
+    "ap_agent.tools.base.IdempotentToolInput",
+    "ap_agent.db.base.Base",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# Pyright: strict. No `Any` leaks out of a module boundary without a comment.
+# ---------------------------------------------------------------------------
+[tool.pyright]
+include = ["src", "tests", "scripts"]
+exclude = ["**/__pycache__", ".venv", "data", "src/ap_agent/db/migrations/versions"]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = "warning"
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+]
+markers = [
+    "db: requires a live Postgres (skipped unless DATABASE_URL is reachable)",
+    "network: reaches an external service",
+]
+filterwarnings = [
+    # A warning this project can fix is a bug this project should fix.
+    "error",
+    # ...with one exception. PyMuPDF's SWIG bindings emit these while the C
+    # extension module is being created. Promoting them to errors raises a Python
+    # exception inside module init, which SWIG cannot unwind: the interpreter
+    # segfaults on `import pymupdf`. Scoped to the three exact messages so a
+    # genuine deprecation elsewhere still fails the build.
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source_pkgs = ["ap_agent"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]

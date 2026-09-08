@@ -1,0 +1,61 @@
+# Run on every commit. `just hooks` runs them over the whole tree.
+#
+# The secrets scanner is the one that matters most here: this repository sits
+# next to an .env with an API key and a database password, and a corpus of
+# documents. gitleaks is the current maintained choice - it scans the staged
+# diff, redacts what it finds, and is a single Go binary rather than a Python
+# dependency that can conflict with the project's own.
+
+default_install_hook_types: [pre-commit, commit-msg]
+default_language_version:
+  python: python3.13
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: detect-private-key
+      # Real invoices carry PII and third-party licences. data/ is git-ignored,
+      # but `git add -f` exists and this is the backstop.
+      - id: forbid-submodules
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.411
+    hooks:
+      - id: pyright
+        # Type checking needs the project's own dependencies importable.
+        additional_dependencies: []
+        entry: uv run pyright
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: no-data-committed
+        name: refuse anything under data/
+        entry: >-
+          bash -c 'files=$(git diff --cached --name-only --diff-filter=A | grep -E "^data/" | grep -v "\.gitkeep$" || true); if [ -n "$files" ]; then echo "Refusing to commit files under data/:"; echo "$files"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
