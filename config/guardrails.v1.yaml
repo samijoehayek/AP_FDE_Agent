@@ -1,0 +1,68 @@
+# ap-agent guardrails, version 1.
+#
+# Every tolerance and every approval threshold lives here rather than in code,
+# and every MatchResult and AuditEvent records the `version` below. That is what
+# makes it possible to re-explain a decision under the rules that were actually
+# in force when it was made - so this file is never edited in place. A change
+# means a new file (guardrails.v2.yaml) and a new version string.
+#
+# PLACEHOLDER VALUES. These are shaped correctly but not calibrated. Calibration
+# comes from the golden set, not from a guess in a scaffold.
+
+version: "v1"
+base_currency: "USD"
+
+# --- Three-way match tolerances -------------------------------------------
+# Each band passes if the variance is inside EITHER the relative or the absolute
+# bound. Neither works alone: 2% of a $12 line is noise, and $5 on a $200,000
+# line is a rounding error.
+
+price_tolerance:
+  relative: 0.02        # 2% over the PO unit price
+  absolute: "5.00"      # or $5 on the line, whichever is more forgiving
+
+quantity_tolerance:
+  relative: 0.00        # over-delivery is never silently accepted
+  absolute: "0.00"
+
+totals_tolerance:
+  relative: 0.01
+  absolute: "10.00"
+
+tax_tolerance:
+  relative: 0.005
+  absolute: "1.00"
+
+# --- Extraction quality ----------------------------------------------------
+# Below these, an invoice goes to a human before any rule reads its numbers.
+
+min_extraction_confidence: 0.85
+min_page_sharpness: 120.0   # Laplacian variance; calibrate against data/index.csv
+
+# --- Duplicate detection ---------------------------------------------------
+duplicate_score_threshold: 0.90
+duplicate_date_window_days: 90
+
+# --- Approval --------------------------------------------------------------
+# Straight-through processing is OFF. Turning it on is a deliberate, reviewed
+# change with a golden-set number attached to it - not a default.
+auto_approve_max_amount: "0.00"
+
+approval_matrix:
+  - max_amount: "1000.00"
+    approver_role: "ap_clerk"
+    requires_second_approver: false
+    applies_to_reason_codes: []
+  - max_amount: "25000.00"
+    approver_role: "controller"
+    requires_second_approver: false
+    applies_to_reason_codes: []
+  - max_amount: null            # unbounded
+    approver_role: "cfo"
+    requires_second_approver: true
+    applies_to_reason_codes: []
+
+# --- Hard stops ------------------------------------------------------------
+# Not tolerances. These do not have a band, and a model cannot argue with them.
+new_vendor_requires_external_verification: true
+block_on_bank_details_mismatch: true
