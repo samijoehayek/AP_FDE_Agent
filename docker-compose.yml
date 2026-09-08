@@ -1,0 +1,56 @@
+# Local development stack.
+#
+# Postgres only, for now. Langfuse is added on Day 5 - the block is below,
+# commented out deliberately rather than omitted, so the shape of the finished
+# stack is visible and the port allocations are already reserved.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: ap_agent_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ap_agent
+      POSTGRES_PASSWORD: ap_agent
+      POSTGRES_DB: ap_agent
+      # Deterministic collation: sorting differences between a developer's
+      # machine and CI are the kind of bug that takes a day to find.
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=en-US --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ap_agent -d ap_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --- Day 5: Langfuse ----------------------------------------------------
+  # Tracing for the two LLM seats: prompt version, token counts, latency, and
+  # cost per invoice. It complements the audit trail rather than replacing it -
+  # audit_events is the compliance record and lives in Postgres; Langfuse is for
+  # debugging and cost analysis, and the system must run correctly without it.
+  #
+  # Langfuse v3+ needs ClickHouse, Redis, and MinIO alongside Postgres. Add
+  # those services here at the same time.
+  #
+  # langfuse:
+  #   image: langfuse/langfuse:4.32.0
+  #   container_name: ap_agent_langfuse
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DATABASE_URL: postgresql://ap_agent:ap_agent@postgres:5432/langfuse
+  #     NEXTAUTH_URL: http://localhost:3000
+  #     NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?set in .env}
+  #     SALT: ${LANGFUSE_SALT:?set in .env}
+  #     ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?32-byte hex, set in .env}
+  #     TELEMETRY_ENABLED: "false"
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
+  postgres_data:
