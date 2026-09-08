@@ -1,0 +1,147 @@
+"""Closed vocabularies.
+
+Every enum here is *closed on purpose*. A model that can invent a reason code
+can invent a reason to pay an invoice. When the model must categorise, it picks
+from a fixed list or the response fails validation and is retried.
+
+``StrEnum`` is used throughout so that members serialise as their value in JSON
+and compare equal to plain strings at a database boundary.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class ArithmeticFlag(StrEnum):
+    """Internal inconsistencies found in an extraction's own numbers.
+
+    These are recorded, never raised. A document whose totals do not add up is
+    a real document with a real problem, and the pipeline must be able to route
+    it to a human rather than crash on it.
+    """
+
+    TOTALS_DO_NOT_SUM = "totals_do_not_sum"
+    LINES_DO_NOT_SUM_TO_SUBTOTAL = "lines_do_not_sum_to_subtotal"
+    LINE_EXTENSION_MISMATCH = "line_extension_mismatch"
+    NEGATIVE_TOTAL = "negative_total"
+    NO_LINE_ITEMS = "no_line_items"
+
+
+class MatchLineStatus(StrEnum):
+    """Outcome of matching one invoice line against a PO line and its receipts."""
+
+    OK = "ok"
+    PRICE_VARIANCE = "price_variance"
+    QTY_VARIANCE = "qty_variance"
+    NOT_ON_PO = "not_on_po"
+    MISSING_RECEIPT = "missing_receipt"
+
+
+class MatchTotalsStatus(StrEnum):
+    """Outcome of matching invoice totals against the PO and tolerance config."""
+
+    OK = "ok"
+    OVER_TOLERANCE = "over_tolerance"
+    UNDER_PO = "under_po"
+    CURRENCY_MISMATCH = "currency_mismatch"
+    PO_NOT_FOUND = "po_not_found"
+
+
+class ReasonCode(StrEnum):
+    """The closed set of reasons an invoice can fail to flow straight through.
+
+    One vocabulary is shared by :class:`~ap_agent.contracts.matching.MatchResult`
+    and :class:`~ap_agent.contracts.exceptions.ExceptionClassification` so that a
+    deterministic rule and a model-written explanation can never disagree about
+    *what* went wrong - only about how to describe it.
+    """
+
+    # Document / extraction
+    EXTRACTION_LOW_CONFIDENCE = "extraction_low_confidence"
+    ARITHMETIC_INCONSISTENT = "arithmetic_inconsistent"
+    UNSUPPORTED_CURRENCY = "unsupported_currency"
+    SUSPICIOUS_DOCUMENT_CONTENT = "suspicious_document_content"
+    MISSING_PO_REFERENCE = "missing_po_reference"
+
+    # Vendor
+    VENDOR_NOT_FOUND = "vendor_not_found"
+    VENDOR_INACTIVE = "vendor_inactive"
+    VENDOR_TAX_ID_MISMATCH = "vendor_tax_id_mismatch"
+    BANK_DETAILS_NOT_ON_FILE = "bank_details_not_on_file"
+
+    # Duplicates
+    DUPLICATE_SUSPECTED = "duplicate_suspected"
+
+    # Purchase order / receipt
+    PO_NOT_FOUND = "po_not_found"
+    PO_CLOSED = "po_closed"
+    LINE_NOT_ON_PO = "line_not_on_po"
+    PRICE_OVER_TOLERANCE = "price_over_tolerance"
+    QUANTITY_OVER_TOLERANCE = "quantity_over_tolerance"
+    UOM_MISMATCH = "uom_mismatch"
+    RECEIPT_MISSING = "receipt_missing"
+    RECEIPT_PARTIAL = "receipt_partial"
+
+    # Totals
+    TOTALS_OVER_TOLERANCE = "totals_over_tolerance"
+    TAX_MISMATCH = "tax_mismatch"
+    CURRENCY_MISMATCH = "currency_mismatch"
+
+    # Terms
+    PAYMENT_TERMS_MISMATCH = "payment_terms_mismatch"
+
+
+class SuggestedResolver(StrEnum):
+    """Who can actually resolve an exception. Closed: there is no "someone"."""
+
+    BUYER = "buyer"
+    RECEIVING = "receiving"
+    VENDOR = "vendor"
+    AP_CLERK = "ap_clerk"
+    CONTROLLER = "controller"
+
+
+class SuggestedAction(StrEnum):
+    """The closed set of next actions a model may suggest.
+
+    Note what is absent: nothing here pays, releases, or edits a vendor. A
+    suggestion is a routing hint for a human, never an instruction to a tool.
+    """
+
+    REQUEST_CREDIT_MEMO = "request_credit_memo"
+    REQUEST_CORRECTED_INVOICE = "request_corrected_invoice"
+    REQUEST_PO_AMENDMENT = "request_po_amendment"
+    REQUEST_GOODS_RECEIPT = "request_goods_receipt"
+    REQUEST_PO_REFERENCE = "request_po_reference"
+    VERIFY_VENDOR_IDENTITY = "verify_vendor_identity"
+    HOLD_FOR_MANUAL_REVIEW = "hold_for_manual_review"
+    ESCALATE_TO_CONTROLLER = "escalate_to_controller"
+    APPROVE_WITHIN_TOLERANCE = "approve_within_tolerance"
+    REJECT_INVOICE = "reject_invoice"
+
+
+class ActorKind(StrEnum):
+    """Discriminator for the audit actor union."""
+
+    SYSTEM = "system"
+    RULE = "rule"
+    MODEL = "model"
+    HUMAN = "human"
+    TOOL = "tool"
+
+
+class AuditEventType(StrEnum):
+    """The closed set of things worth recording in the audit trail."""
+
+    STATE_TRANSITION = "state_transition"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    MODEL_CALL = "model_call"
+    RULE_EVALUATION = "rule_evaluation"
+    HUMAN_DECISION = "human_decision"
+    APPROVAL_REQUESTED = "approval_requested"
+    ERP_WRITE = "erp_write"
+    ERROR = "error"
+    RETRY = "retry"
+    NOTE = "note"
