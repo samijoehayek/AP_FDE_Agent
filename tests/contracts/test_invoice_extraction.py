@@ -7,10 +7,25 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+
+# Private SDK path, used deliberately: this is the function that rewrites a
+# pydantic schema into the one the API receives, and the bug this guards against
+# was invisible in the pydantic schema alone. If a future SDK moves it, this
+# import fails loudly, which is the right outcome - the guarantee would need
+# re-checking anyway.
+from anthropic.lib._parse._transform import (  # pyright: ignore[reportMissingTypeStubs]
+    transform_schema,
+)
 from pydantic import ValidationError
 
 from ap_agent.contracts.enums import ArithmeticFlag
-from ap_agent.contracts.invoice import FieldEvidence, InvoiceExtraction, LineItem
+from ap_agent.contracts.invoice import (
+    EVIDENCE_FIELDS,
+    ExtractionEvidence,
+    FieldEvidence,
+    InvoiceExtraction,
+    LineItem,
+)
 
 
 def _base(**overrides: Any) -> dict[str, Any]:
@@ -167,12 +182,53 @@ def test_a_due_date_before_the_invoice_date_is_a_reading_error() -> None:
 # --- evidence ---------------------------------------------------------------
 
 
+def test_evidence_fields_match_the_declared_policy() -> None:
+    """EVIDENCE_FIELDS is the readable declaration; the model is what enforces it."""
+    assert set(ExtractionEvidence.model_fields) == EVIDENCE_FIELDS
+
+
 def test_evidence_keys_are_restricted_to_declared_fields() -> None:
     """Otherwise evidence becomes an unbounded channel for document text."""
-    with pytest.raises(ValidationError, match="evidence keys not permitted"):
-        InvoiceExtraction(
-            **_base(evidence={"secret_notes": FieldEvidence(page=1, snippet="hello")})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        InvoiceExtraction(**_base(evidence={"secret_notes": {"page": 1, "snippet": "hi"}}))
+
+
+def test_evidence_defaults_to_nothing_supplied() -> None:
+    extraction = InvoiceExtraction(**_base())
+    assert extraction.evidence.provided() == {}
+    assert extraction.evidence.vendor_name is None
+
+
+def test_supplied_evidence_round_trips() -> None:
+    extraction = InvoiceExtraction(
+        **_base(
+            evidence={
+                "total": FieldEvidence(page=1, snippet="Total due 120.00"),
+                "invoice_number": FieldEvidence(page=1, snippet="INV-1"),
+            }
         )
+    )
+    assert extraction.evidence.total is not None
+    assert extraction.evidence.total.snippet == "Total due 120.00"
+    assert sorted(extraction.evidence.provided()) == ["invoice_number", "total"]
+
+
+def test_the_structured_output_schema_carries_the_evidence_properties() -> None:
+    """The reason ExtractionEvidence exists.
+
+    ``dict[str, FieldEvidence]`` becomes ``additionalProperties: {$ref}``, which
+    structured outputs does not support - the SDK rewrites it to an object with
+    no properties, so the model can never return evidence and the loss is
+    silent. Assert against the schema the API actually receives, not the one
+    pydantic generates.
+    """
+    sent = transform_schema(InvoiceExtraction.model_json_schema())
+    node = sent["properties"]["evidence"]
+    if "$ref" in node:
+        node = sent["$defs"][node["$ref"].rsplit("/", 1)[-1]]
+
+    assert set(node["properties"]) == EVIDENCE_FIELDS
+    assert node["additionalProperties"] is False
 
 
 def test_evidence_snippets_are_bounded() -> None:

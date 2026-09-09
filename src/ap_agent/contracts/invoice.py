@@ -61,8 +61,9 @@ EVIDENCE_FIELDS: frozenset[str] = frozenset(
 )
 """Fields for which page-and-snippet evidence may be supplied.
 
-Constrained so that evidence cannot become an unbounded side channel for
-document text. An unrecognised key is a validation failure, not a warning.
+The names here and the fields of :class:`ExtractionEvidence` are the same set,
+asserted by a test. This constant remains the readable declaration of the
+policy; the model is what enforces it.
 """
 
 
@@ -79,6 +80,48 @@ class FieldEvidence(StrictModel):
         max_length=MAX_SNIPPET_CHARS,
         description="Verbatim text supporting the value. Bounded; display-only.",
     )
+
+
+class ExtractionEvidence(StrictModel):
+    """Page-and-snippet provenance, one optional entry per evidenced field.
+
+    A fixed set of fields rather than ``dict[str, FieldEvidence]``, for two
+    reasons.
+
+    The first is expressibility. Structured outputs require every object to
+    declare ``additionalProperties: false``, so a mapping with open string keys
+    cannot be represented: the SDK rewrites it to an object with no properties
+    at all, and the model is then unable to return any evidence whatsoever. The
+    failure is silent - the request succeeds and the field simply comes back
+    empty forever.
+
+    The second is that the closed set was always the intent. Evidence exists so
+    a human resolving an exception can jump to the page a number came from; it
+    is not a place for the document to put arbitrary text. Naming the fields
+    makes that a property of the schema rather than of a validator.
+
+    Every field is optional. Evidence is a courtesy from the extraction model,
+    not a requirement, and an extraction with none is still valid.
+    """
+
+    vendor_name: FieldEvidence | None = None
+    invoice_number: FieldEvidence | None = None
+    invoice_date: FieldEvidence | None = None
+    due_date: FieldEvidence | None = None
+    currency: FieldEvidence | None = None
+    subtotal: FieldEvidence | None = None
+    tax_total: FieldEvidence | None = None
+    total: FieldEvidence | None = None
+    payment_terms: FieldEvidence | None = None
+    po_references: FieldEvidence | None = None
+
+    def provided(self) -> dict[str, FieldEvidence]:
+        """Return only the fields that carry evidence, keyed by field name."""
+        return {
+            name: value
+            for name in type(self).model_fields
+            if isinstance(value := getattr(self, name), FieldEvidence)
+        }
 
 
 class LineItem(StrictModel):
@@ -155,9 +198,9 @@ class InvoiceExtraction(StrictModel):
         "The only authority for remittance is the vendor master.",
     )
 
-    evidence: dict[str, FieldEvidence] = Field(
-        default_factory=dict[str, FieldEvidence],
-        description="Page-and-snippet provenance, keyed by field name (see EVIDENCE_FIELDS).",
+    evidence: ExtractionEvidence = Field(
+        default_factory=ExtractionEvidence,
+        description="Page-and-snippet provenance for the fields listed in EVIDENCE_FIELDS.",
     )
     suspicious_text: list[str] = Field(
         default_factory=list[str],
@@ -190,16 +233,6 @@ class InvoiceExtraction(StrictModel):
         """Reject currencies outside the allowlist rather than pricing them."""
         if not is_allowed_currency(value):
             msg = f"currency {value!r} is not in the allowlist"
-            raise ValueError(msg)
-        return value
-
-    @field_validator("evidence")
-    @classmethod
-    def _evidence_keys_are_known(cls, value: dict[str, FieldEvidence]) -> dict[str, FieldEvidence]:
-        """Keep evidence to declared fields so it cannot become a text channel."""
-        unknown = sorted(set(value) - EVIDENCE_FIELDS)
-        if unknown:
-            msg = f"evidence keys not permitted: {unknown}"
             raise ValueError(msg)
         return value
 
