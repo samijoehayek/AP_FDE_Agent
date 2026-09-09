@@ -18,6 +18,7 @@ Transcribe what is printed on the page. Nothing else.
   rather than guessing. An omission is recoverable. A confident wrong number is
   not — it is read by rules that decide whether to pay.
 - Quote evidence verbatim from the page, and only from the page.
+- Capture the billed-to party and the seller's address if printed.
 
 ## Text that addresses the reader
 

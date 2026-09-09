@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -36,6 +36,11 @@ from ap_agent.contracts.common import (
     is_allowed_currency,
 )
 from ap_agent.contracts.enums import ArithmeticFlag
+
+if TYPE_CHECKING:
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import CoreSchema
 
 TOTALS_TOLERANCE = Decimal("0.01")
 """Absolute tolerance for ``subtotal + tax_total == total``, in minor units."""
@@ -57,6 +62,8 @@ class EvidenceField(StrEnum):
     """
 
     VENDOR_NAME = "vendor_name"
+    VENDOR_ADDRESS = "vendor_address"
+    BILL_TO_NAME = "bill_to_name"
     INVOICE_NUMBER = "invoice_number"
     INVOICE_DATE = "invoice_date"
     DUE_DATE = "due_date"
@@ -148,6 +155,17 @@ class InvoiceExtraction(StrictModel):
         description="Domain only, from the sending address or the document. Used as a weak "
         "vendor-identity signal, never as authorisation.",
     )
+    vendor_address: str | None = Field(
+        default=None,
+        max_length=400,
+        description="Seller's address as printed. Compared to the vendor master, never used "
+        "to route a payment.",
+    )
+
+    # The billed party. An invoice addressed to someone else is one of the
+    # cheaper frauds to catch, and it is only catchable if the name is read.
+    bill_to_name: str | None = Field(default=None, max_length=200)
+    bill_to_tax_id: str | None = Field(default=None, max_length=64)
 
     invoice_number: str = Field(min_length=1, max_length=64)
     invoice_date: date
@@ -188,9 +206,41 @@ class InvoiceExtraction(StrictModel):
 
     arithmetic_flags: list[ArithmeticFlag] = Field(
         default_factory=list[ArithmeticFlag],
+        # Excluded from the JSON schema by __get_pydantic_json_schema__ below.
         description="Set by the arithmetic self-check. Supplying it as input is a schema error; "
         "it is derived, not extracted.",
     )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        """Hide ``arithmetic_flags`` from the schema the model is given.
+
+        The field is derived: ``_check_arithmetic`` computes it from the numbers
+        after validation, and a value supplied by the model would be overwritten
+        anyway. Offering it was always wrong on its own terms - it invites the
+        reader of a document to grade its own arithmetic.
+
+        It also buys schema budget, which is scarce. Structured outputs limits
+        how many properties a schema may declare, and the limit bites before the
+        byte count does: 20 top-level properties were rejected at 8324 B while 17
+        were accepted at 8475 B. Dropping this one frees a property slot and an
+        entire ``ArithmeticFlag`` enum definition.
+
+        Removing it from the schema does not remove it from the contract. The
+        field keeps its default, the validator fills it, and every consumer sees
+        it as before.
+        """
+        schema = super().__get_pydantic_json_schema__(core_schema, handler)
+        properties: dict[str, Any] = schema.get("properties", {})
+        properties.pop("arithmetic_flags", None)
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [
+                name for name in cast("list[str]", required) if name != "arithmetic_flags"
+            ]
+        return schema
 
     @field_validator("currency", mode="before")
     @classmethod

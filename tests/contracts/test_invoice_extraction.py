@@ -315,8 +315,63 @@ def test_email_domain_must_be_a_domain_not_an_address() -> None:
 # --- schema shape -----------------------------------------------------------
 
 
-def test_the_json_schema_exposes_no_arithmetic_flags_to_the_model() -> None:
-    """Flags are derived server-side. A model supplying them is a schema error."""
+def test_the_model_is_never_offered_the_derived_field() -> None:
+    """arithmetic_flags is computed by the validator, so the model cannot supply it.
+
+    Offering it would invite the reader of a document to grade its own
+    arithmetic. It also costs a property slot the schema cannot spare.
+    """
     schema = InvoiceExtraction.model_json_schema()
-    assert "arithmetic_flags" in schema["properties"]
+    assert "arithmetic_flags" not in schema["properties"]
     assert "arithmetic_flags" not in schema.get("required", [])
+
+    # Absent from the schema, still present on the contract.
+    extraction = InvoiceExtraction(**_base(total=Decimal("130.00")))
+    assert ArithmeticFlag.TOTALS_DO_NOT_SUM in extraction.arithmetic_flags
+
+
+def test_the_schema_declares_no_redundant_titles() -> None:
+    """Titles duplicate the property name and cost budget the schema needs."""
+    sent = transform_schema(InvoiceExtraction.model_json_schema())
+    assert "title" not in sent
+    assert all("title" not in prop for prop in sent["properties"].values())
+
+
+def test_the_schema_stays_within_the_property_limit() -> None:
+    """Structured outputs caps how many properties a schema may declare.
+
+    Measured against the live API, and it is a property count rather than a byte
+    count: 20 top-level properties were rejected at 8324 B while 17 were accepted
+    at 8475 B. 19 is the highest count verified to work. Raising this is not a
+    matter of editing the number - probe the API first.
+    """
+    sent = transform_schema(InvoiceExtraction.model_json_schema())
+    assert len(sent["properties"]) <= 19
+
+
+def test_the_new_party_fields_reach_the_schema() -> None:
+    sent = transform_schema(InvoiceExtraction.model_json_schema())
+    for name in ("vendor_address", "bill_to_name", "bill_to_tax_id"):
+        assert name in sent["properties"], name
+    assert {"vendor_address", "bill_to_name"} <= set(sent["$defs"]["EvidenceField"]["enum"])
+
+
+def test_the_party_fields_default_to_absent() -> None:
+    """Absent is a fact about the document; the prompt forbids inventing one."""
+    extraction = InvoiceExtraction(**_base())
+    assert extraction.vendor_address is None
+    assert extraction.bill_to_name is None
+    assert extraction.bill_to_tax_id is None
+
+
+def test_the_party_fields_round_trip() -> None:
+    extraction = InvoiceExtraction(
+        **_base(
+            vendor_address="Plot 14, MIDC Industrial Area, Mumbai",
+            bill_to_name="Raj Electronics Pvt Ltd",
+            bill_to_tax_id="901-95-4704",
+        )
+    )
+    assert extraction.bill_to_name == "Raj Electronics Pvt Ltd"
+    assert extraction.bill_to_tax_id == "901-95-4704"
+    assert extraction.vendor_address == "Plot 14, MIDC Industrial Area, Mumbai"

@@ -15,9 +15,14 @@ a vendor problem rather than a type problem.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import CoreSchema
 
 CURRENCY_ALLOWLIST: frozenset[str] = frozenset(
     {"USD", "EUR", "GBP", "INR", "CAD", "AUD", "CHF", "JPY", "SEK", "SGD", "MXN"}
@@ -60,6 +65,34 @@ class StrictModel(BaseModel):
         validate_default=True,
         protected_namespaces=(),
     )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        """Drop pydantic's auto-generated ``title`` keys from the JSON schema.
+
+        Structured outputs enforces an undocumented complexity budget, and
+        ``InvoiceExtraction`` runs close to it - close enough that adding three
+        string fields once tipped it into ``400 Schema is too complex``.
+
+        Titles are the cheapest thing to give up because they carry no
+        information at all: pydantic derives ``"title": "Vendor Address"`` from
+        the key ``vendor_address``, which the model can already read. Measured on
+        the extraction schema, they cost 822 bytes - more than the headroom the
+        three fields needed.
+
+        Descriptions are kept. Those are the field-level instructions the model
+        actually extracts against, and trading them for schema budget would buy
+        space with accuracy.
+        """
+        schema = handler(core_schema)
+        schema.pop("title", None)
+        properties: dict[str, Any] = schema.get("properties", {})
+        for subschema in properties.values():
+            if isinstance(subschema, dict):
+                cast("dict[str, Any]", subschema).pop("title", None)
+        return schema
 
 
 CurrencyCode = Annotated[
