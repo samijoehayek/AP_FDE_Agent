@@ -27,6 +27,7 @@ from ap_agent.contracts.audit import (
 from ap_agent.contracts.common import (
     CURRENCY_ALLOWLIST,
     Confidence,
+    CostUsd,
     CurrencyCode,
     Money,
     Quantity,
@@ -74,6 +75,7 @@ __all__ = [
     "AuditEvent",
     "AuditEventType",
     "Confidence",
+    "CostUsd",
     "CurrencyCode",
     "EvidenceEntry",
     "EvidenceField",

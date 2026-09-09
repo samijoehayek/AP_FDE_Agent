@@ -28,7 +28,7 @@ from typing import Annotated, Literal, Self
 from pydantic import AwareDatetime, Field, model_validator
 from ulid import ULID
 
-from ap_agent.contracts.common import Confidence, Money, Sha256Hex, StrictModel
+from ap_agent.contracts.common import Confidence, CostUsd, Sha256Hex, StrictModel
 from ap_agent.contracts.enums import ActorKind, AuditEventType
 from ap_agent.states.machine import InvoiceState
 
@@ -131,7 +131,12 @@ class AuditEvent(StrictModel):
     prompt_version: str | None = Field(default=None, max_length=32)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
-    cost_usd: Money | None = Field(default=None, ge=0)
+    cost_usd: CostUsd | None = Field(
+        default=None,
+        ge=0,
+        description="Six places, not two: one extraction costs about $0.027, which Money "
+        "would have rejected outright.",
+    )
     latency_ms: int | None = Field(default=None, ge=0)
     trace_id: str | None = Field(
         default=None, max_length=128, description="Correlates this event with an external trace."

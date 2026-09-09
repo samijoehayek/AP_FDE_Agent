@@ -14,10 +14,10 @@ a vendor problem rather than a type problem.
 
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Annotated, Any, Final, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from pydantic import GetJsonSchemaHandler
@@ -105,33 +105,130 @@ CurrencyCode = Annotated[
     ),
 ]
 
+MAX_MONEY_DIGITS: Final = 18
+MONEY_PLACES: Final = 2
+COST_PLACES: Final = 6
+"""API costs are fractions of a cent, so two places would round them to nothing."""
+
+PRICE_PLACES: Final = 6
+"""Unit prices and quantities. Catalogue prices are often sub-cent."""
+
+RATE_PLACES: Final = 5
+"""Tax rates as fractions: 0.20 is 20%."""
+
+_MONEY_EXPONENT: Final = Decimal("0.01")
+_COST_EXPONENT: Final = Decimal("0.000001")
+_PRICE_EXPONENT: Final = Decimal("0.000001")
+_RATE_EXPONENT: Final = Decimal("0.00001")
+
+
+def _canonicalise(value: Decimal, exponent: Decimal, places: int) -> Decimal:
+    """Return ``value`` at exactly the scale of ``exponent``, never rounding.
+
+    Canonical form matters beyond tidiness. The audit trail hashes a
+    serialisation of each event, so ``Decimal("1676976")`` and
+    ``Decimal("1676976.00")`` - equal numbers, different strings - would produce
+    different hashes for the same extraction. A chain that reports tampering
+    when nothing was tampered with is a chain people learn to ignore.
+
+    Rounding is refused rather than performed. The field constraints already
+    reject too many decimal places, so quantising here is exact by construction;
+    if that ever stops being true, the right outcome is a loud failure, not a
+    silently altered amount.
+    """
+    if not value.is_finite():
+        msg = f"not a finite amount: {value}"
+        raise ValueError(msg)
+
+    try:
+        quantised = value.quantize(exponent)
+    except InvalidOperation as exc:
+        msg = f"amount cannot be represented at {places} places: {value}"
+        raise ValueError(msg) from exc
+
+    if quantised != value:
+        msg = f"amount would need rounding to be stored: {value}"
+        raise ValueError(msg)
+
+    if len(quantised.as_tuple().digits) > MAX_MONEY_DIGITS:
+        msg = f"amount exceeds {MAX_MONEY_DIGITS} significant digits once scaled: {value}"
+        raise ValueError(msg)
+
+    # Decimal("-0.00") is equal to zero but serialises with a sign, which would
+    # break the hash the same way a trailing zero would.
+    return Decimal(0).quantize(exponent) if quantised.is_zero() else quantised
+
+
+def _canonical_money(value: Decimal) -> Decimal:
+    return _canonicalise(value, _MONEY_EXPONENT, MONEY_PLACES)
+
+
+def _canonical_cost(value: Decimal) -> Decimal:
+    return _canonicalise(value, _COST_EXPONENT, COST_PLACES)
+
+
+def _canonical_price(value: Decimal) -> Decimal:
+    return _canonicalise(value, _PRICE_EXPONENT, PRICE_PLACES)
+
+
+def _canonical_rate(value: Decimal) -> Decimal:
+    return _canonicalise(value, _RATE_EXPONENT, RATE_PLACES)
+
+
 Money = Annotated[
     Decimal,
     Field(
-        max_digits=18,
-        decimal_places=2,
+        max_digits=MAX_MONEY_DIGITS,
+        decimal_places=MONEY_PLACES,
+        allow_inf_nan=False,
         description="A monetary amount in the invoice's currency, to the minor unit.",
     ),
+    AfterValidator(_canonical_money),
 ]
-"""Totals, subtotals, taxes, line extensions. Two decimal places."""
+"""Totals, subtotals, taxes, line extensions.
+
+Always exactly two decimal places once validated, whatever the document printed,
+so that equal amounts serialise identically.
+"""
+
+CostUsd = Annotated[
+    Decimal,
+    Field(
+        max_digits=MAX_MONEY_DIGITS,
+        decimal_places=COST_PLACES,
+        allow_inf_nan=False,
+        description="A cost in USD, to six places.",
+    ),
+    AfterValidator(_canonical_cost),
+]
+"""What an API call cost. Not :data:`Money`.
+
+A single extraction costs about $0.027, which two decimal places would record as
+$0.03 - or, as the contract was originally written, reject outright. Six places
+matches the ``audit_events.cost_usd`` column.
+"""
 
 UnitPrice = Annotated[
     Decimal,
     Field(
         ge=0,
-        max_digits=18,
-        decimal_places=6,
+        max_digits=MAX_MONEY_DIGITS,
+        decimal_places=PRICE_PLACES,
+        allow_inf_nan=False,
         description="Per-unit price. Six places because catalogue prices are often sub-cent.",
     ),
+    AfterValidator(_canonical_price),
 ]
 
 Quantity = Annotated[
     Decimal,
     Field(
-        max_digits=18,
-        decimal_places=6,
+        max_digits=MAX_MONEY_DIGITS,
+        decimal_places=PRICE_PLACES,
+        allow_inf_nan=False,
         description="Quantity in the line's unit of measure. May be negative on a credit line.",
     ),
+    AfterValidator(_canonical_price),
 ]
 
 TaxRate = Annotated[
@@ -140,9 +237,11 @@ TaxRate = Annotated[
         ge=0,
         le=1,
         max_digits=6,
-        decimal_places=5,
+        decimal_places=RATE_PLACES,
+        allow_inf_nan=False,
         description="Fractional rate, not a percentage: 0.20 is 20%.",
     ),
+    AfterValidator(_canonical_rate),
 ]
 
 Confidence = Annotated[
