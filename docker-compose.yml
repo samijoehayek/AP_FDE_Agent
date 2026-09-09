@@ -19,7 +19,17 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Postgres 18 changed this. The image now stores data in a
+      # major-version-specific subdirectory so `pg_upgrade --link` does not have
+      # to cross a mount boundary, so the mount goes at /var/lib/postgresql and
+      # NOT at /var/lib/postgresql/data. Mounting the old path makes the
+      # container exit 1 on start with "in 18+, these Docker images are
+      # configured to store database data in a format compatible with
+      # pg_ctlcluster". See docker-library/postgres#1259.
+      - postgres_data:/var/lib/postgresql
+      # Runs once, on an empty data directory, before anything connects.
+      # Creates the non-superuser role the application uses; see the file.
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ap_agent -d ap_agent"]
       interval: 5s
