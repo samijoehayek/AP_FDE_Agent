@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from PIL import Image, ImageFilter
@@ -18,7 +19,47 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
+from ap_agent.config import get_settings
 from ap_agent.contracts.invoice import InvoiceExtraction, LineItem
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+SENTINEL_API_KEY = "sk-ant-api00-TEST-SENTINEL-not-a-real-key"
+"""What the suite sees instead of a real key. Any request carrying it 401s."""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_live_api_credentials() -> Iterator[None]:
+    """Make it impossible for the test suite to reach the Anthropic API.
+
+    Every test that touches the extraction seat mocks the client, so nothing
+    *should* call out. This makes that a property of the environment rather than
+    of everyone remembering, because the failure mode is bad in a specific way:
+    an unmocked test would not error, it would quietly succeed and bill a real
+    account, and a green suite is exactly where nobody looks.
+
+    A sentinel rather than a deletion. Unsetting the key is not enough - the SDK
+    falls through to ``ANTHROPIC_AUTH_TOKEN``, then to an ``ant auth login``
+    profile on disk, so an "unset" key can still authenticate. Setting the
+    variable wins outright: it takes precedence in the SDK's credential chain,
+    and in pydantic-settings an environment variable overrides the ``.env`` file
+    that ``Settings`` reads.
+
+    This binds to the pytest session only. ``just extract`` and every other real
+    run read ``.env`` exactly as before.
+
+    Deliberately not underscore-prefixed: an autouse fixture is never referenced
+    by name, and a private one reads to a type checker as dead code.
+    """
+    patcher = pytest.MonkeyPatch()
+    patcher.setenv("ANTHROPIC_API_KEY", SENTINEL_API_KEY)
+    patcher.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    patcher.delenv("ANTHROPIC_PROFILE", raising=False)
+    get_settings.cache_clear()
+    yield
+    patcher.undo()
+    get_settings.cache_clear()
 
 
 @pytest.fixture

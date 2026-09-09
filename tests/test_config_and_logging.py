@@ -6,8 +6,11 @@ is a setting nobody sets, and the drift is invisible until someone deploys.
 
 from __future__ import annotations
 
+import os
+
 import structlog
 from pydantic import SecretStr
+from tests.conftest import SENTINEL_API_KEY
 
 from ap_agent.config import REPO_ROOT, Settings, get_settings
 from ap_agent.logging import configure_logging, get_logger
@@ -79,3 +82,26 @@ def test_get_logger_returns_a_bound_logger() -> None:
     assert hasattr(logger, "info")
     bound = logger.bind(invoice_id="inv-1")
     assert bound is not None
+
+
+# --- the no-live-credentials guard ------------------------------------------
+
+
+def test_the_suite_cannot_reach_the_api() -> None:
+    """The guard in conftest, asserted rather than assumed.
+
+    If this ever fails, a real key is live inside the test session and an
+    unmocked call would bill a real account instead of erroring.
+    """
+    assert get_settings().anthropic_api_key.get_secret_value() == SENTINEL_API_KEY
+
+
+def test_the_guard_survives_the_dotenv() -> None:
+    """A fresh Settings must see the sentinel too, not the file on disk."""
+    assert Settings().anthropic_api_key.get_secret_value() == SENTINEL_API_KEY
+
+
+def test_no_fallback_credential_is_left_reachable() -> None:
+    """Unsetting the key is not enough: the SDK falls through to these."""
+    assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+    assert "ANTHROPIC_PROFILE" not in os.environ
