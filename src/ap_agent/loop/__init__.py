@@ -12,6 +12,7 @@ from ap_agent.loop.runner import (
     decide,
     make_event,
     run,
+    validate_extraction,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "make_event",
     "run",
     "run_invoice",
+    "validate_extraction",
 ]

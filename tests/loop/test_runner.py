@@ -17,16 +17,18 @@ import pytest
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
-from ap_agent.contracts.enums import AuditEventType
+from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.run import Action, ActionKind, InvoiceRecord, StepResult
 from ap_agent.loop.runner import (
     DEFAULT_MAX_STEPS,
+    LOOP_ONLY_FLAGS,
     RunContext,
     actor_for,
     apply,
     decide,
     run,
+    validate_extraction,
 )
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools import TOOL_MODULE_NAMES
@@ -264,6 +266,59 @@ def test_a_failing_validation_routes_to_needs_human_extraction(
         "extract",
         "validation_failed",
     ]
+
+
+def test_validation_reuses_the_contract_checks_rather_than_repeating_them() -> None:
+    """One implementation of each arithmetic rule, not two that agree today.
+
+    Every flag the step reports is either one the contract computed or one of the
+    short list this step is allowed to add. If someone re-implements an
+    arithmetic check here, its flag name will belong to neither set.
+    """
+    broken = _extraction(total=Decimal("999.00"), subtotal=Decimal("100.00"))
+    record = InvoiceRecord(source_path=Path("x.pdf"), created_at=utc_now(), extraction=broken)
+    flags, event = validate_extraction(record, utc_now())
+
+    contract_flags = {flag.value for flag in ArithmeticFlag}
+    assert set(flags) <= contract_flags | LOOP_ONLY_FLAGS
+    # and it really did carry the contract's findings through
+    assert {flag.value for flag in broken.arithmetic_flags} <= set(flags)
+    assert event == "validation_failed"
+
+
+def test_the_arithmetic_tolerances_live_in_exactly_one_place() -> None:
+    """Proof the two are the same code: the contract's verdict is the step's.
+
+    An amount inside the contract's tolerance must pass validation, and one
+    outside must fail, without this module knowing what the tolerance is.
+    """
+    inside = _extraction(total=Decimal("120.01"))  # 1 cent, within TOTALS_TOLERANCE
+    outside = _extraction(total=Decimal("120.05"))  # 5 cents, outside it
+
+    assert inside.arithmetic_flags == []
+    assert outside.arithmetic_flags != []
+
+    for extraction, expected in ((inside, "validate"), (outside, "validation_failed")):
+        record = InvoiceRecord(
+            source_path=Path("x.pdf"), created_at=utc_now(), extraction=extraction
+        )
+        assert validate_extraction(record, utc_now())[1] == expected
+
+
+def test_a_zero_total_is_a_policy_failure_not_an_arithmetic_one() -> None:
+    """The contract sees nothing wrong with zero; the loop refuses to advance it."""
+    zero = _extraction(subtotal=Decimal("0.00"), tax_total=Decimal("0.00"), total=Decimal("0.00"))
+    record = InvoiceRecord(source_path=Path("x.pdf"), created_at=utc_now(), extraction=zero)
+    flags, event = validate_extraction(record, utc_now())
+    assert "total_is_zero" in flags
+    assert event == "validation_failed"
+
+
+def test_validation_without_an_extraction_fails_rather_than_crashing() -> None:
+    record = InvoiceRecord(source_path=Path("x.pdf"), created_at=utc_now())
+    flags, event = validate_extraction(record, utc_now())
+    assert flags == ["no_extraction"]
+    assert event == "validation_failed"
 
 
 def test_a_future_invoice_date_fails_validation(record: InvoiceRecord, tmp_path: Path) -> None:

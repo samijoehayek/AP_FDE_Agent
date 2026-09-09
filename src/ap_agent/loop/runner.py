@@ -30,7 +30,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from ap_agent.contracts.audit import (
@@ -42,11 +41,6 @@ from ap_agent.contracts.audit import (
     utc_now,
 )
 from ap_agent.contracts.enums import AuditEventType
-from ap_agent.contracts.invoice import (
-    LINE_SUM_ABS_TOLERANCE,
-    LINE_SUM_REL_TOLERANCE,
-    TOTALS_TOLERANCE,
-)
 from ap_agent.contracts.run import Action, ActionKind, InvoiceRecord, StepResult
 from ap_agent.errors import APAgentError, IllegalTransition
 from ap_agent.logging import get_logger
@@ -148,37 +142,72 @@ def decide(record: InvoiceRecord) -> Action:
 # ---------------------------------------------------------------------------
 
 
-def _validate(record: InvoiceRecord, now: datetime) -> tuple[list[str], str]:
-    """Run the arithmetic and sanity checks. Returns ``(flags, event)``.
+ZERO_TOTAL_FLAG = "total_is_zero"
+FUTURE_DATE_FLAG = "invoice_date_in_the_future"
+NO_EXTRACTION_FLAG = "no_extraction"
 
-    Deterministic and total: it never raises, because a document whose numbers
-    disagree is exactly the document a human needs to see, and losing it to an
-    exception would be losing the evidence.
+LOOP_ONLY_FLAGS: frozenset[str] = frozenset({ZERO_TOTAL_FLAG, FUTURE_DATE_FLAG, NO_EXTRACTION_FLAG})
+"""Checks this step adds on top of the ones the contract already made.
+
+Deliberately short. Anything that is a pure function of the extracted numbers
+belongs on the contract, not here - see :func:`validate_extraction`.
+"""
+
+
+def validate_extraction(record: InvoiceRecord, now: datetime) -> tuple[list[str], str]:
+    """Decide whether the extraction may advance. Returns ``(flags, event)``.
+
+    The split between this and ``InvoiceExtraction``'s own arithmetic check is
+    the interesting part, and it is a split by *kind of question*, not by
+    convenience:
+
+    **The contract answers questions about the numbers.** Do the lines sum to the
+    subtotal, does subtotal plus tax equal the total, is a line's extension
+    consistent with its quantity and price. Those are pure functions of the
+    extraction, they are the same answer forever, and they belong wherever the
+    extraction goes - so the contract computes them at construction and every
+    consumer can read ``arithmetic_flags`` without re-deriving anything.
+
+    **This function answers whether the invoice may proceed.** That is policy,
+    and policy is allowed to depend on things a contract must not: the clock, and
+    later the versioned guardrails config.
+
+    The clock is the load-bearing half of that distinction. A validator that
+    consults ``now`` cannot live on the contract, because re-loading a stored
+    extraction next year would produce different flags than when it was written -
+    which would break replay and, once the audit chain hashes it, would look
+    exactly like tampering.
+
+    So this reads the contract's findings rather than recomputing them. There is
+    one implementation of each arithmetic rule and one set of tolerance
+    constants; changing a tolerance changes both the contract and this decision,
+    because they are the same code.
+
+    Never raises. A document whose numbers disagree is precisely the document a
+    human needs to see, and losing it to an exception would lose the evidence.
     """
     extraction = record.extraction
     if extraction is None:
-        return ["no_extraction"], InvoiceEvent.VALIDATION_FAILED.value
+        return [NO_EXTRACTION_FLAG], InvoiceEvent.VALIDATION_FAILED.value
 
-    flags: list[str] = []
+    # Computed by InvoiceExtraction at construction. Recomputing them here would
+    # be a second implementation of the same rules with its own copy of the
+    # tolerances - two things that agree today and drift the first time one is
+    # edited alone.
+    flags = [flag.value for flag in extraction.arithmetic_flags]
 
-    if abs(extraction.subtotal + extraction.tax_total - extraction.total) > TOTALS_TOLERANCE:
-        flags.append("totals_do_not_sum")
+    # A zero total is arithmetically fine and commercially meaningless. The
+    # contract records a *negative* total as an observation; whether zero blocks
+    # an invoice is a policy call, so it is made here. (A negative total is a
+    # credit note, which is a real thing - it is flagged, not forbidden.)
+    if extraction.total == 0:
+        flags.append(ZERO_TOTAL_FLAG)
 
-    if extraction.line_items:
-        line_sum = sum((item.extended_price for item in extraction.line_items), Decimal(0))
-        allowed = max(LINE_SUM_ABS_TOLERANCE, abs(extraction.subtotal) * LINE_SUM_REL_TOLERANCE)
-        if abs(line_sum - extraction.subtotal) > allowed:
-            flags.append("lines_do_not_sum_to_subtotal")
-    else:
-        flags.append("no_line_items")
-
-    if extraction.total <= 0:
-        flags.append("total_not_positive")
-
-    # A future invoice date is either a misread or a document that should not be
-    # paid yet. Either way it is not something to decide automatically.
+    # Time-dependent, so it cannot live on the contract. A future invoice date is
+    # either a misread or a document that should not be paid yet; neither is
+    # something to decide automatically.
     if extraction.invoice_date > now.astimezone(UTC).date():
-        flags.append("invoice_date_in_the_future")
+        flags.append(FUTURE_DATE_FLAG)
 
     event = InvoiceEvent.VALIDATE if not flags else InvoiceEvent.VALIDATION_FAILED
     return flags, event.value
@@ -219,7 +248,7 @@ def apply(
             )
 
         case ActionKind.VALIDATE:
-            flags, event = _validate(record, ctx.now())
+            flags, event = validate_extraction(record, ctx.now())
             return (
                 record.model_copy(update={"validation_flags": flags}),
                 StepResult(event=event, output_ref=f"flags:{len(flags)}"),
