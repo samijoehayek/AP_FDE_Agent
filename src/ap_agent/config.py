@@ -47,8 +47,14 @@ class Settings(BaseSettings):
 
     # --- Storage ---------------------------------------------------------
     database_url: str = Field(
+        default="postgresql+psycopg://ap_agent_app:ap_agent_app@localhost:5432/ap_agent",
+        description="What the application connects as. An ordinary role, so the REVOKE that "
+        "makes audit_events append-only actually binds. The +psycopg driver is psycopg 3.",
+    )
+    database_migration_url: str = Field(
         default="postgresql+psycopg://ap_agent:ap_agent@localhost:5432/ap_agent",
-        description="SQLAlchemy URL. The +psycopg driver is psycopg 3.",
+        description="What Alembic connects as: the schema owner. Separate from database_url "
+        "so the role that can ALTER a table is not the role that serves traffic.",
     )
     data_dir: Path = Field(
         default=REPO_ROOT / "data",

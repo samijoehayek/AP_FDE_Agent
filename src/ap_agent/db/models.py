@@ -3,10 +3,13 @@
 Four decisions worth reading before adding a fifth table:
 
 * ``audit_events`` is append-only at the schema level, not by convention. It
-  carries a unique ``(invoice_id, step_seq)`` so a duplicate step is a database
-  error, and the migration that creates it revokes ``UPDATE`` and ``DELETE`` from
-  the application role. Enforcement in the schema survives a refactor; a comment
-  does not.
+  carries a unique ``(invoice_id, run_id, step_seq)`` so a duplicate step is a
+  database error, and revision ``0002`` revokes ``UPDATE``, ``DELETE`` and
+  ``TRUNCATE`` on it from the application role. Note *which* role: the
+  application connects as an ordinary role rather than the schema owner,
+  because a superuser bypasses privilege checks and the revoke would be
+  decorative. Enforcement in the schema survives a refactor; a comment does
+  not.
 * Money is ``Numeric(18, 2)`` and currency travels with it. There is no
   application-wide currency constant.
 * ``erp_writes`` exists so rule 5 of ``CLAUDE.md`` has somewhere to live. Every
@@ -118,9 +121,9 @@ class Invoice(Base):
 class AuditEventRow(Base):
     """One entry in an invoice's hash-chained history. Append only.
 
-    Mirrors :class:`~ap_agent.contracts.audit.AuditEvent`. The migration that
-    creates this table revokes UPDATE and DELETE from the application role - the
-    ORM cannot be the thing that keeps it append-only, because the ORM is what a
+    Mirrors :class:`~ap_agent.contracts.audit.AuditEvent`. Revision ``0002``
+    grants the application role SELECT and INSERT here and nothing else - the ORM
+    cannot be the thing that keeps this append-only, because the ORM is what a
     future bug will be written in.
     """
 

@@ -14,7 +14,7 @@ import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
-from ap_agent.config import REPO_ROOT
+from ap_agent.config import REPO_ROOT, Settings
 from ap_agent.db.base import Base
 from ap_agent.db.models import ApprovalRequest, AuditEventRow, Document, ErpWrite, Invoice
 
@@ -81,8 +81,27 @@ def test_the_alembic_url_is_not_committed() -> None:
     """A committed connection string is a committed password."""
     ini = (REPO_ROOT / "alembic.ini").read_text(encoding="utf-8")
     assert "sqlalchemy.url" not in ini.replace("# ", "")
-    assert (
-        Path(REPO_ROOT / "src/ap_agent/db/migrations/env.py")
-        .read_text()
-        .count("get_settings().database_url")
+
+
+def test_alembic_connects_as_the_owner_not_the_application() -> None:
+    """The application role cannot ALTER a table, and must not be able to."""
+    env = Path(REPO_ROOT / "src/ap_agent/db/migrations/env.py").read_text(encoding="utf-8")
+    assert "get_settings().database_migration_url" in env
+
+
+def test_the_application_role_is_not_the_owner() -> None:
+    """A superuser bypasses every grant, which is what made 0001's revoke a no-op."""
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.database_url != settings.database_migration_url
+    assert "ap_agent_app" in settings.database_url
+
+
+def test_the_append_only_grant_targets_the_application_role() -> None:
+    """The revoke has to name a role that is actually subject to grants."""
+    source = (REPO_ROOT / "src/ap_agent/db/migrations/versions/0002_grant_app_role.py").read_text(
+        encoding="utf-8"
     )
+    assert "REVOKE UPDATE, DELETE, TRUNCATE" in source
+    assert "AP_AGENT_DB_APP_ROLE" in source
+    # Nothing that could rewrite the trail may be granted on it.
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON audit_events" not in source

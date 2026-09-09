@@ -1,8 +1,12 @@
 """Alembic environment.
 
 The URL comes from :func:`ap_agent.config.get_settings`, never from
-``alembic.ini`` - a committed file must not be able to hold a password, and a
-migration must run against the same database the application does.
+``alembic.ini`` - a committed file must not be able to hold a password.
+
+Note which URL: ``database_migration_url``, the schema owner, not the
+``database_url`` the application serves traffic with. The application is an
+ordinary role precisely so that the append-only revoke on ``audit_events``
+binds against it, which means it cannot run migrations - and should not.
 """
 
 from __future__ import annotations
@@ -36,7 +40,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# The owner URL, not the application's. Migrations need rights the
+# application deliberately does not have.
+config.set_main_option("sqlalchemy.url", get_settings().database_migration_url)
 
 target_metadata = Base.metadata
 

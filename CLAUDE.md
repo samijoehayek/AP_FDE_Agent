@@ -37,6 +37,9 @@ just docs-diagram # regenerate the state diagram from the transition table
 - **`Decimal` for money**, `date` for dates, aware UTC for timestamps. Never `float`
   for an amount — a float tolerance check fails in ways that look like vendor fraud.
 - **structlog** for logs. The log is a debugging aid; `audit_events` is the record of truth.
+- **Two database roles.** The application connects as `ap_agent_app`, an ordinary
+  role, so the append-only revoke on `audit_events` actually binds. Migrations
+  connect as the owner `ap_agent`. Never point `DATABASE_URL` at the owner.
 - Docstrings state *why*, not *what*. A module docstring says what the module is
   responsible for and what it deliberately does not do.
 - Tests assert behaviour and invariants, not implementation. Structural tests
@@ -68,7 +71,7 @@ Rules are not honour-system. Most of them fail a test if broken:
 | 1 | `tests/tools/test_tool_contracts.py::test_no_tool_is_exposed_to_a_model` |
 | 2 | `tests/contracts/test_strictness.py::test_no_contract_carries_bank_details`, plus `extra="forbid"` on every contract |
 | 3 | `tests/tools/test_tool_contracts.py::test_no_forbidden_tool_exists` and its siblings |
-| 4 | `IllegalTransition` from `transition()`; the audit write is the loop's job and will be tested with it |
+| 4 | `IllegalTransition` from `transition()`; `audit_events` is append-only in the schema (revision `0002`, verified against a live database) and the audit write is the loop's job |
 | 5 | `tests/tools/test_tool_contracts.py::test_external_writes_require_an_idempotency_key`; `erp_writes` table |
 | 6 | `.gitignore`, the `no-data-committed` pre-commit hook, gitleaks in CI |
 | 7 | Nothing automated. This one is on you. |

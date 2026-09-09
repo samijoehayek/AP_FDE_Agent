@@ -180,7 +180,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `documents` | One row per distinct file, keyed by SHA-256 | Identity is the bytes |
 | `invoices` | Current state and the extracted header | Unique `(vendor_id, invoice_number)` — the duplicate control the database enforces |
-| `audit_events` | The hash-chained trail | Append-only at the schema level; `UPDATE`/`DELETE` revoked from the application role |
+| `audit_events` | The hash-chained trail | Append-only at the schema level. The application role holds `SELECT` and `INSERT` and nothing else — and it is an ordinary role, not the owner, because a superuser bypasses the check |
 | `approval_requests` | Durable human-in-the-loop approvals | A four-day approval must survive a deploy |
 | `erp_writes` | The idempotency ledger | A key is claimed before the call goes out |
 
