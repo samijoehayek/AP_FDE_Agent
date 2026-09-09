@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from ap_agent import __version__
 from ap_agent.cli import app
+from ap_agent.contracts.invoice import InvoiceExtraction
+from ap_agent.loop import runner as runner_module
 from ap_agent.states.machine import InvoiceState
+from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
 
 runner = CliRunner()
 
@@ -61,7 +67,48 @@ def test_states_check_rejects_an_illegal_transition() -> None:
     assert result.exit_code == 1
 
 
-def test_run_is_stubbed_and_says_so() -> None:
-    result = runner.invoke(app, ["run", "inv-1"])
-    assert result.exit_code == 2
-    assert "not implemented" in result.output
+def test_run_processes_an_invoice_and_reports_where_it_stopped(
+    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extraction seat is replaced, so this never reaches the API."""
+    extraction = InvoiceExtraction.model_validate(
+        {
+            "vendor_name": "Acme",
+            "invoice_number": "INV-1",
+            "invoice_date": date(2026, 1, 1),
+            "currency": "USD",
+            "subtotal": Decimal("100.00"),
+            "tax_total": Decimal("20.00"),
+            "total": Decimal("120.00"),
+            "line_items": [
+                {
+                    "description": "Widget",
+                    "quantity": Decimal(1),
+                    "unit": "EA",
+                    "unit_price": Decimal("100.00"),
+                    "extended_price": Decimal("100.00"),
+                }
+            ],
+        }
+    )
+
+    def _extract(_payload: object) -> ExtractInvoiceVisionOutput:
+        return ExtractInvoiceVisionOutput(
+            extraction=extraction,
+            model_id="claude-sonnet-5",
+            prompt_version="extract_v1",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(runner_module, "extract_invoice_vision", _extract)
+    monkeypatch.setattr(runner_module.RunContext, "__init__", runner_module.RunContext.__init__)
+    result = runner.invoke(
+        app,
+        ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")],
+    )
+    assert result.exit_code == 0, result.output
+    assert "final state : CLOSED" in result.output
+    assert "steps       : 14" in result.output
+    assert "chain intact: True" in result.output

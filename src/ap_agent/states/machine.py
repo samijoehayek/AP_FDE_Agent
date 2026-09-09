@@ -89,6 +89,9 @@ class InvoiceEvent(StrEnum):
     REJECT = "reject"
     CANCEL = "cancel"
 
+    STUB_OK = "stub_ok"
+    """A step whose tool is not written yet completed vacuously. TEMPORARY."""
+
 
 TERMINAL_STATES: frozenset[InvoiceState] = frozenset(
     {InvoiceState.CLOSED, InvoiceState.REJECTED, InvoiceState.CANCELLED}
@@ -170,6 +173,52 @@ this pipeline may quietly rewrite.
 """
 
 TRANSITIONS.update({(state, _E.CANCEL): _S.CANCELLED for state in _CANCELLABLE})
+
+
+STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
+    # TEMP STUB: vendor resolution is not implemented (lookup_vendor is a stub).
+    (_S.VALIDATED, _E.STUB_OK): _S.VENDOR_RESOLVED,
+    # TEMP STUB: duplicate detection is not implemented (find_duplicates).
+    (_S.VENDOR_RESOLVED, _E.STUB_OK): _S.DUPLICATE_CHECKED,
+    # TEMP STUB: three-way matching is not implemented (compute_match).
+    (_S.DUPLICATE_CHECKED, _E.STUB_OK): _S.MATCHED,
+    # TEMP STUB: GL coding is not implemented (propose_gl_coding).
+    (_S.MATCHED, _E.STUB_OK): _S.CODED,
+    # TEMP STUB: approval routing is not implemented (request_approval).
+    (_S.CODED, _E.STUB_OK): _S.PENDING_APPROVAL,
+    # TEMP STUB: THE DANGEROUS ONE. This lets a machine approve an invoice with
+    # no human anywhere near it, which is the single thing this system exists to
+    # prevent. It is here only so the happy path can be exercised end to end
+    # before request_approval is written. Delete it the moment approvals are
+    # real, and never ship it.
+    (_S.PENDING_APPROVAL, _E.STUB_OK): _S.APPROVED,
+    # TEMP STUB: the ERP write is not implemented (create_bill).
+    (_S.APPROVED, _E.STUB_OK): _S.POSTED,
+    # TEMP STUB: payment scheduling is not implemented (mark_ready_for_payment).
+    (_S.POSTED, _E.STUB_OK): _S.SCHEDULED,
+    # TEMP STUB: payment confirmation comes from outside this system entirely.
+    (_S.SCHEDULED, _E.STUB_OK): _S.PAID,
+    # TEMP STUB: reconciliation is not implemented.
+    (_S.PAID, _E.STUB_OK): _S.RECONCILED,
+    # TEMP STUB: closing is not implemented.
+    (_S.RECONCILED, _E.STUB_OK): _S.CLOSED,
+}
+"""Edges that exist only because the tools behind them do not.
+
+Kept in their own table rather than mixed into ``TRANSITIONS`` so that "what is
+real" and "what is scaffolding" can be told apart at a glance, and so a test can
+enumerate them. ``tests/states/test_stub_transitions.py`` lists every one, which
+means deleting a stub is a deliberate act with a failing test to confirm it -
+not something that happens by accident while editing nearby lines.
+
+Note what is deliberately absent: no stub edge leaves NEEDS_HUMAN_EXTRACTION,
+ON_HOLD_DUPLICATE, EXCEPTION or NEW_VENDOR. Those states exist because a human
+is required, and a stub that walked past them would be simulating the approval
+this system is built to insist on. The loop asks for a stub step there, the
+table refuses, and the run halts - which is the correct outcome.
+"""
+
+TRANSITIONS.update(STUB_TRANSITIONS)
 
 
 def transition(state: InvoiceState, event: str) -> InvoiceState:

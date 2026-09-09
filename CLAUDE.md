@@ -78,10 +78,16 @@ Rules are not honour-system. Most of them fail a test if broken:
 
 ## What is stubbed, and why
 
-`loop/`, `guardrails/config.py`, `audit/writer.py`, `audit/chain.py`,
-`evals/golden.py`, `scripts/generate_invoices.py`, and every tool except
-`ingest_document` raise `NotImplementedError` under a docstring describing the
-responsibility and the constraints. That is deliberate: the owner is writing
+`guardrails/config.py`, `audit/chain.py`, `evals/golden.py`,
+`scripts/generate_invoices.py`, `PostgresAuditWriter`, and every tool except
+`ingest_document` and `extract_invoice_vision` raise `NotImplementedError` under
+a docstring describing the responsibility and the constraints.
+
+The agent loop (`loop/runner.py`) and the JSONL audit writer are now real. The
+states between `VALIDATED` and `CLOSED` are crossed by `STUB_TRANSITIONS` -
+enumerated in `states/machine.py` and asserted in
+`tests/states/test_stub_transitions.py`. One of them lets a machine approve an
+invoice; delete it the moment `request_approval` exists. That is deliberate: the owner is writing
 those by hand. Do not fill them in speculatively. If a session's task genuinely
 requires one of them, say so and ask.
 

@@ -79,6 +79,10 @@ verify-audit:
 pull-data *ARGS:
     uv run python scripts/pull_hf_datasets.py {{ARGS}}
 
+# Run one invoice through the agent loop. Spends tokens (extraction calls the API).
+run PATH *ARGS:
+    uv run ap-agent run {{PATH}} {{ARGS}}
+
 # Read one invoice with the extraction model. Spends tokens.
 extract PATH *ARGS:
     uv run ap-agent extract {{PATH}} {{ARGS}}

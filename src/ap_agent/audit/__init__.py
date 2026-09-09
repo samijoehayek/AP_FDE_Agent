@@ -9,7 +9,12 @@ because this is where a reader will look for it.
 from __future__ import annotations
 
 from ap_agent.audit.chain import ChainVerification, compute_event_hash, verify_chain
-from ap_agent.audit.writer import AuditWriter, PostgresAuditWriter
+from ap_agent.audit.writer import (
+    AuditWriter,
+    JsonlAuditWriter,
+    PostgresAuditWriter,
+    chain_hash,
+)
 from ap_agent.contracts.audit import (
     GENESIS_HASH,
     Actor,
@@ -29,11 +34,13 @@ __all__ = [
     "AuditWriter",
     "ChainVerification",
     "HumanActor",
+    "JsonlAuditWriter",
     "ModelActor",
     "PostgresAuditWriter",
     "RuleActor",
     "SystemActor",
     "ToolActor",
+    "chain_hash",
     "compute_event_hash",
     "utc_now",
     "verify_chain",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from ap_agent.errors import IllegalTransition
 from ap_agent.states.machine import (
     APPROVAL_GATE,
+    STUB_TRANSITIONS,
     TERMINAL_STATES,
     TRANSITIONS,
     InvoiceEvent,
@@ -18,6 +19,7 @@ from ap_agent.states.machine import (
 
 __all__ = [
     "APPROVAL_GATE",
+    "STUB_TRANSITIONS",
     "TERMINAL_STATES",
     "TRANSITIONS",
     "IllegalTransition",

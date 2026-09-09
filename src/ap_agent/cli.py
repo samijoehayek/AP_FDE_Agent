@@ -12,9 +12,16 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from ulid import ULID
 
 from ap_agent import __version__
+from ap_agent.audit.writer import JsonlAuditWriter
+from ap_agent.config import REPO_ROOT
+from ap_agent.contracts.audit import utc_now
+from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.errors import APAgentError
+from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext
+from ap_agent.loop.runner import run as loop_run
 from ap_agent.states.machine import (
     TERMINAL_STATES,
     TRANSITIONS,
@@ -145,16 +152,34 @@ def states_check(
 
 
 @app.command(name="run")
-def run(
-    invoice_id: Annotated[str, typer.Argument(help="Invoice to advance.")],
+def run_invoice(
+    path: Annotated[Path, typer.Argument(help="Invoice document to process.")],
+    max_steps: Annotated[
+        int, typer.Option("--max-steps", min=1, help="Step budget before escalating.")
+    ] = DEFAULT_MAX_STEPS,
+    audit_dir: Annotated[
+        Path, typer.Option("--audit-dir", help="Where the JSONL trail is written.")
+    ] = REPO_ROOT / "data" / "audit",
 ) -> None:
-    """Advance one invoice through the pipeline. NOT IMPLEMENTED."""
-    typer.secho(
-        f"the agent loop is not implemented yet (invoice {invoice_id})",
-        fg=typer.colors.YELLOW,
-        err=True,
-    )
-    raise typer.Exit(code=2)
+    """Run one invoice through the loop and print where it stopped.
+
+    This spends tokens: the extraction step calls the API. Most other steps are
+    stubs, so a run that reaches CLOSED has proved the pipeline's shape, not
+    that an invoice was really matched, approved or posted.
+    """
+    record = InvoiceRecord(source_path=path, created_at=utc_now())
+    writer = JsonlAuditWriter(audit_dir)
+    ctx = RunContext(run_id=str(ULID()), writer=writer)
+
+    final = loop_run(record, ctx, max_steps=max_steps)
+
+    colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
+    typer.secho(f"final state : {final.state.value}", fg=colour)
+    typer.echo(f"steps       : {len(ctx.events)}")
+    typer.echo(f"audit trail : {writer.path_for(str(record.invoice_id))}")
+    typer.echo(f"chain intact: {writer.verify(str(record.invoice_id))}")
+    if final.validation_flags:
+        typer.secho(f"validation  : {', '.join(final.validation_flags)}", fg=typer.colors.YELLOW)
 
 
 if __name__ == "__main__":  # pragma: no cover

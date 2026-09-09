@@ -109,12 +109,15 @@ stateDiagram-v2
     [*] --> RECEIVED
     APPROVED --> POSTED: post
     APPROVED --> EXCEPTION: post_failed
+    APPROVED --> POSTED: stub_ok
     CODED --> CANCELLED: cancel
     CODED --> PENDING_APPROVAL: request_approval
+    CODED --> PENDING_APPROVAL: stub_ok
     DUPLICATE_CHECKED --> CANCELLED: cancel
     DUPLICATE_CHECKED --> MATCHED: match
     DUPLICATE_CHECKED --> EXCEPTION: match_exception
     DUPLICATE_CHECKED --> NON_PO: no_po_reference
+    DUPLICATE_CHECKED --> MATCHED: stub_ok
     EXCEPTION --> CANCELLED: cancel
     EXCEPTION --> MATCHED: exception_resolved
     EXCEPTION --> REJECTED: reject
@@ -126,6 +129,7 @@ stateDiagram-v2
     INGESTED --> NEEDS_HUMAN_EXTRACTION: extraction_failed
     MATCHED --> CANCELLED: cancel
     MATCHED --> CODED: code
+    MATCHED --> CODED: stub_ok
     NEEDS_HUMAN_EXTRACTION --> CANCELLED: cancel
     NEEDS_HUMAN_EXTRACTION --> EXTRACTED: human_extraction_provided
     NEW_VENDOR --> CANCELLED: cancel
@@ -138,22 +142,29 @@ stateDiagram-v2
     ON_HOLD_DUPLICATE --> REJECTED: confirm_duplicate
     ON_HOLD_DUPLICATE --> DUPLICATE_CHECKED: duplicate_cleared
     PAID --> RECONCILED: reconcile
+    PAID --> RECONCILED: stub_ok
     PENDING_APPROVAL --> APPROVED: approve
     PENDING_APPROVAL --> CANCELLED: cancel
     PENDING_APPROVAL --> REJECTED: reject
     PENDING_APPROVAL --> EXCEPTION: request_changes
+    PENDING_APPROVAL --> APPROVED: stub_ok
     POSTED --> SCHEDULED: schedule_payment
+    POSTED --> SCHEDULED: stub_ok
     RECEIVED --> CANCELLED: cancel
     RECEIVED --> INGESTED: ingest
     RECONCILED --> CLOSED: close
+    RECONCILED --> CLOSED: stub_ok
     SCHEDULED --> PAID: payment_confirmed
     SCHEDULED --> POSTED: payment_failed
+    SCHEDULED --> PAID: stub_ok
     VALIDATED --> CANCELLED: cancel
     VALIDATED --> VENDOR_RESOLVED: resolve_vendor
+    VALIDATED --> VENDOR_RESOLVED: stub_ok
     VALIDATED --> NEW_VENDOR: vendor_not_found
     VENDOR_RESOLVED --> CANCELLED: cancel
     VENDOR_RESOLVED --> DUPLICATE_CHECKED: check_duplicates
     VENDOR_RESOLVED --> ON_HOLD_DUPLICATE: duplicate_suspected
+    VENDOR_RESOLVED --> DUPLICATE_CHECKED: stub_ok
     CANCELLED --> [*]
     CLOSED --> [*]
     REJECTED --> [*]
