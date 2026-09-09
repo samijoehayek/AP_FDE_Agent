@@ -70,7 +70,11 @@ jobs:
           --health-retries 10
 
     env:
-      DATABASE_URL: postgresql+psycopg://ap_agent:ap_agent@localhost:5432/ap_agent
+      # Same two-role split as the compose stack. The application connects as an
+      # ordinary role so the grants on audit_events actually bind; migrations
+      # connect as the owner.
+      DATABASE_URL: postgresql+psycopg://ap_agent_app:ap_agent_app@localhost:5432/ap_agent
+      DATABASE_MIGRATION_URL: postgresql+psycopg://ap_agent:ap_agent@localhost:5432/ap_agent
 
     steps:
       - uses: actions/checkout@v7
@@ -85,8 +89,26 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-groups --frozen
 
+      # The compose stack does this from docker-entrypoint-initdb.d, which a
+      # service container does not have. Run the same file so CI and local are
+      # provisioned identically rather than approximately.
+      - name: Create the application role
+        run: |
+          uv run python -c "
+          import psycopg
+          from ap_agent.config import get_settings
+          dsn = get_settings().database_migration_url.replace('postgresql+psycopg://', 'postgresql://')
+          with psycopg.connect(dsn, autocommit=True) as c:
+              c.execute(open('docker/initdb/010-app-role.sql').read())
+          "
+
       - name: Run migrations
         run: uv run alembic upgrade head
+
+      # A control nobody exercises is a control nobody can trust. This one was
+      # silently broken once; now a regression fails the build.
+      - name: Verify audit_events is append-only
+        run: uv run python scripts/verify_append_only.py
 
       - name: pytest
         run: uv run pytest --cov --cov-report=term-missing --cov-report=xml

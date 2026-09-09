@@ -17,13 +17,21 @@
 -- In production this role comes from your infrastructure, and the migration
 -- grants to whatever AP_AGENT_DB_APP_ROLE names.
 
-CREATE ROLE ap_agent_app
-    LOGIN
-    PASSWORD 'ap_agent_app'
-    NOSUPERUSER
-    NOCREATEDB
-    NOCREATEROLE
-    NOBYPASSRLS;
+-- Idempotent so CI, which provisions the role after the container is already
+-- up, can run this file directly rather than duplicating it in YAML.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ap_agent_app') THEN
+        CREATE ROLE ap_agent_app
+            LOGIN
+            PASSWORD 'ap_agent_app'
+            NOSUPERUSER
+            NOCREATEDB
+            NOCREATEROLE
+            NOBYPASSRLS;
+    END IF;
+END
+$$;
 
 GRANT CONNECT ON DATABASE ap_agent TO ap_agent_app;
 GRANT USAGE ON SCHEMA public TO ap_agent_app;

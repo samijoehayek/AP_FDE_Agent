@@ -89,11 +89,18 @@ def test_alembic_connects_as_the_owner_not_the_application() -> None:
     assert "get_settings().database_migration_url" in env
 
 
-def test_the_application_role_is_not_the_owner() -> None:
-    """A superuser bypasses every grant, which is what made 0001's revoke a no-op."""
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.database_url != settings.database_migration_url
-    assert "ap_agent_app" in settings.database_url
+def test_the_shipped_defaults_use_two_distinct_roles() -> None:
+    """A superuser bypasses every grant, which is what made 0001's revoke a no-op.
+
+    Asserted against the declared field defaults rather than a resolved
+    ``Settings``, because a deployment is free to set DATABASE_URL to anything
+    and a test that reads the ambient environment tests the environment.
+    """
+    app_url = Settings.model_fields["database_url"].default
+    owner_url = Settings.model_fields["database_migration_url"].default
+    assert app_url != owner_url
+    assert "ap_agent_app" in app_url
+    assert "ap_agent_app" not in owner_url
 
 
 def test_the_append_only_grant_targets_the_application_role() -> None:

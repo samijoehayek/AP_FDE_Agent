@@ -62,8 +62,14 @@ just setup          # uv sync + pre-commit install
 just db-up          # Postgres 18 in Docker
 just db-migrate     # alembic upgrade head
 just test           # ruff + pyright + pytest
-uv run ap-agent states graph    # print the transition table as Mermaid
+just verify-audit   # prove the audit trail cannot be rewritten
 ```
+
+The database runs two roles. The application connects as `ap_agent_app`, an
+ordinary role, so the revoke that makes `audit_events` append-only actually
+binds; migrations connect as the owner `ap_agent`. Pointing `DATABASE_URL` at
+the owner silently disables the control, which is why `just verify-audit`
+exists and runs in CI.
 
 Requires [uv](https://docs.astral.sh/uv/), [just](https://just.systems), and
 Docker. Copy `.env.example` to `.env` before running anything that talks to the
@@ -79,6 +85,7 @@ API or the database.
 | `just test` | Lint, typecheck, and pytest with coverage |
 | `just db-up` / `just db-down` | Postgres via docker compose |
 | `just db-migrate` | `alembic upgrade head` |
+| `just verify-audit` | Prove `audit_events` refuses UPDATE, DELETE and TRUNCATE |
 | `just db-revision "msg"` | Autogenerate a migration from the models |
 | `just ingest` | Index every document under `data/` into `data/index.csv` |
 | `just pull-data` | Stream sample corpora from Hugging Face |

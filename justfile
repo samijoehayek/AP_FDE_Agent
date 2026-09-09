@@ -61,6 +61,10 @@ db-revision message:
 db-shell:
     docker compose exec postgres psql -U ap_agent -d ap_agent
 
+# Prove audit_events refuses UPDATE, DELETE and TRUNCATE for the app role.
+verify-audit:
+    uv run python scripts/verify_append_only.py
+
 # --- data ------------------------------------------------------------------
 
 # Print dataset licences, then stream sample corpora into data/synthetic/.
