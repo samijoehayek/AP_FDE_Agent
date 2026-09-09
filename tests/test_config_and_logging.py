@@ -7,6 +7,7 @@ is a setting nobody sets, and the drift is invisible until someone deploys.
 from __future__ import annotations
 
 import structlog
+from pydantic import SecretStr
 
 from ap_agent.config import REPO_ROOT, Settings, get_settings
 from ap_agent.logging import configure_logging, get_logger
@@ -32,16 +33,25 @@ def test_env_example_documents_nothing_that_does_not_exist() -> None:
     assert not stale, f".env.example documents settings that do not exist: {stale}"
 
 
-def test_settings_work_with_no_environment_at_all() -> None:
-    """Ingestion, indexing, and the whole suite must run without a key."""
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.anthropic_api_key.get_secret_value() == ""
-    assert settings.qbo_environment == "sandbox"
+def test_the_shipped_defaults_need_no_credentials() -> None:
+    """Ingestion, indexing, and the whole suite must run without a key.
+
+    Asserted against the declared field defaults rather than a resolved
+    ``Settings``. ``_env_file=None`` disables the dotenv *file*, but the deepeval
+    pytest plugin loads `.env` into ``os.environ`` at collection time, so a
+    resolved instance under pytest reflects whatever the developer has on disk.
+    A test about shipped defaults must not read the ambient environment.
+    """
+    fields = Settings.model_fields
+    assert fields["anthropic_api_key"].default.get_secret_value() == ""
+    assert fields["qbo_environment"].default == "sandbox"
 
 
 def test_secrets_do_not_render_in_a_repr() -> None:
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert "get_secret_value" not in repr(settings.anthropic_api_key)
+    """A key that renders in a log line is a key in the log."""
+    settings = Settings(anthropic_api_key=SecretStr("sk-ant-notreal"))
+    assert "notreal" not in repr(settings)
+    assert "notreal" not in str(settings.anthropic_api_key)
     assert "SecretStr" in repr(settings.anthropic_api_key)
 
 
@@ -50,14 +60,12 @@ def test_settings_are_cached() -> None:
 
 
 def test_the_guardrails_path_points_at_a_file_that_exists() -> None:
-    assert Settings(_env_file=None).guardrails_config_path.is_file()  # type: ignore[call-arg]
+    assert Settings.model_fields["guardrails_config_path"].default.is_file()
 
 
 def test_the_database_url_uses_psycopg3() -> None:
     """`postgresql://` would silently select psycopg2, which is not installed."""
-    assert Settings(_env_file=None).database_url.startswith(  # type: ignore[call-arg]
-        "postgresql+psycopg://"
-    )
+    assert Settings.model_fields["database_url"].default.startswith("postgresql+psycopg://")
 
 
 def test_configure_logging_is_idempotent() -> None:

@@ -32,3 +32,13 @@ class IngestionError(APAgentError):
 
 class UnsupportedDocumentError(IngestionError):
     """The document's media type is not one this pipeline accepts."""
+
+
+class ExtractionError(APAgentError):
+    """Reading a document into an :class:`InvoiceExtraction` failed.
+
+    Covers the API call and the validation of what came back. Both are failures
+    of the same step from the caller's point of view - there is no extraction -
+    and both route the invoice to ``NEEDS_HUMAN_EXTRACTION``. The underlying
+    cause is always chained, so the audit event can record what actually broke.
+    """

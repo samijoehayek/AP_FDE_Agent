@@ -151,7 +151,24 @@ def test_idempotent_tools_carry_the_key_on_their_input_model(name: str) -> None:
 # --- stubs ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", sorted(set(TOOL_MODULE_NAMES) - {"ingest_document"}))
+def _is_stub(name: str) -> bool:
+    module = _module(name)
+    return "raise NotImplementedError" in inspect.getsource(getattr(module, name))
+
+
+STUB_TOOLS = sorted(name for name in TOOL_MODULE_NAMES if _is_stub(name))
+"""Derived, not hand-maintained, so implementing a tool does not break this file."""
+
+
+def test_some_tools_are_implemented() -> None:
+    """Guards the derivation above: if every tool looked like a stub, so would a bug."""
+    assert set(TOOL_MODULE_NAMES) - set(STUB_TOOLS) >= {
+        "ingest_document",
+        "extract_invoice_vision",
+    }
+
+
+@pytest.mark.parametrize("name", STUB_TOOLS)
 def test_unimplemented_tools_fail_loudly(name: str) -> None:
     """A stub that returns a plausible default is worse than one that raises."""
     module = _module(name)

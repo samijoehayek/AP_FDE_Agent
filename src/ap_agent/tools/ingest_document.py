@@ -193,7 +193,7 @@ def _sha256_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _sniff_media_type(header: bytes) -> tuple[str, str]:
+def sniff_media_type(header: bytes) -> tuple[str, str]:
     """Return ``(media_type, pymupdf_filetype)`` from a file's leading bytes.
 
     Raises:
@@ -261,7 +261,7 @@ def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
 
     with path.open("rb") as handle:
         header = handle.read(16)
-    media_type, filetype = _sniff_media_type(header)
+    media_type, filetype = sniff_media_type(header)
 
     data = path.read_bytes()
     try:

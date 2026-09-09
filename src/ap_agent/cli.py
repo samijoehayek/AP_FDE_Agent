@@ -23,6 +23,11 @@ from ap_agent.states.machine import (
     to_mermaid,
     transition,
 )
+from ap_agent.tools.extract_invoice_vision import (
+    PROMPT_VERSION,
+    ExtractInvoiceVisionInput,
+    extract_invoice_vision,
+)
 from ap_agent.tools.ingest_document import IngestDocumentInput, ingest_document
 
 app = typer.Typer(
@@ -59,6 +64,38 @@ def ingest(
     payload["is_born_digital"] = result.is_born_digital
     payload["min_sharpness"] = result.min_sharpness
     typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command()
+def extract(
+    path: Annotated[Path, typer.Argument(help="Invoice document to read.")],
+    model: Annotated[
+        str | None, typer.Option("--model", help="Overrides Settings.extraction_model.")
+    ] = None,
+    prompt_version: Annotated[
+        str, typer.Option("--prompt-version", help="Selects prompts/<version>.md.")
+    ] = PROMPT_VERSION,
+) -> None:
+    """Read one invoice with the extraction model and print the result.
+
+    This spends tokens. It is the only command in this CLI that calls an API.
+    """
+    try:
+        result = extract_invoice_vision(
+            ExtractInvoiceVisionInput(path=path, model_id=model, prompt_version=prompt_version)
+        )
+    except APAgentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(json.dumps(result.extraction.model_dump(mode="json"), indent=2))
+    typer.secho(
+        f"{result.model_id}  prompt={result.prompt_version}  "
+        f"in={result.input_tokens} out={result.output_tokens} tokens  "
+        f"{result.latency_ms} ms",
+        fg=typer.colors.CYAN,
+        err=True,
+    )
 
 
 @states_app.command("graph")
