@@ -20,13 +20,14 @@ Four decisions worth reading before adding a fifth table:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -92,7 +93,12 @@ class Invoice(Base):
     vendor_id: Mapped[str | None] = mapped_column(String(_ID_LEN), nullable=True)
     vendor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     invoice_number: Mapped[str | None] = mapped_column(String(_ID_LEN), nullable=True)
-    invoice_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Date, not DateTime. An invoice date is a calendar date printed on paper:
+    # it has no time and no timezone, and storing it as timestamptz invents both.
+    # That matters here - invoice_date drives payment terms and the duplicate
+    # detection window, so a timezone conversion that shifts it by a day is a
+    # wrong due date or a missed duplicate.
+    invoice_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     total: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)

@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
@@ -42,6 +43,39 @@ def test_there_is_exactly_one_head(script: ScriptDirectory) -> None:
 def test_every_revision_has_a_docstring(script: ScriptDirectory) -> None:
     for revision in script.walk_revisions():
         assert revision.doc, f"{revision.revision} has no message"
+
+
+def test_a_calendar_date_is_never_stored_as_a_timestamp() -> None:
+    """invoice_date shipped as timestamptz while its contract was a date.
+
+    Postgres attaches the session timezone to a timestamptz and converts on read,
+    so the same row can read as a different day depending on who asks. Here that
+    is a wrong due date or a missed duplicate, not a cosmetic difference.
+
+    Columns that are genuine instants keep timestamptz; the ``_at``/``ts_``/
+    ``_by`` suffixes mark them.
+    """
+    instants = ("_at", "ts_", "_by")
+    offenders = [
+        f"{table.name}.{column.name} is {type(column.type).__name__}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if "date" in column.name
+        and not any(marker in column.name for marker in instants)
+        and isinstance(column.type, sa.DateTime)
+    ]
+    assert not offenders, offenders
+
+
+def test_temporal_instants_are_timezone_aware() -> None:
+    """A naive timestamp in an audit trail cannot be ordered against anything."""
+    naive = [
+        f"{table.name}.{column.name}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, sa.DateTime) and not column.type.timezone
+    ]
+    assert not naive, naive
 
 
 def test_the_models_and_the_metadata_agree() -> None:
