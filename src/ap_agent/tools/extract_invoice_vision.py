@@ -30,7 +30,7 @@ import functools
 import io
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import anthropic
 from anthropic.types import (
@@ -171,12 +171,24 @@ def build_content_block(path: Path) -> ImageBlockParam | DocumentBlockParam:
 def _build_client() -> anthropic.Anthropic:
     """Construct the API client.
 
+    Two settings are conditional rather than always sent.
+
     An empty ``ANTHROPIC_API_KEY`` is not the same as no credentials - the SDK
     also resolves ``ANTHROPIC_AUTH_TOKEN`` and an ``ant auth login`` profile - so
     an empty setting means "let the SDK decide", not "send an empty key".
+
+    ``anthropic-workspace-id`` is sent only when configured. An organisation-
+    scoped key resolves no workspace of its own and the API rejects the request
+    without that header; a workspace-scoped key already carries one, and sending
+    the header anyway would override it.
     """
-    key = get_settings().anthropic_api_key.get_secret_value()
-    return anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+    settings = get_settings()
+    kwargs: dict[str, Any] = {}
+    if key := settings.anthropic_api_key.get_secret_value():
+        kwargs["api_key"] = key
+    if workspace_id := settings.anthropic_workspace_id:
+        kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
+    return anthropic.Anthropic(**kwargs)
 
 
 class ExtractInvoiceVisionInput(ToolInput):

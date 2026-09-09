@@ -18,6 +18,7 @@ import anthropic
 import pytest
 from PIL import Image
 
+from ap_agent.config import get_settings
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.errors import ExtractionError
 from ap_agent.tools.extract_invoice_vision import (
@@ -159,6 +160,53 @@ def test_the_result_carries_what_the_audit_trail_needs(
     assert result.input_tokens == 4321
     assert result.output_tokens == 765
     assert result.latency_ms >= 0
+
+
+# --- workspace scoping ------------------------------------------------------
+
+
+def _client_kwargs(
+    monkeypatch: pytest.MonkeyPatch, pdf: Path, extraction: InvoiceExtraction
+) -> dict[str, Any]:
+    """Run an extraction and return the kwargs the SDK client was built with."""
+    seen: dict[str, Any] = {}
+    client = MagicMock()
+    client.messages.parse = _client_factory(_fake_response(extraction))
+
+    def _construct(*_args: object, **kwargs: object) -> MagicMock:
+        seen.update(kwargs)
+        return client
+
+    monkeypatch.setattr(anthropic, "Anthropic", _construct)
+    extract_invoice_vision(ExtractInvoiceVisionInput(path=pdf))
+    return seen
+
+
+def test_the_workspace_header_is_omitted_when_unset(
+    monkeypatch: pytest.MonkeyPatch, born_digital_pdf: Path, sample_extraction: InvoiceExtraction
+) -> None:
+    """A workspace-scoped key carries its own workspace; a header would override it."""
+    monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "")
+    get_settings.cache_clear()
+    try:
+        assert "default_headers" not in _client_kwargs(
+            monkeypatch, born_digital_pdf, sample_extraction
+        )
+    finally:
+        get_settings.cache_clear()
+
+
+def test_the_workspace_header_is_sent_when_configured(
+    monkeypatch: pytest.MonkeyPatch, born_digital_pdf: Path, sample_extraction: InvoiceExtraction
+) -> None:
+    """An organisation-scoped key is rejected with a 400 without this header."""
+    monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_test123")
+    get_settings.cache_clear()
+    try:
+        kwargs = _client_kwargs(monkeypatch, born_digital_pdf, sample_extraction)
+        assert kwargs["default_headers"] == {"anthropic-workspace-id": "wrkspc_test123"}
+    finally:
+        get_settings.cache_clear()
 
 
 # --- content blocks ---------------------------------------------------------

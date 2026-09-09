@@ -36,6 +36,13 @@ class Settings(BaseSettings):
         default=SecretStr(""),
         description="Anthropic API key. Empty is valid for offline work (tests, ingestion).",
     )
+    anthropic_workspace_id: str = Field(
+        default="",
+        description="Required only when the API key is organisation-scoped rather than scoped "
+        "to a workspace. Such a key carries no workspace of its own, so the API rejects the "
+        "request unless the `anthropic-workspace-id` header names one. Empty means the key "
+        "already resolves a workspace and the header is omitted.",
+    )
     extraction_model: str = Field(
         default="claude-sonnet-5",
         description="Model id for the document-extraction seat. This model has no tools.",
