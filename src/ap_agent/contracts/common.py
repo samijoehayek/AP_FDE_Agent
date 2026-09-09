@@ -20,13 +20,19 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 CURRENCY_ALLOWLIST: frozenset[str] = frozenset(
-    {"USD", "EUR", "GBP", "CAD", "AUD", "CHF", "JPY", "SEK", "SGD", "MXN"}
+    {"USD", "EUR", "GBP", "INR", "CAD", "AUD", "CHF", "JPY", "SEK", "SGD", "MXN"}
 )
 """ISO-4217 codes this pipeline will price.
 
 Deliberately small. An invoice in a currency that is not here is an exception
 for a human, not a silent pass-through - an unexpected currency is one of the
 cheapest signals that a document is not what it claims to be.
+
+The list is a calibration, not a constant: it should hold the currencies the
+business actually trades in and nothing more. INR is here because every invoice
+in the Kaggle corpus is Indian, which the first live extraction discovered by
+being refused. Widen it when the corpus or the business does - never to make a
+single awkward document go through.
 """
 
 MAX_SNIPPET_CHARS = 200

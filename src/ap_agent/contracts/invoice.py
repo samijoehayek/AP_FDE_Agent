@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from typing import Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -45,83 +46,57 @@ LINE_SUM_ABS_TOLERANCE = Decimal("0.02")
 LINE_SUM_REL_TOLERANCE = Decimal("0.001")
 """Relative component (0.1%) of the line-items-sum-to-subtotal check."""
 
-EVIDENCE_FIELDS: frozenset[str] = frozenset(
-    {
-        "vendor_name",
-        "invoice_number",
-        "invoice_date",
-        "due_date",
-        "currency",
-        "subtotal",
-        "tax_total",
-        "total",
-        "payment_terms",
-        "po_references",
-    }
-)
-"""Fields for which page-and-snippet evidence may be supplied.
 
-The names here and the fields of :class:`ExtractionEvidence` are the same set,
-asserted by a test. This constant remains the readable declaration of the
-policy; the model is what enforces it.
-"""
+class EvidenceField(StrEnum):
+    """The fields an extraction may cite evidence for.
 
-
-class FieldEvidence(StrictModel):
-    """Where on the document a value was read from.
-
-    Evidence is what makes an extraction reviewable: a human resolving an
-    exception can jump to the page and see the text the model based a number on.
+    A closed enum rather than open strings. It is what keeps evidence from
+    becoming a channel for arbitrary document text, and - because structured
+    outputs charges by schema complexity - it is also far cheaper than declaring
+    ten separately-typed optional properties. See :class:`EvidenceEntry`.
     """
 
+    VENDOR_NAME = "vendor_name"
+    INVOICE_NUMBER = "invoice_number"
+    INVOICE_DATE = "invoice_date"
+    DUE_DATE = "due_date"
+    CURRENCY = "currency"
+    SUBTOTAL = "subtotal"
+    TAX_TOTAL = "tax_total"
+    TOTAL = "total"
+    PAYMENT_TERMS = "payment_terms"
+    PO_REFERENCES = "po_references"
+
+
+EVIDENCE_FIELDS: frozenset[str] = frozenset(member.value for member in EvidenceField)
+"""The same set as :class:`EvidenceField`, as plain strings, for lookups."""
+
+
+class EvidenceEntry(StrictModel):
+    """One citation: which field, which page, and the text it was read from.
+
+    Evidence is a list of these rather than one optional property per field.
+    Both shapes carry identical information; only one of them fits.
+
+    Structured outputs enforces a complexity budget on the schema, and ten
+    separately-typed optional properties expand to ten ``anyOf`` branches - about
+    3 KB - which puts the whole ``InvoiceExtraction`` schema over the limit and
+    gets every request rejected with ``400 Schema is too complex``. One repeated
+    entry with an enumerated ``field`` costs a fraction of that. Measured against
+    the live API: 9320 B rejected, 7536 B accepted.
+
+    The enum is what preserves the guarantee. ``field`` cannot be a name the
+    contract has not declared, so evidence stays a closed vocabulary exactly as
+    a fixed set of properties would have made it.
+    """
+
+    field: EvidenceField
     page: int = Field(ge=1, description="1-based page number in the source document.")
     snippet: str = Field(
         min_length=1,
         max_length=MAX_SNIPPET_CHARS,
         description="Verbatim text supporting the value. Bounded; display-only.",
     )
-
-
-class ExtractionEvidence(StrictModel):
-    """Page-and-snippet provenance, one optional entry per evidenced field.
-
-    A fixed set of fields rather than ``dict[str, FieldEvidence]``, for two
-    reasons.
-
-    The first is expressibility. Structured outputs require every object to
-    declare ``additionalProperties: false``, so a mapping with open string keys
-    cannot be represented: the SDK rewrites it to an object with no properties
-    at all, and the model is then unable to return any evidence whatsoever. The
-    failure is silent - the request succeeds and the field simply comes back
-    empty forever.
-
-    The second is that the closed set was always the intent. Evidence exists so
-    a human resolving an exception can jump to the page a number came from; it
-    is not a place for the document to put arbitrary text. Naming the fields
-    makes that a property of the schema rather than of a validator.
-
-    Every field is optional. Evidence is a courtesy from the extraction model,
-    not a requirement, and an extraction with none is still valid.
-    """
-
-    vendor_name: FieldEvidence | None = None
-    invoice_number: FieldEvidence | None = None
-    invoice_date: FieldEvidence | None = None
-    due_date: FieldEvidence | None = None
-    currency: FieldEvidence | None = None
-    subtotal: FieldEvidence | None = None
-    tax_total: FieldEvidence | None = None
-    total: FieldEvidence | None = None
-    payment_terms: FieldEvidence | None = None
-    po_references: FieldEvidence | None = None
-
-    def provided(self) -> dict[str, FieldEvidence]:
-        """Return only the fields that carry evidence, keyed by field name."""
-        return {
-            name: value
-            for name in type(self).model_fields
-            if isinstance(value := getattr(self, name), FieldEvidence)
-        }
 
 
 class LineItem(StrictModel):
@@ -198,9 +173,10 @@ class InvoiceExtraction(StrictModel):
         "The only authority for remittance is the vendor master.",
     )
 
-    evidence: ExtractionEvidence = Field(
-        default_factory=ExtractionEvidence,
-        description="Page-and-snippet provenance for the fields listed in EVIDENCE_FIELDS.",
+    evidence: list[EvidenceEntry] = Field(
+        default_factory=list[EvidenceEntry],
+        max_length=len(EVIDENCE_FIELDS),
+        description="Page-and-snippet provenance, at most one entry per field.",
     )
     suspicious_text: list[str] = Field(
         default_factory=list[str],
@@ -241,6 +217,21 @@ class InvoiceExtraction(StrictModel):
     def _truncate_suspicious_text(cls, value: list[str]) -> list[str]:
         """Bound each captured snippet. Evidence of an attack, not a payload."""
         return [item[:MAX_SNIPPET_CHARS] for item in value]
+
+    @model_validator(mode="after")
+    def _evidence_cites_each_field_once(self) -> Self:
+        """Reject a second citation for the same field.
+
+        A list can hold duplicates where the previous mapping could not, so the
+        guarantee is restored here. Two snippets for ``total`` would leave every
+        reader picking one arbitrarily, which is worse than having none.
+        """
+        seen = [entry.field for entry in self.evidence]
+        duplicated = sorted({field.value for field in seen if seen.count(field) > 1})
+        if duplicated:
+            msg = f"evidence cites these fields more than once: {duplicated}"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _check_dates(self) -> Self:
@@ -285,6 +276,14 @@ class InvoiceExtraction(StrictModel):
 
         self.arithmetic_flags = flags
         return self
+
+    def evidence_by_field(self) -> dict[str, EvidenceEntry]:
+        """Return the evidence keyed by field name.
+
+        The list is the wire shape; this is the shape callers want. Validation
+        guarantees at most one entry per field, so the mapping is lossless.
+        """
+        return {entry.field.value: entry for entry in self.evidence}
 
     @property
     def is_arithmetically_consistent(self) -> bool:

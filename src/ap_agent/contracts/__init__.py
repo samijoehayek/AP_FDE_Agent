@@ -49,8 +49,8 @@ from ap_agent.contracts.enums import (
 from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import (
     EVIDENCE_FIELDS,
-    ExtractionEvidence,
-    FieldEvidence,
+    EvidenceEntry,
+    EvidenceField,
     InvoiceExtraction,
     LineItem,
 )
@@ -75,9 +75,9 @@ __all__ = [
     "AuditEventType",
     "Confidence",
     "CurrencyCode",
+    "EvidenceEntry",
+    "EvidenceField",
     "ExceptionClassification",
-    "ExtractionEvidence",
-    "FieldEvidence",
     "GoodsReceipt",
     "GoodsReceiptLine",
     "HumanActor",

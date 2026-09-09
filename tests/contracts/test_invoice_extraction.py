@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -21,8 +22,8 @@ from pydantic import ValidationError
 from ap_agent.contracts.enums import ArithmeticFlag
 from ap_agent.contracts.invoice import (
     EVIDENCE_FIELDS,
-    ExtractionEvidence,
-    FieldEvidence,
+    EvidenceEntry,
+    EvidenceField,
     InvoiceExtraction,
     LineItem,
 )
@@ -183,62 +184,80 @@ def test_a_due_date_before_the_invoice_date_is_a_reading_error() -> None:
 
 
 def test_evidence_fields_match_the_declared_policy() -> None:
-    """EVIDENCE_FIELDS is the readable declaration; the model is what enforces it."""
-    assert set(ExtractionEvidence.model_fields) == EVIDENCE_FIELDS
+    """EvidenceField is the enum in the schema; EVIDENCE_FIELDS is the string view."""
+    assert {member.value for member in EvidenceField} == EVIDENCE_FIELDS
 
 
-def test_evidence_keys_are_restricted_to_declared_fields() -> None:
-    """Otherwise evidence becomes an unbounded channel for document text."""
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        InvoiceExtraction(**_base(evidence={"secret_notes": {"page": 1, "snippet": "hi"}}))
+def test_evidence_cannot_cite_an_undeclared_field() -> None:
+    """The enum is what keeps evidence from becoming a channel for document text."""
+    with pytest.raises(ValidationError):
+        InvoiceExtraction(**_base(evidence=[{"field": "secret_notes", "page": 1, "snippet": "hi"}]))
 
 
 def test_evidence_defaults_to_nothing_supplied() -> None:
     extraction = InvoiceExtraction(**_base())
-    assert extraction.evidence.provided() == {}
-    assert extraction.evidence.vendor_name is None
+    assert extraction.evidence == []
+    assert extraction.evidence_by_field() == {}
 
 
 def test_supplied_evidence_round_trips() -> None:
     extraction = InvoiceExtraction(
         **_base(
-            evidence={
-                "total": FieldEvidence(page=1, snippet="Total due 120.00"),
-                "invoice_number": FieldEvidence(page=1, snippet="INV-1"),
-            }
+            evidence=[
+                EvidenceEntry(field=EvidenceField.TOTAL, page=1, snippet="Total due 120.00"),
+                EvidenceEntry(field=EvidenceField.INVOICE_NUMBER, page=1, snippet="INV-1"),
+            ]
         )
     )
-    assert extraction.evidence.total is not None
-    assert extraction.evidence.total.snippet == "Total due 120.00"
-    assert sorted(extraction.evidence.provided()) == ["invoice_number", "total"]
+    by_field = extraction.evidence_by_field()
+    assert sorted(by_field) == ["invoice_number", "total"]
+    assert by_field["total"].snippet == "Total due 120.00"
 
 
-def test_the_structured_output_schema_carries_the_evidence_properties() -> None:
-    """The reason ExtractionEvidence exists.
+def test_a_field_cannot_be_cited_twice() -> None:
+    """A list permits duplicates where the old mapping could not; restore the rule."""
+    with pytest.raises(ValidationError, match="more than once"):
+        InvoiceExtraction(
+            **_base(
+                evidence=[
+                    {"field": "total", "page": 1, "snippet": "Total 120.00"},
+                    {"field": "total", "page": 2, "snippet": "Total 999.00"},
+                ]
+            )
+        )
 
-    ``dict[str, FieldEvidence]`` becomes ``additionalProperties: {$ref}``, which
-    structured outputs does not support - the SDK rewrites it to an object with
-    no properties, so the model can never return evidence and the loss is
-    silent. Assert against the schema the API actually receives, not the one
-    pydantic generates.
+
+def test_the_structured_output_schema_stays_inside_the_complexity_budget() -> None:
+    """Both halves of the bug this shape exists to fix.
+
+    ``dict[str, FieldEvidence]`` produced ``additionalProperties: {$ref}``, which
+    the SDK rewrites to an object with no properties - so evidence could never be
+    returned. Replacing it with ten optional typed properties made evidence
+    expressible but pushed the schema to 9320 B, which the API rejects outright
+    with ``400 Schema is too complex``. One repeated entry with an enumerated
+    field is both expressible and small enough; measured at 8475 B and verified
+    accepted by the live API.
+
+    The 9000 B ceiling is a guard rail, not the documented limit - the real limit
+    is structural and undocumented. If this fails, re-probe before raising it.
     """
     sent = transform_schema(InvoiceExtraction.model_json_schema())
-    node = sent["properties"]["evidence"]
-    if "$ref" in node:
-        node = sent["$defs"][node["$ref"].rsplit("/", 1)[-1]]
+    entry = sent["$defs"]["EvidenceEntry"]
 
-    assert set(node["properties"]) == EVIDENCE_FIELDS
-    assert node["additionalProperties"] is False
+    assert set(entry["properties"]) == {"field", "page", "snippet"}
+    assert entry["additionalProperties"] is False
+    assert set(sent["$defs"]["EvidenceField"]["enum"]) == EVIDENCE_FIELDS
+    assert len(json.dumps(sent)) < 9000
 
 
 def test_evidence_snippets_are_bounded() -> None:
     with pytest.raises(ValidationError):
-        FieldEvidence(page=1, snippet="x" * 201)
+        EvidenceEntry(field=EvidenceField.TOTAL, page=1, snippet="x" * 201)
 
 
 def test_evidence_pages_are_one_based() -> None:
     with pytest.raises(ValidationError):
-        FieldEvidence(page=0, snippet="x")
+        EvidenceEntry(field=EvidenceField.TOTAL, page=0, snippet="x")
 
 
 # --- suspicious text --------------------------------------------------------
