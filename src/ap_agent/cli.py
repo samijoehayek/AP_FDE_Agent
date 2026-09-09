@@ -75,10 +75,20 @@ def extract(
     prompt_version: Annotated[
         str, typer.Option("--prompt-version", help="Selects prompts/<version>.md.")
     ] = PROMPT_VERSION,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Also write the extraction to this file as JSON."),
+    ] = None,
 ) -> None:
     """Read one invoice with the extraction model and print the result.
 
     This spends tokens. It is the only command in this CLI that calls an API.
+
+    Nothing is persisted unless ``--out`` is given. Writing an extraction to the
+    database is the agent loop's job, and it does so in the same transaction as
+    the AuditEvent that records it - a CLI that quietly inserted rows would
+    produce invoices with no trail, which is the one thing this system exists to
+    prevent.
     """
     try:
         result = extract_invoice_vision(
@@ -88,7 +98,14 @@ def extract(
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
-    typer.echo(json.dumps(result.extraction.model_dump(mode="json"), indent=2))
+    payload = json.dumps(result.extraction.model_dump(mode="json"), indent=2)
+    typer.echo(payload)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload + "\n", encoding="utf-8")
+        typer.secho(f"written to {out}", fg=typer.colors.GREEN, err=True)
+
     typer.secho(
         f"{result.model_id}  prompt={result.prompt_version}  "
         f"in={result.input_tokens} out={result.output_tokens} tokens  "
