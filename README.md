@@ -88,7 +88,7 @@ API or the database.
 | `just verify-audit` | Prove `audit_events` refuses UPDATE, DELETE and TRUNCATE |
 | `just db-revision "msg"` | Autogenerate a migration from the models |
 | `just ingest` | Index every document under `data/` into `data/index.csv` |
-| `just pull-data` | Stream sample corpora from Hugging Face |
+| `just pull-data` | Print dataset licences; add `--accept-licenses` to download |
 | `just docs-diagram` | Regenerate the state diagram from the transition table |
 
 ## Data: what is real and what is synthetic
@@ -115,7 +115,16 @@ exercise matching, tolerances, or approval routing at all — see the docstring 
 `scripts/generate_invoices.py`.
 
 Run `just pull-data` to see each dataset's licence printed before anything
-downloads; nothing is written without `--accept-licenses`.
+downloads; nothing is written without `--accept-licenses`:
+
+```bash
+just pull-data                    # licences only, downloads nothing
+just pull-data --accept-licenses  # 50 + 20 images into data/synthetic/
+```
+
+Pass flags directly — not via just's `--` separator, which is forwarded into the
+script and swallows the flag after it. Re-run `just ingest` afterwards to refresh
+`data/index.csv`.
 
 ## Layout
 

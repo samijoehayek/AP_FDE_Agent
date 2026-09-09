@@ -68,6 +68,14 @@ verify-audit:
 # --- data ------------------------------------------------------------------
 
 # Print dataset licences, then stream sample corpora into data/synthetic/.
+#
+#   just pull-data                      licences only, downloads nothing, exits 1
+#   just pull-data --accept-licenses    pull both at their defaults (50 + 20)
+#   just pull-data --accept-licenses --dataset mychen76 --limit 10
+#
+# Pass flags directly. Do NOT use the usual `just recipe -- --flag` separator:
+# `--` is forwarded verbatim into ARGS, and click reads it as end-of-options, so
+# the flag after it arrives as a stray positional and the script rejects it.
 pull-data *ARGS:
     uv run python scripts/pull_hf_datasets.py {{ARGS}}
 
