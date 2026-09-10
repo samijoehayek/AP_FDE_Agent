@@ -47,6 +47,11 @@ class Settings(BaseSettings):
         default="claude-sonnet-5",
         description="Model id for the document-extraction seat. This model has no tools.",
     )
+    text_extraction_model: str = Field(
+        default="claude-haiku-4-5",
+        description="The second reading, from the PDF text layer. A different and cheaper model "
+        "on purpose: two reads only disagree usefully if they can fail differently.",
+    )
     reasoning_model: str = Field(
         default="claude-opus-5",
         description="Model id for the exception-explanation seat.",
