@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import numpy as np
 import pymupdf
@@ -36,9 +36,9 @@ from ap_agent.errors import IngestionError, UnsupportedDocumentError
 from ap_agent.tools.base import SideEffect, ToolCaller, ToolInput, ToolOutput
 
 if TYPE_CHECKING:
-    from types import TracebackType
-
     from numpy.typing import NDArray
+
+    from ap_agent.tools.pymupdf_types import PdfDocument, PdfPage
 
 CALLER = ToolCaller.CODE
 SIDE_EFFECTS: tuple[SideEffect, ...] = (SideEffect.LOCAL_READ,)
@@ -73,57 +73,6 @@ _CHUNK_BYTES: Final = 1 << 20
 
 _LAPLACIAN_KERNEL_SPAN: Final = 3
 """The 4-neighbour kernel needs a 3x3 neighbourhood to have an interior."""
-
-
-# ---------------------------------------------------------------------------
-# PyMuPDF's own annotations are incomplete, so the exact surface this module
-# depends on is declared here and the document is cast to it once. That keeps
-# strict type checking on for the rest of the file and makes the dependency
-# legible: these five members are all that would have to be re-verified if the
-# library changed.
-# ---------------------------------------------------------------------------
-
-
-class _Pixmap(Protocol):
-    """A rendered page. ``samples`` is row-padded to ``stride`` bytes."""
-
-    @property
-    def samples(self) -> bytes: ...
-    @property
-    def width(self) -> int: ...
-    @property
-    def height(self) -> int: ...
-    @property
-    def stride(self) -> int: ...
-
-
-class _Rect(Protocol):
-    @property
-    def width(self) -> float: ...
-    @property
-    def height(self) -> float: ...
-
-
-class _Page(Protocol):
-    @property
-    def rect(self) -> _Rect: ...
-    def get_text(self, option: str = ...) -> str: ...
-    def get_pixmap(self, *, matrix: object, colorspace: object) -> _Pixmap: ...
-
-
-class _Document(Protocol):
-    """PyMuPDF exposes ``__getitem__`` and ``__len__`` but no ``__iter__``."""
-
-    @property
-    def page_count(self) -> int: ...
-    def __getitem__(self, index: int) -> _Page: ...
-    def __enter__(self) -> _Document: ...
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None: ...
 
 
 class IngestDocumentInput(ToolInput):
@@ -222,7 +171,7 @@ def _laplacian_variance(gray: NDArray[np.float32]) -> float:
     return float(laplacian.var())
 
 
-def _page_gray(page: _Page) -> NDArray[np.float32]:
+def _page_gray(page: PdfPage) -> NDArray[np.float32]:
     """Render one page to a greyscale array normalised to a fixed long edge."""
     rect = page.rect
     longest = max(rect.width, rect.height) or 1.0
@@ -265,7 +214,7 @@ def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
 
     data = path.read_bytes()
     try:
-        document = cast("_Document", pymupdf.open(stream=data, filetype=filetype))
+        document = cast("PdfDocument", pymupdf.open(stream=data, filetype=filetype))
     except Exception as exc:  # pymupdf raises a broad set of parse errors
         msg = f"could not parse {path} as {media_type}"
         raise IngestionError(msg) from exc

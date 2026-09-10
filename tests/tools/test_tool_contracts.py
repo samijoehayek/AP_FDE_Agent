@@ -11,7 +11,7 @@ import importlib
 import inspect
 import pkgutil
 from types import ModuleType
-from typing import cast, get_type_hints
+from typing import Final, cast, get_type_hints
 
 import pytest
 from pydantic import BaseModel
@@ -39,11 +39,21 @@ def _requires_key(module: ModuleType) -> object:
     return cast("object", module.REQUIRES_IDEMPOTENCY_KEY)
 
 
+SUPPORT_MODULES: Final = frozenset({"base", "pymupdf_types"})
+"""Modules under ``tools/`` that are not tools.
+
+Listed by hand rather than matched by a pattern. A new file in this package is
+a tool until someone deliberately writes it down here, which is the direction
+this mistake should run in: an unregistered tool fails the suite, where a tool
+quietly excluded by a naming convention would not.
+"""
+
+
 def _discovered_module_names() -> set[str]:
     return {
         info.name
         for info in pkgutil.iter_modules(tools_pkg.__path__)
-        if not info.name.startswith("_") and info.name != "base"
+        if not info.name.startswith("_") and info.name not in SUPPORT_MODULES
     }
 
 

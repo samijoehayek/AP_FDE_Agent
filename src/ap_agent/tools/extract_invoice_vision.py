@@ -168,7 +168,7 @@ def build_content_block(path: Path) -> ImageBlockParam | DocumentBlockParam:
     )
 
 
-def _build_client() -> anthropic.Anthropic:
+def build_client() -> anthropic.Anthropic:
     """Construct the API client.
 
     Two settings are conditional rather than always sent.
@@ -258,7 +258,7 @@ def extract_invoice_vision(payload: ExtractInvoiceVisionInput) -> ExtractInvoice
 
     started = time.perf_counter()
     try:
-        response = _build_client().messages.parse(
+        response = build_client().messages.parse(
             model=model_id,
             max_tokens=payload.max_tokens,
             system=system_prompt,
