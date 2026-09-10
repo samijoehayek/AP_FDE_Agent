@@ -87,6 +87,10 @@ run PATH *ARGS:
 extract PATH *ARGS:
     uv run ap-agent extract {{PATH}} {{ARGS}}
 
+# Read one invoice twice and score the agreement. Spends tokens (two model calls).
+confidence PATH *ARGS:
+    uv run ap-agent confidence {{PATH}} {{ARGS}}
+
 # Walk data/ and write data/index.csv.
 ingest *ARGS:
     uv run python scripts/index_invoices.py {{ARGS}}

@@ -30,9 +30,20 @@ from ap_agent.states.machine import (
     to_mermaid,
     transition,
 )
+from ap_agent.tools.compute_extraction_confidence import (
+    ComputeExtractionConfidenceInput,
+    ExtractionConfidence,
+    compute_extraction_confidence,
+)
+from ap_agent.tools.extract_invoice_text import (
+    ExtractInvoiceTextInput,
+    ExtractInvoiceTextOutput,
+    extract_invoice_text,
+)
 from ap_agent.tools.extract_invoice_vision import (
     PROMPT_VERSION,
     ExtractInvoiceVisionInput,
+    ExtractInvoiceVisionOutput,
     extract_invoice_vision,
 )
 from ap_agent.tools.ingest_document import IngestDocumentInput, ingest_document
@@ -120,6 +131,114 @@ def extract(
         fg=typer.colors.CYAN,
         err=True,
     )
+
+
+@app.command()
+def confidence(
+    path: Annotated[Path, typer.Argument(help="Invoice document to read twice.")],
+    country: Annotated[
+        str | None,
+        typer.Option(
+            "--country",
+            "-c",
+            help="Vendor's ISO-3166-1 alpha-2 country. Settles DD/MM against MM/DD.",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Also write the full verdict to this file as JSON."),
+    ] = None,
+) -> None:
+    """Read one invoice twice and report how much of it can be trusted.
+
+    Two model calls: the vision model over the page image, then the cheaper text
+    model over the PDF's own characters. Where they agree *and* the value is
+    present in the text layer, the field passes; anything else is named in
+    ``needs_human``.
+
+    This spends tokens, roughly the cost of ``extract`` plus a few cents.
+
+    Nothing is persisted unless ``--out`` is given, and nothing is wired into the
+    agent loop yet - this command exists so the check can be run against real
+    invoices and its thresholds argued with before it decides anything.
+    """
+    try:
+        document = ingest_document(IngestDocumentInput(path=path))
+        vision = extract_invoice_vision(ExtractInvoiceVisionInput(path=path))
+        text = extract_invoice_text(ExtractInvoiceTextInput(path=path))
+        verdict = compute_extraction_confidence(
+            ComputeExtractionConfidenceInput(
+                primary=vision.extraction,
+                secondary=text.second_read,
+                raw_text=text.raw_text,
+                vendor_country=country,
+                min_sharpness=document.min_sharpness,
+            )
+        ).confidence
+    except APAgentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    _print_confidence(verdict, vision, text)
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(verdict.model_dump(mode="json"), indent=2) + "\n", encoding="utf-8"
+        )
+        typer.secho(f"written to {out}", fg=typer.colors.GREEN, err=True)
+
+    raise typer.Exit(code=0 if verdict.auto_ok else 2)
+
+
+def _print_confidence(
+    verdict: ExtractionConfidence,
+    vision: ExtractInvoiceVisionOutput,
+    text: ExtractInvoiceTextOutput,
+) -> None:
+    """Render the verdict as a table. Two colours: passed, or did not."""
+    primary = vision.extraction
+    typer.echo(f"{'field':<16}{'primary':<34}{'agreed':<8}{'grounded':<10}{'score':<7}reason")
+    typer.echo("-" * 100)
+    for entry in verdict.fields:
+        value = str(getattr(primary, entry.field))
+        passed = entry.agreed is True and entry.grounded
+        typer.secho(
+            f"{entry.field:<16}{value[:32]:<34}"
+            f"{_tick(entry.agreed):<8}{_tick(entry.grounded):<10}"
+            f"{entry.score:<7.2f}{entry.reason}",
+            fg=typer.colors.GREEN if passed else typer.colors.YELLOW,
+        )
+
+    if verdict.resolved_invoice_date != primary.invoice_date:
+        typer.secho(
+            f"\ninvoice_date reinterpreted: {primary.invoice_date} -> "
+            f"{verdict.resolved_invoice_date}",
+            fg=typer.colors.MAGENTA,
+        )
+
+    typer.echo("")
+    if verdict.auto_ok:
+        typer.secho("auto_ok: yes", fg=typer.colors.GREEN, bold=True)
+    else:
+        typer.secho(
+            f"auto_ok: no  needs_human: {', '.join(verdict.needs_human)}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+
+    typer.secho(
+        f"\nvision {vision.model_id} in={vision.input_tokens} out={vision.output_tokens}"
+        f"  |  text {text.model_id} in={text.input_tokens} out={text.output_tokens}"
+        f"  |  text layer {len(text.raw_text)} chars",
+        fg=typer.colors.CYAN,
+        err=True,
+    )
+
+
+def _tick(value: bool | None) -> str:
+    """A tri-state as one character: unknown is not the same as false."""
+    return {True: "yes", False: "NO", None: "?"}[value]
 
 
 @states_app.command("graph")
