@@ -104,6 +104,8 @@ ignore = [
     "ANN401",  # **overrides: Any is the point of a payload-building helper
     "TC001", "TC002", "TC003",  # indirection with no runtime payoff in a test
     "EM101", "TRY003",  # a raise in a stub is the fixture, not an error path
+    "S105", "S106", "S107",  # fake credentials are what a credential test is made of
+    "S311",             # seeded RNG is how a fixture stays reproducible
 ]
 "scripts/**/*.py" = ["T201"]  # scripts print to stdout on purpose
 # Typer reads annotations at runtime to build the CLI, so TC00x would break these.

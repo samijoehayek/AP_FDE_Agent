@@ -107,6 +107,21 @@ decision that does not name what it rejected is a preference, not a decision.
 | The contract computes arithmetic facts; the loop applies policy | Both checking the arithmetic; moving every check onto the contract | Split by *kind of question*, not convenience. Whether the lines sum to the subtotal is a pure function of the numbers, the same answer forever, so it belongs wherever the extraction goes. Whether the invoice may *advance* is policy, and policy may depend on the clock and the guardrails config. The clock is the load-bearing half: a validator that consults `now` cannot live on a contract, because re-loading a stored extraction next year would flag it differently than when it was written - breaking replay, and once the chain hashes it, looking exactly like tampering |
 | `DEFAULT_MAX_STEPS = 15`, one more than the happy path | A generous round number | An agent that can loop forever will eventually loop forever on the invoice that costs the most tokens. A tight budget makes adding a pipeline step a deliberate change |
 
+## 2026-09-10 — QuickBooks foundation
+
+| Decision | Rejected | Because |
+| --- | --- | --- |
+| **Goods receipts are owned by ap-agent, not the ERP** | Looking for a QuickBooks entity to hold them | QuickBooks Online has **no goods-receipt entity**. It models the purchase order and the bill and nothing in between, so "what was actually received" - the third leg of a three-way match, and the leg that catches short deliveries - has no home in the ERP. `data/generated/receipts.json` is therefore ours. Discovering this while writing the matcher would have been much worse than discovering it while writing the seeder |
+| The token file is the source of truth; `.env` is only a seed | Reading `QBO_REFRESH_TOKEN` on every refresh | Intuit rotates the refresh token on every successful refresh and forces the previous one to expire. Preferring the setting would re-use a dead token after the first rotation - the classic QuickBooks failure, where everything works until it returns `invalid_grant` days later with no obvious cause |
+| Persist the rotated token *before* returning it | Returning first, writing after | A crash between the exchange and the write leaves a token on disk that Intuit has already invalidated, and the integration is locked out until someone re-authorises by hand |
+| Atomic write (temp file plus rename), mode 0600 | A plain `write_text` | `rename` is atomic on POSIX, so a crash mid-write leaves the previous file intact rather than a truncated one - and a truncated token file means manual re-authorisation. The mode is because it is a credential |
+| The client has `get`, `query` and `create` and nothing else | A full CRUD client | Nothing in this system updates or deletes in the ERP, and a client that cannot express those is a client no future bug can use to express them. Same reasoning as the absent tools |
+| Retry only 429 and 5xx | Retrying every failure | Retrying a 400 re-sends the same bad request; retrying a 401 burns the rate limit while the credential stays wrong. Backoff is jittered, because a fleet retrying on one schedule recreates the burst that caused the throttling |
+| `minorversion=75` pinned explicitly | Omitting it | Intuit ignores anything below 75 and serves 75 anyway, so omitting it is not neutral - it is the same behaviour with none of the intent recorded |
+| Seeding is idempotent by query on the natural key | Assuming an empty sandbox; deleting first | A sandbox is shared and long-lived and has no bulk delete. A seeder that duplicated its fixture on each run would poison the thing it exists to provide |
+| `--dry-run` makes no calls at all, not even reads | Letting lookups through, since reads are harmless | Otherwise `--dry-run` needs live credentials, which defeats the point of a mode that plans the work offline. Caught because the first dry run failed on a missing token |
+| Home currency is queried before attaching `CurrencyRef` | Always setting the vendor's currency | Multicurrency is off by default in a fresh sandbox, and a mismatched `CurrencyRef` fails. Asking first degrades to home currency with a warning instead of failing ten creates in |
+
 ### Things that bit during the scaffold
 
 Recorded because the next person to hit them should not have to re-derive the cause.

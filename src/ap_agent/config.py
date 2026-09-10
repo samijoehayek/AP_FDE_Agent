@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     # --- ERP (QuickBooks Online sandbox) ---------------------------------
     qbo_client_id: SecretStr = SecretStr("")
     qbo_client_secret: SecretStr = SecretStr("")
+    qbo_refresh_token: SecretStr = Field(
+        default=SecretStr(""),
+        description="Long-lived OAuth token. Rotates on every refresh, so the value here is "
+        "only a seed - the current one lives in data/.qbo_tokens.json.",
+    )
     qbo_realm_id: str = ""
     qbo_environment: Literal["sandbox", "production"] = "sandbox"
 
