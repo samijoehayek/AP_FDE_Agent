@@ -8,6 +8,7 @@ system is visible from ``--help`` on day one.
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -34,6 +35,7 @@ from ap_agent.tools.compute_extraction_confidence import (
     ComputeExtractionConfidenceInput,
     ExtractionConfidence,
     compute_extraction_confidence,
+    find_raw_date,
 )
 from ap_agent.tools.extract_invoice_text import (
     ExtractInvoiceTextInput,
@@ -210,12 +212,7 @@ def _print_confidence(
             fg=typer.colors.GREEN if passed else typer.colors.YELLOW,
         )
 
-    if verdict.resolved_invoice_date != primary.invoice_date:
-        typer.secho(
-            f"\ninvoice_date reinterpreted: {primary.invoice_date} -> "
-            f"{verdict.resolved_invoice_date}",
-            fg=typer.colors.MAGENTA,
-        )
+    _print_date_note(verdict, primary.invoice_date, text.raw_text)
 
     typer.echo("")
     if verdict.auto_ok:
@@ -233,6 +230,38 @@ def _print_confidence(
         f"  |  text layer {len(text.raw_text)} chars",
         fg=typer.colors.CYAN,
         err=True,
+    )
+
+
+def _print_date_note(verdict: ExtractionConfidence, extracted: date, raw_text: str) -> None:
+    """Explain an ambiguous date in the terms the page states it.
+
+    ``-> None`` is not an explanation. Whoever is reading this needs to see the
+    digits that are ambiguous and both ways they can be read, because they are
+    the one who has to decide which vendor this is.
+    """
+    if verdict.resolved_invoice_date == extracted:
+        return
+
+    raw = find_raw_date(raw_text, extracted)
+    rendering = f"the page reads {raw.text}" if raw else "the page is ambiguous"
+
+    if verdict.resolved_invoice_date is None:
+        readings = ""
+        if raw is not None:
+            day_first = raw.resolve(day_first=True)
+            month_first = raw.resolve(day_first=False)
+            readings = f", which is {day_first} day-first or {month_first} month-first"
+        typer.secho(
+            f"\ninvoice_date unresolved: {rendering}{readings}. Pass --country to settle it.",
+            fg=typer.colors.MAGENTA,
+        )
+        return
+
+    typer.secho(
+        f"\ninvoice_date reinterpreted: {rendering}, read as {extracted} and "
+        f"resolved to {verdict.resolved_invoice_date}",
+        fg=typer.colors.MAGENTA,
     )
 
 
