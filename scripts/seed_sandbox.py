@@ -131,6 +131,7 @@ class SeedContext:
     """Facts about the target company that every create needs."""
 
     expense_account: str
+    ap_account: str
     home_currency: str
     multicurrency: bool
     item_ids: dict[str, str]
@@ -240,21 +241,51 @@ class Seeder:
             raise SeedError(msg)
         return found
 
-    def home_currency(self) -> str:
-        """Read the company's home currency.
+    def find_ap_account(self) -> str:
+        """Find the Accounts Payable account a purchase order settles against.
 
-        Attaching a CurrencyRef that differs from home fails unless multicurrency
-        is switched on, and it is off by default in a fresh sandbox. Asking first
-        means the script degrades to home currency with a warning rather than
-        failing ten creates in.
+        Not an expense account. QuickBooks rejects the wrong type outright with
+        ``6430 Invalid account type used`` - the expense account belongs on the
+        *line*, where the cost is booked, and the A/P account on the *header*,
+        where the liability sits. Getting them the wrong way round is the first
+        mistake anyone makes with this entity, this author included.
         """
-        rows = _rows(self.client.query("SELECT * FROM CompanyInfo"), "CompanyInfo")
-        if rows:
-            ref: dict[str, Any] = rows[0].get("CurrencyRef") or {}
-            currency: Any = ref.get("value")
-            if currency:
-                return str(currency)
-        return "USD"
+        query = "SELECT Id FROM Account WHERE AccountType = 'Accounts Payable' MAXRESULTS 1"
+        found = _first_id(self.client.query(query), "Account")
+        if not found:
+            msg = "the sandbox has no Accounts Payable account for purchase-order headers"
+            raise SeedError(msg)
+        return found
+
+    def _currency_prefs(self) -> dict[str, Any]:
+        """Read the company's currency preferences.
+
+        ``Preferences`` rather than ``CompanyInfo``: a live sandbox returned no
+        ``CurrencyRef`` on CompanyInfo at all, so reading it there silently fell
+        back to a guess. Preferences carries both the home currency and whether
+        multicurrency is switched on.
+        """
+        rows = _rows(self.client.query("SELECT * FROM Preferences"), "Preferences")
+        if not rows:
+            return {}
+        prefs: dict[str, Any] = rows[0].get("CurrencyPrefs") or {}
+        return prefs
+
+    def home_currency(self) -> str:
+        """Return the company's home currency, defaulting to USD."""
+        home: dict[str, Any] = self._currency_prefs().get("HomeCurrency") or {}
+        value: Any = home.get("value")
+        return str(value) if value else "USD"
+
+    def multicurrency_enabled(self) -> bool:
+        """Return whether this company can hold non-home-currency records.
+
+        Off by default in a fresh sandbox, and attaching a ``CurrencyRef`` that
+        differs from home fails outright when it is off. Asking is the difference
+        between five vendors being created in the home currency with a warning
+        and five creates failing one after another.
+        """
+        return bool(self._currency_prefs().get("MultiCurrencyEnabled"))
 
     # --- creates -------------------------------------------------------
 
@@ -313,7 +344,7 @@ class Seeder:
         payload: dict[str, Any] = {
             "DocNumber": draft.doc_number,
             "VendorRef": {"value": draft.vendor_id},
-            "APAccountRef": {"value": ctx.expense_account},
+            "APAccountRef": {"value": ctx.ap_account},
             "TxnDate": draft.order_date,
             "Line": [
                 {
@@ -413,10 +444,18 @@ def main(
         seeder = Seeder(client, dry_run=dry_run)
         ctx = SeedContext(
             expense_account="dry-run-account" if dry_run else seeder.find_expense_account(),
+            ap_account="dry-run-ap" if dry_run else seeder.find_ap_account(),
             home_currency="USD" if dry_run else seeder.home_currency(),
-            multicurrency=not dry_run,
+            multicurrency=False if dry_run else seeder.multicurrency_enabled(),
             item_ids=item_ids,
         )
+        if not ctx.multicurrency and not dry_run:
+            foreign = sorted({v.currency for v in VENDORS if v.currency != ctx.home_currency})
+            typer.secho(
+                f"multicurrency is off in this company: {', '.join(foreign)} vendors will be "
+                f"created in {ctx.home_currency}. The manifest records what was actually used.",
+                fg=typer.colors.YELLOW,
+            )
     except APAgentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc

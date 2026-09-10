@@ -31,7 +31,9 @@ from scripts.seed_sandbox import (
 class FakeQbo:
     """An in-memory QuickBooks. Remembers what was created and answers queries."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, multicurrency: bool = True, home_currency: str = "USD") -> None:
+        self.multicurrency = multicurrency
+        self.home_currency = home_currency
         self.records: dict[str, list[dict[str, Any]]] = {}
         self.creates: list[tuple[str, dict[str, Any]]] = []
         self.queries: list[str] = []
@@ -39,9 +41,22 @@ class FakeQbo:
 
     def query(self, statement: str) -> dict[str, Any]:
         self.queries.append(statement)
-        if "CompanyInfo" in statement:
-            return {"QueryResponse": {"CompanyInfo": [{"CurrencyRef": {"value": "USD"}}]}}
+        if "Preferences" in statement:
+            return {
+                "QueryResponse": {
+                    "Preferences": [
+                        {
+                            "CurrencyPrefs": {
+                                "HomeCurrency": {"value": self.home_currency},
+                                "MultiCurrencyEnabled": self.multicurrency,
+                            }
+                        }
+                    ]
+                }
+            }
         if "AccountType = 'Expense'" in statement:
+            return {"QueryResponse": {"Account": [{"Id": "69"}]}}
+        if "AccountType = 'Accounts Payable'" in statement:
             return {"QueryResponse": {"Account": [{"Id": "33"}]}}
 
         entity = statement.split(" FROM ")[1].split(maxsplit=1)[0]
@@ -68,8 +83,9 @@ def _seed_once(fake: FakeQbo) -> Seeder:
     item_ids: dict[str, str] = {}
     ctx = SeedContext(
         expense_account=seeder.find_expense_account(),
+        ap_account=seeder.find_ap_account(),
         home_currency=seeder.home_currency(),
-        multicurrency=True,
+        multicurrency=seeder.multicurrency_enabled(),
         item_ids=item_ids,
     )
     vendor_ids = {spec.display_name: seeder.vendor(spec, ctx) for spec in VENDORS}
@@ -142,10 +158,76 @@ def test_a_dry_run_makes_no_calls_at_all() -> None:
     """--dry-run must not need credentials, so it may not even read."""
     fake = FakeQbo()
     seeder = Seeder(fake, dry_run=True)  # type: ignore[arg-type]
-    ctx = SeedContext("acct", "USD", multicurrency=False, item_ids={})
+    ctx = SeedContext("acct", "ap", "USD", multicurrency=False, item_ids={})
     seeder.vendor(VENDORS[0], ctx)
     assert fake.queries == []
     assert fake.creates == []
+
+
+def test_the_purchase_order_header_uses_the_ap_account_not_an_expense_one() -> None:
+    """QuickBooks rejects the wrong type with 6430; a live sandbox proved it.
+
+    The expense account books the cost on the line; the A/P account carries the
+    liability on the header. They are not interchangeable.
+    """
+    fake = FakeQbo()
+    seeder = Seeder(fake)  # type: ignore[arg-type]
+    ctx = SeedContext(
+        expense_account=seeder.find_expense_account(),
+        ap_account=seeder.find_ap_account(),
+        home_currency="USD",
+        multicurrency=False,
+        item_ids={ITEMS[0].name: "1"},
+    )
+    draft = seed_sandbox.PoDraft(
+        doc_number="AP-SEED-001",
+        vendor=VENDORS[0],
+        vendor_id="1",
+        order_date="2026-08-01",
+        lines=[
+            PoLine(item=ITEMS[0].name, qty=seed_sandbox.Decimal(1), unit_price=ITEMS[0].unit_price)
+        ],
+    )
+    seeder.purchase_order(draft, ctx)
+
+    _, payload = next((e, p) for e, p in fake.creates if e == "purchaseorder")
+    assert payload["APAccountRef"] == {"value": "33"}
+    assert ctx.expense_account == "69"
+    assert payload["APAccountRef"]["value"] != ctx.expense_account
+
+
+# --- currency, which a live sandbox got wrong --------------------------------
+
+
+def test_multicurrency_is_read_not_assumed() -> None:
+    """A live sandbox had it off, and a CurrencyRef would have failed five creates."""
+    assert Seeder(FakeQbo(multicurrency=False)).multicurrency_enabled() is False  # type: ignore[arg-type]
+    assert Seeder(FakeQbo(multicurrency=True)).multicurrency_enabled() is True  # type: ignore[arg-type]
+
+
+def test_the_home_currency_comes_from_preferences() -> None:
+    """CompanyInfo returned no CurrencyRef at all on a real sandbox."""
+    assert Seeder(FakeQbo(home_currency="GBP")).home_currency() == "GBP"  # type: ignore[arg-type]
+
+
+def test_no_currency_ref_is_attached_when_multicurrency_is_off() -> None:
+    fake = FakeQbo(multicurrency=False)
+    seeder = Seeder(fake)  # type: ignore[arg-type]
+    ctx = SeedContext("69", "33", "USD", multicurrency=False, item_ids={})
+    inr_vendor = next(v for v in VENDORS if v.currency == "INR")
+    seeder.vendor(inr_vendor, ctx)
+    _, payload = fake.creates[0]
+    assert "CurrencyRef" not in payload
+
+
+def test_a_currency_ref_is_attached_when_multicurrency_is_on() -> None:
+    fake = FakeQbo(multicurrency=True)
+    seeder = Seeder(fake)  # type: ignore[arg-type]
+    ctx = SeedContext("69", "33", "USD", multicurrency=True, item_ids={})
+    inr_vendor = next(v for v in VENDORS if v.currency == "INR")
+    seeder.vendor(inr_vendor, ctx)
+    _, payload = fake.creates[0]
+    assert payload["CurrencyRef"] == {"value": "INR"}
 
 
 # --- what QuickBooks cannot model -------------------------------------------
