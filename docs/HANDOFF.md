@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-09-10, Day 2 in progress. Update this file at the end of every working day._
+_Last updated: 2026-09-11, Day 2 in progress. Update this file at the end of every working day._
 
 ## Purpose (three sentences)
 
@@ -27,10 +27,14 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - State machine in `src/ap_agent/states/` — enum, transition table, `transition()` raising on illegal moves, tests incl. "no POSTED without APPROVED".
 - `tools/ingest_document.py` — real: sha256, MIME sniffing, page count, text-layer detection, per-page Laplacian sharpness.
 - `tools/extract_invoice_vision.py` — real: PDF as document block / images as image block (TIFF→PNG), structured output into InvoiceExtraction, returns model id, prompt_version=`extract_v1`, tokens, latency; `ExtractionError` on API failure/refusal/truncation/validation. Prompt at `prompts/extract_v1.md`. 16 mocked tests.
-- `contracts/run.py` — InvoiceRecord, Action, StepResult.
+- `tools/extract_invoice_text.py` — real: pymupdf text layer → `claude-haiku-4-5` reading characters only (no tools, document text is the whole user turn), prompt `extract_text_v1`. Images / no text layer → `has_text_layer=False`, `second_read=None`, **no OCR** and no model call. `raw_text` is byte-identical to what the model was sent, because grounding is scored against it. 19 mocked tests.
+- `tools/compute_extraction_confidence.py` — real, and **pure code with no model call and no clock**: per-field `agreed` (two readings match) and `grounded` (value is in the text layer), both required. `auto_ok` is true **iff** all five load-bearing fields agreed and grounded — nothing else vetoes it, so low sharpness and an ambiguous date lower the score and are recorded but no longer block. `needs_human` is `{field, reason}` records. Carries `date_verdict`, `date_candidates` and `date_raw_text`. 53 tests.
+- `contracts/run.py` — InvoiceRecord, Action, StepResult, `ToolCallRecord`. InvoiceRecord now also carries `received_at` (set by the caller, **never** by the loop), the confidence verdict, `invoice_date_resolved` + `date_resolution_reason`, and `vendor_country`.
 - `loop/runner.py` — decide → apply → transition → log; max_steps counts state moves; INGESTED→EXTRACTED makes both model calls and runs `EXTRACT-CONF@v1` over them; VALIDATED runs arithmetic (`VALIDATE@v1`) and `DATE-RESOLVE@v1` when the receipt window can settle an open date; all later states are `rule:STUB` with `# TEMP STUB` edges in the transition table (listed in a test).
 - `loop/dates.py` — `resolve_date_by_receipt_window` and `resolve_date_by_locale`. Pure, and both take the clock as an argument: a rule that read `now()` would resolve a date differently on replay and break the chain that hashed it.
 - `audit/writer.py` — JsonlAuditWriter to `data/audit/<invoice_id>.jsonl`, sha256 hash chain from a zero genesis hash, `verify()`.
+- **Audit rows are now one per thing that happened, not one per step.** `step_seq` counts rows, and only the last row of a step carries a `to_state` - so following `to_state` down the file still shows the state machine, while the rows between it account for what each call cost. The extraction step is 1 step and 4 rows. A clean run is 14 moves / 17 rows.
+- **Date resolution constants worth knowing before changing them:** `MAX_INVOICE_AGE_DAYS = 365` in `loop/dates.py` (a year, deliberately generous - a narrower window resolves more dates but *silently* eliminates a candidate that may be correct; six months was the first value and it got 09/03/2024 wrong). `MIN_SHARPNESS = 800` and the 0.9 name-similarity cut in the confidence tool are still uncalibrated guesses; they belong in the guardrails config on Day 3.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
@@ -65,6 +69,8 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - Full loop run on 51109304: RECEIVED→CLOSED in 14 steps, one model step (7,211 in / 1,326 out tokens, 18.5 s), hash chain verifies. `bill_to_name`/`vendor_address` populate.
 - `batch_1.csv` has an `ocred_text` column — usable as the second reading for grounding on the Kaggle set.
 - mychen76 extraction captured an IBAN in `remit_to_display` — rule 2 applies; it must never flow downstream.
+- **2026-09-10, four confidence runs (EXTRACTION_LOG.md).** The same file, model and prompt twenty minutes apart returned `2024-09-03` and then `2024-03-09` for 51109305. That settles what the bug is: not a model misreading a date, but a document that does not say which reading is meant. The check refused both times; the locale rule answered the same both times.
+- **Behaviour change since those runs:** an ambiguous date is no longer a failure. Both readings stay on the record and are settled by the receipt window at VALIDATED, then the vendor's country at VENDOR_RESOLVED. Runs 2 and 3 in the log predate this and would now be `auto_ok=True` with `date_verdict=ambiguous`. Reasoning in DECISIONS.md, 2026-09-10.
 
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
 
