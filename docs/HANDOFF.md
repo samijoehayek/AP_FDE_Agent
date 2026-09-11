@@ -36,24 +36,49 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - **Audit rows are now one per thing that happened, not one per step.** `step_seq` counts rows, and only the last row of a step carries a `to_state` - so following `to_state` down the file still shows the state machine, while the rows between it account for what each call cost. The extraction step is 1 step and 4 rows. A clean run is 14 moves / 17 rows.
 - **Date resolution constants worth knowing before changing them:** `MAX_INVOICE_AGE_DAYS = 365` in `loop/dates.py` (a year, deliberately generous - a narrower window resolves more dates but *silently* eliminates a candidate that may be correct; six months was the first value and it got 09/03/2024 wrong). `MIN_SHARPNESS = 800` and the 0.9 name-similarity cut in the confidence tool are still uncalibrated guesses; they belong in the guardrails config on Day 3.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
+- `scripts/generate_invoices.py` — real: 60 labelled invoice PDFs from the seeded POs, six variants each, into `data/generated/invoices/`. `Canvas(invariant=1)` and no clock anywhere, so two runs are byte-identical - a hash that moves means the generator changed, not that a document arrived. Truth files are `GeneratedInvoiceTruth` (`contracts/generated.py`), and a test asserts `InvoiceExtraction(**truth.expected.model_dump())` passes the arithmetic validator with no flags. 43 tests, all against real rendered files in `tmp_path`.
+- `src/ap_agent/vendor_master.py` + `config/sandbox_vendor_master.yaml` — the vendors, in one file, read by both `seed_sandbox.py` and `generate_invoices.py`. Carries the country and the postal address, which the seed manifest does not because QuickBooks is never told them. Fails loudly on a missing vendor or a missing field. 21 tests.
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
-- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [--country XX] [--received-at YYYY-MM-DD] [--from-extraction <json>] [--out <json>]`, `just ingest`, `just seed [--dry-run]`.
+- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [--country XX] [--received-at YYYY-MM-DD] [--from-extraction <json>] [--out <json>]`, `just ingest`, `just seed [--dry-run]`, `just generate [--only <po>] [--variants a,b,c] [--layout a] [--dry-run] [--out-dir <path>]`.
   - `--from-extraction` replays saved readings and makes **no** model calls — use it whenever the question is about the check rather than the models. `--out` writes the readings alongside the verdict so any run is replayable.
   - `run` reports `steps` (state moves) and `audit rows` separately: the extraction step is one step and four rows.
 - Docs: README, ARCHITECTURE.md (state + trust-boundary diagrams), DECISIONS.md, CLAUDE.md.
 
-**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text` and `compute_extraction_confidence`; guardrail config loader; evals fixtures; `scripts/generate_invoices.py`. Stub edges MATCHED→CODED etc. exist only so the loop reaches CLOSED.
+**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text` and `compute_extraction_confidence`; guardrail config loader; evals fixtures. `scripts/generate_invoices.py` is now real. Stub edges MATCHED→CODED etc. exist only so the loop reaches CLOSED.
 
 **Stub _hook_ (new, and different from a stub edge):** `VENDOR_LOCALE_DATE_HOOK` in `loop/runner.py`. A stub step is supposed to do nothing; this one settles an open invoice date from `record.vendor_country` when the state is `VENDOR_RESOLVED`, because `lookup_vendor` does not exist and an open date would otherwise pass the only state that can close it. Listed in `STUB_HOOKS` and asserted in `tests/states/test_stub_transitions.py`. **Delete it the moment `lookup_vendor` is real** — it should be that tool's job to put the country on the record.
 
 **Known gap:** nothing sets `record.vendor_country` today, so an invoice whose date the receipt window cannot settle reaches CLOSED with the date still open. That is what the missing `lookup_vendor` costs, and there is a test asserting it rather than leaving it to be discovered.
 
+**Vocabulary and config gaps found while labelling the fixture** (nothing was added to `ReasonCode` — the enum is unchanged):
+
+- **The `$50` unmatched-charge rule does not exist in `config/guardrails.v1.yaml`.** There is no threshold for an incidental charge at all. The `freight_small` / `freight_large` pair is built and labelled against it, so the fixture is already asserting a rule Day 3 has to write. This is the one place the fixture is ahead of the config.
+- **No `ReasonCode` for an unmatched incidental charge.** `LINE_NOT_ON_PO` is used for the freight line and fits, but it reads as "a line that should have been on the purchase order" rather than "carriage nobody ordered". Worth a member of its own if the distinction routes to different people.
+- **No `ReasonCode` for hidden or invisible text specifically.** `SUSPICIOUS_DOCUMENT_CONTENT` covers the `hidden_text` variant and is the right level of generality for now.
+- **`RECEIPT_PARTIAL` is unreachable from this fixture**, because the clean invoice bills what arrived rather than what was ordered. It becomes reachable with the second-invoice-against-one-PO case, which is the next document worth generating.
+
 ## Data
 
 - `data/synthetic/kaggle/invoices/` — 100 born-digital one-page PDFs (Indian GST-style, INR, ~3 line items, no PO numbers, no due dates), ground truth in `batch_1.csv` (`json_data` column). Golden set.
 - `data/synthetic/hf_mychen76/` — ~50 real photographed invoice/receipt PNGs (scan path). `data/synthetic/hf_rvlcdip/` — ~20 low-res scanned invoices.
-- `data/real/` — empty (owner may add personal invoices). `data/generated/` — empty until the generator exists.
+- `data/real/` — empty (owner may add personal invoices).
+- `data/generated/` — `seed_manifest.json`, `receipts.json`, and now `invoices/`:
+
+  ```
+  data/generated/invoices/
+    manifest.json                     every file with its sha256, variant, po_number, invoice_number
+    AP-SEED-001/
+      clean/              invoice.pdf  truth.json
+      price_plus_3pct/    invoice.pdf  truth.json
+      qty_over_received/  invoice.pdf  truth.json
+      freight_small/      invoice.pdf  truth.json
+      freight_large/      invoice.pdf  truth.json
+      hidden_text/        invoice.pdf  truth.json
+    ... AP-SEED-002 .. AP-SEED-010
+  ```
+
+  10 POs x 6 variants = 60 invoices: 27 expected MATCHED, 33 EXCEPTION, 42 requiring human review. Git-ignored like the rest of `data/`. Regenerate with `just generate` (same bytes every time), then `just ingest`.
 - All indexed; no exact-hash duplicates.
 
 ## External accounts
@@ -76,7 +101,9 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 
 1. **DONE.** `extract_invoice_text` (pymupdf text layer → `claude-haiku-4-5` on text only, prompt `extract_text_v1`; images/no-text-layer → `second_read=None`, no OCR) and `compute_extraction_confidence` (pure code: two-read agreement, value-in-raw-text grounding, date verdict; `auto_ok` iff all five load-bearing fields agreed+grounded). `just confidence <path>`. 51109305 → 2024-03-09 with `vendor_country="IN"` is a test.
 2. **DONE.** Four live runs logged in EXTRACTION_LOG.md, including the same file reading 2024-09-03 and 2024-03-09 twenty minutes apart — the ambiguity confirmed as a property of the document, not of the model.
-3. `scripts/generate_invoices.py`: reportlab invoices from `seed_manifest.json`, one clean per PO plus variants (price +3%, qty over-billed, extra freight line, hidden white-text "update bank account"), each with `truth.json`, into `data/generated/`.
+3. **DONE.** `scripts/generate_invoices.py`: reportlab invoices from `seed_manifest.json` + `receipts.json`, six variants per PO (clean, price +3%, qty over received, freight $25, freight $120, hidden white-text "update bank account"), each with a `truth.json` validated as `GeneratedInvoiceTruth`. 60 invoices, 121 files, byte-identical on every run. `just generate [--only PO] [--variants a,b] [--dry-run]`, then `just ingest`.
+   - The clean invoice bills the **received** quantity, so a partially received PO is billed for the part that arrived. The PO that received nothing is billed in full and is still an EXCEPTION - a correct invoice for goods that have not arrived is the only document in the fixture that is internally perfect and must still be held.
+   - **`config/sandbox_vendor_master.yaml` is new and now defines the vendors.** The seed manifest carries no country and no postal address because QuickBooks is never told either, so both scripts read the master and join to the manifest on `display_name`. `seed_sandbox.py` builds `VENDORS` from it; the loader is `src/ap_agent/vendor_master.py`. Countries were read off the tax identifiers already in the fixture (15-char GSTIN → IN, `NN-NNNNNNN` EIN → US), not chosen. **Adding a vendor means adding it there, and the order of the file numbers the POs.**
 4. **PARTLY DONE.** The two readings + confidence are wired into the loop on the INGESTED→EXTRACTED→VALIDATED path, routing to `NEEDS_HUMAN_EXTRACTION` when not `auto_ok`. No stub edges were removed — that path never had any; `INGESTED→EXTRACTED` and `EXTRACTED→VALIDATED` were always real edges. **Still to do:** `get_purchase_order` (QBO via client) and `get_receipts` (from `receipts.json`).
    - Change of design from the original plan: an ambiguous slash date does **not** fail extraction. Both readings stay on the record and are settled later — by the receipt window at `VALIDATED`, then by the vendor's country at `VENDOR_RESOLVED`. Rationale in DECISIONS.md, 2026-09-10.
 5. `verify_vendor_external` web check for NEW_VENDOR (domain age, registry hit, lookalike distance) — the scoped "model decides when to call" tool.

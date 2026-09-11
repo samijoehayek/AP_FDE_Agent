@@ -24,6 +24,8 @@ just db-up        # Postgres 18 via docker compose
 just db-migrate   # alembic upgrade head
 just db-revision "message"
 just ingest       # walk data/ and write data/index.csv
+just generate     # render the labelled invoice fixture into data/generated/invoices/
+just seed         # seed the QuickBooks sandbox from config/sandbox_vendor_master.yaml
 just pull-data    # stream sample corpora from Hugging Face
 just docs-diagram # regenerate the state diagram from the transition table
 ```
@@ -79,9 +81,15 @@ Rules are not honour-system. Most of them fail a test if broken:
 ## What is stubbed, and why
 
 `guardrails/config.py`, `audit/chain.py`, `evals/golden.py`,
-`scripts/generate_invoices.py`, `PostgresAuditWriter`, and every tool except
-`ingest_document` and `extract_invoice_vision` raise `NotImplementedError` under
-a docstring describing the responsibility and the constraints.
+`PostgresAuditWriter`, and every tool except `ingest_document` and
+`extract_invoice_vision` raise `NotImplementedError` under a docstring
+describing the responsibility and the constraints.
+
+`scripts/generate_invoices.py` is real. It renders the labelled fixture into
+`data/generated/invoices/` and writes a `GeneratedInvoiceTruth` beside each PDF.
+Its `expected_match` and `expected_reason_codes` are *assertions about a matcher
+that does not exist yet*, declared per variant — never computed by evaluating a
+tolerance. Do not make the generator grade its own output.
 
 The agent loop (`loop/runner.py`) and the JSONL audit writer are now real. The
 states between `VALIDATED` and `CLOSED` are crossed by `STUB_TRANSITIONS` -

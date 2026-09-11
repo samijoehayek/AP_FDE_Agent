@@ -89,6 +89,8 @@ API or the database.
 | `just db-revision "msg"` | Autogenerate a migration from the models |
 | `just ingest` | Index every document under `data/` into `data/index.csv` |
 | `just pull-data` | Print dataset licences; add `--accept-licenses` to download |
+| `just seed` | Seed the QuickBooks sandbox from the vendor master. Live calls |
+| `just generate` | Render the 60 labelled invoice PDFs. No network, no model |
 | `just docs-diagram` | Regenerate the state diagram from the transition table |
 
 ## Data: what is real and what is synthetic
@@ -110,9 +112,33 @@ with per-file JSON ground truth, which is exactly what an extraction golden set
 needs. It still has no purchase orders behind it, so it can score extraction and
 nothing else.
 
-Only `data/generated/` will have POs, which is why it is the only corpus that can
-exercise matching, tolerances, or approval routing at all — see the docstring in
-`scripts/generate_invoices.py`.
+Only `data/generated/` has POs, which is why it is the only corpus that can
+exercise matching, tolerances, or approval routing at all.
+
+### Regenerating the labelled fixture
+
+`just generate` renders 60 invoice PDFs from the seeded purchase orders into
+`data/generated/invoices/<po_number>/<variant>/`, each beside a `truth.json`
+stating what is on the page and what the pipeline should do with it — six
+variants per PO: an honest invoice, a price 3% over the PO, a quantity two units
+above what was received, a small and a large unmatched freight charge, and one
+carrying an instruction to change the vendor's bank account in white 4pt type
+that only the text layer can see. The vendors come from
+`config/sandbox_vendor_master.yaml`, which is also what `just seed` reads, so a
+supplier cannot exist in QuickBooks under terms the invoices disagree with. The
+output is **byte-identical on every run** — the renderer is invariant and every
+date is derived from the seed manifest rather than the clock, because hashes are
+document identity here and a generator whose bytes moved would make each
+regeneration look like sixty new documents. Rerunning therefore overwrites
+safely; follow it with `just ingest` to pick the documents up in `data/index.csv`.
+
+```bash
+just generate --dry-run                      # print the plan, write nothing
+just generate                                # all 60
+just generate --only AP-SEED-010             # one purchase order
+just generate --variants clean,hidden_text   # one or more variants
+just ingest                                  # refresh data/index.csv
+```
 
 Run `just pull-data` to see each dataset's licence printed before anything
 downloads; nothing is written without `--accept-licenses`:
@@ -138,9 +164,11 @@ src/ap_agent/
   audit/        Append-only event model (done) and writer/chain. STUB
   db/           SQLAlchemy models and Alembic environment.
   evals/        Golden-set loader and scorers.   STUB
+  vendor_master.py  Loader for config/sandbox_vendor_master.yaml.
   cli.py        Typer entry points.
-scripts/        Corpus download, indexing, and synthetic generation.
+scripts/        Corpus download, indexing, seeding, and invoice generation.
 config/         guardrails.v1.yaml — versioned, never edited in place.
+                sandbox_vendor_master.yaml — the one definition of the vendors.
 docs/           ARCHITECTURE.md, DECISIONS.md
 ```
 
