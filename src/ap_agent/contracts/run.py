@@ -20,6 +20,7 @@ turns an event into a state.
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -28,8 +29,13 @@ from pydantic import AwareDatetime, Field
 from ulid import ULID
 
 from ap_agent.contracts.common import StrictModel
+from ap_agent.contracts.enums import AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.states.machine import InvoiceState
+from ap_agent.tools.compute_extraction_confidence import (
+    DateResolutionReason,
+    ExtractionConfidence,
+)
 from ap_agent.tools.ingest_document import IngestDocumentOutput
 
 
@@ -87,6 +93,36 @@ class Action(StrictModel):
     )
 
 
+class ToolCallRecord(StrictModel):
+    """One model or tool call made inside a step, recorded on its own audit row.
+
+    A step that calls three things is three facts and then a decision. Folding
+    them into the decision's row would lose what each call cost and which one
+    was slow - and "what did the second reading cost" is a question an auditor
+    asks about a system that pays two models to read the same page.
+
+    Flat rather than a nested ``(Action, StepResult)`` pair, because the pair
+    would make ``StepResult`` recursive for no gain: a call inside a call is not
+    a thing this loop does.
+    """
+
+    kind: ActionKind
+    by: Literal["rule", "model"]
+    rule_id: str | None = Field(default=None, max_length=64)
+    event_type: AuditEventType = AuditEventType.TOOL_CALL
+    summary: str = Field(min_length=1, max_length=64, description="What happened, in one token.")
+    output_ref: str | None = Field(default=None, max_length=512)
+    basis: str | None = Field(
+        default=None, max_length=1000, description="Why, for this call's own audit row."
+    )
+
+    model_id: str | None = Field(default=None, max_length=128)
+    prompt_version: str | None = Field(default=None, max_length=32)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+
+
 class StepResult(StrictModel):
     """What a step produced.
 
@@ -108,6 +144,19 @@ class StepResult(StrictModel):
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int | None = Field(default=None, ge=0)
 
+    calls: list[ToolCallRecord] = Field(
+        default_factory=list[ToolCallRecord],
+        max_length=8,
+        description="Calls this step made, in order. Each gets its own audit row, written "
+        "before the row that records what the step decided.",
+    )
+    decision_basis: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Why the step decided what it did, for the audit row. When a step has "
+        "something better to say than a list of flags, it says it here.",
+    )
+
 
 class InvoiceRecord(StrictModel):
     """One invoice, and everything known about it so far.
@@ -122,9 +171,52 @@ class InvoiceRecord(StrictModel):
     state: InvoiceState = InvoiceState.RECEIVED
     created_at: AwareDatetime
 
+    received_at: AwareDatetime | None = Field(
+        default=None,
+        description="When the document arrived. Set by whoever handed it to the pipeline - an "
+        "inbox timestamp, a scanner, an upload - and never by the loop, which would "
+        "be reading its own clock and calling it evidence. Bounds an ambiguous "
+        "invoice date: nothing can be issued after it was received.",
+    )
+
     ingest: IngestDocumentOutput | None = None
     extraction: InvoiceExtraction | None = None
+    confidence: ExtractionConfidence | None = Field(
+        default=None,
+        description="The verdict on the two readings. None before extraction has run.",
+    )
     validation_flags: list[str] = Field(
         default_factory=list[str],
         description="Why validation failed, in the order found. Empty means it passed.",
     )
+
+    invoice_date_resolved: date | None = Field(
+        default=None,
+        description="The effective invoice date. Set at extraction when the page was "
+        "unambiguous, and later by whichever rule settled it. None while the date "
+        "is still open.",
+    )
+    date_resolution_reason: DateResolutionReason | None = Field(
+        default=None, description="Which rule settled the date. None when none had to."
+    )
+    vendor_country: str | None = Field(
+        default=None,
+        max_length=2,
+        description="ISO-3166-1 alpha-2, from the vendor master - never read off the document. "
+        "Unset until the vendor is resolved.",
+    )
+
+    @property
+    def date_candidates(self) -> list[date]:
+        """The invoice-date readings still live. Empty once the date is settled."""
+        return list(self.confidence.date_candidates) if self.confidence else []
+
+    @property
+    def date_is_open(self) -> bool:
+        """True while two readings of the invoice date are still possible."""
+        return self.invoice_date_resolved is None and bool(self.date_candidates)
+
+    @property
+    def effective_invoice_date(self) -> date | None:
+        """The date downstream should use, or None while it is still open."""
+        return self.invoice_date_resolved
