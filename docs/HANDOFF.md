@@ -28,15 +28,22 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - `tools/ingest_document.py` — real: sha256, MIME sniffing, page count, text-layer detection, per-page Laplacian sharpness.
 - `tools/extract_invoice_vision.py` — real: PDF as document block / images as image block (TIFF→PNG), structured output into InvoiceExtraction, returns model id, prompt_version=`extract_v1`, tokens, latency; `ExtractionError` on API failure/refusal/truncation/validation. Prompt at `prompts/extract_v1.md`. 16 mocked tests.
 - `contracts/run.py` — InvoiceRecord, Action, StepResult.
-- `loop/runner.py` — decide → apply → transition → log; max_steps; only INGESTED→EXTRACTED calls the model; VALIDATED runs arithmetic (`VALIDATE@v1`); all later states are `rule:STUB` with `# TEMP STUB` edges in the transition table (listed in a test).
+- `loop/runner.py` — decide → apply → transition → log; max_steps counts state moves; INGESTED→EXTRACTED makes both model calls and runs `EXTRACT-CONF@v1` over them; VALIDATED runs arithmetic (`VALIDATE@v1`) and `DATE-RESOLVE@v1` when the receipt window can settle an open date; all later states are `rule:STUB` with `# TEMP STUB` edges in the transition table (listed in a test).
+- `loop/dates.py` — `resolve_date_by_receipt_window` and `resolve_date_by_locale`. Pure, and both take the clock as an argument: a rule that read `now()` would resolve a date differently on replay and break the chain that hashed it.
 - `audit/writer.py` — JsonlAuditWriter to `data/audit/<invoice_id>.jsonl`, sha256 hash chain from a zero genesis hash, `verify()`.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
-- CLI: `just extract <path>`, `just run <path>`, `just ingest`, `just seed [--dry-run]`.
+- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [--country XX] [--received-at YYYY-MM-DD] [--from-extraction <json>] [--out <json>]`, `just ingest`, `just seed [--dry-run]`.
+  - `--from-extraction` replays saved readings and makes **no** model calls — use it whenever the question is about the check rather than the models. `--out` writes the readings alongside the verdict so any run is replayable.
+  - `run` reports `steps` (state moves) and `audit rows` separately: the extraction step is one step and four rows.
 - Docs: README, ARCHITECTURE.md (state + trust-boundary diagrams), DECISIONS.md, CLAUDE.md.
 
-**Stubs:** all tools except ingest/extract, guardrail config loader, evals fixtures, `scripts/generate_invoices.py`. Stub edges MATCHED→CODED etc. exist only so the loop reaches CLOSED.
+**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text` and `compute_extraction_confidence`; guardrail config loader; evals fixtures; `scripts/generate_invoices.py`. Stub edges MATCHED→CODED etc. exist only so the loop reaches CLOSED.
+
+**Stub _hook_ (new, and different from a stub edge):** `VENDOR_LOCALE_DATE_HOOK` in `loop/runner.py`. A stub step is supposed to do nothing; this one settles an open invoice date from `record.vendor_country` when the state is `VENDOR_RESOLVED`, because `lookup_vendor` does not exist and an open date would otherwise pass the only state that can close it. Listed in `STUB_HOOKS` and asserted in `tests/states/test_stub_transitions.py`. **Delete it the moment `lookup_vendor` is real** — it should be that tool's job to put the country on the record.
+
+**Known gap:** nothing sets `record.vendor_country` today, so an invoice whose date the receipt window cannot settle reaches CLOSED with the date still open. That is what the missing `lookup_vendor` costs, and there is a test asserting it rather than leaving it to be discovered.
 
 ## Data
 
@@ -61,10 +68,11 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
 
-1. **IN PROGRESS — prompt issued:** `extract_invoice_text` (pymupdf text layer → second model read on text only, cheaper model, prompt `extract_text_v1`; images/no-text-layer → `second_read=None`, no OCR yet) and `compute_extraction_confidence` (pure code: two-read agreement on load-bearing fields, value-in-raw-text grounding, ambiguous slash-date resolution from vendor country, sharpness floor 800; `auto_ok` only if all five load-bearing fields agreed+grounded). `just confidence <path>`. Test must reproduce 51109305 → 2024-03-09 with vendor_country="IN". Not yet wired into the loop.
-2. Verify: `just confidence` on 51109305 (expect date held until locale, then resolved) and 51109301 (expect `auto_ok=True`). Log results in EXTRACTION_LOG.md.
+1. **DONE.** `extract_invoice_text` (pymupdf text layer → `claude-haiku-4-5` on text only, prompt `extract_text_v1`; images/no-text-layer → `second_read=None`, no OCR) and `compute_extraction_confidence` (pure code: two-read agreement, value-in-raw-text grounding, date verdict; `auto_ok` iff all five load-bearing fields agreed+grounded). `just confidence <path>`. 51109305 → 2024-03-09 with `vendor_country="IN"` is a test.
+2. **DONE.** Four live runs logged in EXTRACTION_LOG.md, including the same file reading 2024-09-03 and 2024-03-09 twenty minutes apart — the ambiguity confirmed as a property of the document, not of the model.
 3. `scripts/generate_invoices.py`: reportlab invoices from `seed_manifest.json`, one clean per PO plus variants (price +3%, qty over-billed, extra freight line, hidden white-text "update bank account"), each with `truth.json`, into `data/generated/`.
-4. `get_purchase_order` (QBO via client) and `get_receipts` (from receipts.json) real; wire the two readings + confidence into the loop (INGESTED→EXTRACTED→VALIDATED path, route to NEEDS_HUMAN_EXTRACTION when not auto_ok); remove the corresponding stub edges.
+4. **PARTLY DONE.** The two readings + confidence are wired into the loop on the INGESTED→EXTRACTED→VALIDATED path, routing to `NEEDS_HUMAN_EXTRACTION` when not `auto_ok`. No stub edges were removed — that path never had any; `INGESTED→EXTRACTED` and `EXTRACTED→VALIDATED` were always real edges. **Still to do:** `get_purchase_order` (QBO via client) and `get_receipts` (from `receipts.json`).
+   - Change of design from the original plan: an ambiguous slash date does **not** fail extraction. Both readings stay on the record and are settled later — by the receipt window at `VALIDATED`, then by the vendor's country at `VENDOR_RESOLVED`. Rationale in DECISIONS.md, 2026-09-10.
 5. `verify_vendor_external` web check for NEW_VENDOR (domain age, registry hit, lookalike distance) — the scoped "model decides when to call" tool.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
 7. Off-keyboard: book the customer interview.
