@@ -99,7 +99,14 @@ seed *ARGS:
 ingest *ARGS:
     uv run python scripts/index_invoices.py {{ARGS}}
 
-# Render labelled synthetic invoices from seeded POs. STUB.
+# Byte-identical on every run, so rerunning overwrites with the same bytes.
+# Follow it with `just ingest` to pick the new documents up in data/index.csv.
+#
+#   just generate --dry-run
+#   just generate --only AP-SEED-010
+#   just generate --variants clean,hidden_text
+
+# Render labelled invoice PDFs from the seeded POs into data/generated/invoices/.
 generate *ARGS:
     uv run python scripts/generate_invoices.py {{ARGS}}
 
