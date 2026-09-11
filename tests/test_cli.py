@@ -15,6 +15,8 @@ from ap_agent.cli import app
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.loop import runner as runner_module
 from ap_agent.states.machine import InvoiceState
+from ap_agent.tools.compute_extraction_confidence import ComputeExtractionConfidenceInput
+from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
 from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
 
 runner = CliRunner()
@@ -102,8 +104,34 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
             latency_ms=1,
         )
 
+    # A text layer that grounds every claimed value, because the confidence
+    # check between the two seats is left real.
+    page = (
+        "Acme\n"
+        "Invoice No: INV-1\n"
+        "Date of issue: 2026-01-01\n"
+        "Subtotal 100.00\n"
+        "Tax 20.00\n"
+        "Total 120.00 USD"
+    )
+
+    def _extract_text(_payload: object) -> ExtractInvoiceTextOutput:
+        return ExtractInvoiceTextOutput(
+            raw_text=page,
+            pages=[page],
+            has_text_layer=True,
+            second_read=extraction,
+            model_id="claude-haiku-4-5-20251001",
+            prompt_version="extract_text_v1",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+        )
+
+    # Both seats are replaced. The confidence check between them is left real:
+    # it is pure code, so faking it would only test the fake.
     monkeypatch.setattr(runner_module, "extract_invoice_vision", _extract)
-    monkeypatch.setattr(runner_module.RunContext, "__init__", runner_module.RunContext.__init__)
+    monkeypatch.setattr(runner_module, "extract_invoice_text", _extract_text)
     result = runner.invoke(
         app,
         ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")],
@@ -111,4 +139,123 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     assert result.exit_code == 0, result.output
     assert "final state : CLOSED" in result.output
     assert "steps       : 14" in result.output
+    assert "audit rows  : 17" in result.output
     assert "chain intact: True" in result.output
+
+
+# --- confidence, replayed from saved readings --------------------------------
+
+
+def _saved_readings(tmp_path: Path, *, ambiguous: bool = False) -> Path:
+    """Write a readings file of the shape ``--out`` produces."""
+    rendering = "09/03/2024" if ambiguous else "2024-03-09"
+    page = "\n".join(
+        [
+            "TechVision Distributors Pvt Ltd",
+            "Invoice No: 51109305",
+            f"Date of issue: {rendering}",
+            "Subtotal 2023625.00",
+            "Tax 202362.50",
+            "Total 2225987.50 INR",
+        ]
+    )
+    extraction = InvoiceExtraction.model_validate(
+        {
+            "vendor_name": "TechVision Distributors Pvt Ltd",
+            "invoice_number": "51109305",
+            "invoice_date": date(2024, 3, 9),
+            "currency": "INR",
+            "subtotal": Decimal("2023625.00"),
+            "tax_total": Decimal("202362.50"),
+            "total": Decimal("2225987.50"),
+        }
+    )
+    readings = ComputeExtractionConfidenceInput(
+        primary=extraction, secondary=extraction, raw_text=page
+    )
+    target = tmp_path / "readings.json"
+    target.write_text(
+        json.dumps({"readings": readings.model_dump(mode="json")}, indent=2), encoding="utf-8"
+    )
+    return target
+
+
+def test_confidence_can_be_replayed_without_calling_a_model(tmp_path: Path) -> None:
+    """The check will be argued with far more often than the readings change.
+
+    Re-reading the invoice to re-run the check costs a few cents against a $5
+    budget, and answers a question nobody asked - the readings are not what is
+    in doubt.
+    """
+    result = runner.invoke(
+        app,
+        ["confidence", "unused.pdf", "--from-extraction", str(_saved_readings(tmp_path))],
+    )
+    assert result.exit_code == 0, result.output
+    assert "auto_ok: yes" in result.output
+
+
+def test_replaying_an_ambiguous_date_says_it_is_not_a_failure(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "confidence",
+            "unused.pdf",
+            "--from-extraction",
+            str(_saved_readings(tmp_path, ambiguous=True)),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "invoice_date ambiguous" in result.output
+    assert "2024-03-09 or 2024-09-03" in result.output
+    assert "not a failure" in result.output
+
+
+def test_a_received_date_settles_the_replayed_ambiguity(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "confidence",
+            "unused.pdf",
+            "--from-extraction",
+            str(_saved_readings(tmp_path, ambiguous=True)),
+            "--received-at",
+            "2024-03-12",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "received 2024-03-12 -> 2024-03-09" in result.output
+    assert "date_resolved_from_receipt_window" in result.output
+
+
+def test_the_country_flag_overrides_what_was_saved(tmp_path: Path) -> None:
+    """The country is the one input that is not a property of the document."""
+    result = runner.invoke(
+        app,
+        [
+            "confidence",
+            "unused.pdf",
+            "--from-extraction",
+            str(_saved_readings(tmp_path, ambiguous=True)),
+            "--country",
+            "US",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "resolved to 2024-09-03" in result.output
+
+
+def test_a_file_that_is_not_readings_fails_cleanly(tmp_path: Path) -> None:
+    junk = tmp_path / "junk.json"
+    junk.write_text('{"nope": 1}', encoding="utf-8")
+    result = runner.invoke(app, ["confidence", "unused.pdf", "--from-extraction", str(junk)])
+    assert result.exit_code == 1
+    assert "not a saved readings file" in result.output
+
+
+def test_a_missing_readings_file_fails_cleanly(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["confidence", "unused.pdf", "--from-extraction", str(tmp_path / "nope.json")]
+    )
+    assert result.exit_code == 1
+    assert "could not read saved readings" in result.output

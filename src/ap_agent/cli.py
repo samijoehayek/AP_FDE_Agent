@@ -8,11 +8,12 @@ system is visible from ``--help`` on day one.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
+from pydantic import ValidationError
 from ulid import ULID
 
 from ap_agent import __version__
@@ -21,6 +22,7 @@ from ap_agent.config import REPO_ROOT
 from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.errors import APAgentError
+from ap_agent.loop.dates import resolve_date_by_receipt_window
 from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext
 from ap_agent.loop.runner import run as loop_run
 from ap_agent.states.machine import (
@@ -33,19 +35,18 @@ from ap_agent.states.machine import (
 )
 from ap_agent.tools.compute_extraction_confidence import (
     ComputeExtractionConfidenceInput,
+    DateResolutionReason,
+    DateVerdict,
     ExtractionConfidence,
     compute_extraction_confidence,
-    find_raw_date,
 )
 from ap_agent.tools.extract_invoice_text import (
     ExtractInvoiceTextInput,
-    ExtractInvoiceTextOutput,
     extract_invoice_text,
 )
 from ap_agent.tools.extract_invoice_vision import (
     PROMPT_VERSION,
     ExtractInvoiceVisionInput,
-    ExtractInvoiceVisionOutput,
     extract_invoice_vision,
 )
 from ap_agent.tools.ingest_document import IngestDocumentInput, ingest_document
@@ -146,9 +147,26 @@ def confidence(
             help="Vendor's ISO-3166-1 alpha-2 country. Settles DD/MM against MM/DD.",
         ),
     ] = None,
+    received_at: Annotated[
+        datetime | None,
+        typer.Option(
+            "--received-at",
+            formats=["%Y-%m-%d"],
+            help="The day the document arrived. Settles an ambiguous date when only one "
+            "reading could have been received by then.",
+        ),
+    ] = None,
+    from_extraction: Annotated[
+        Path | None,
+        typer.Option(
+            "--from-extraction",
+            help="Replay the check against readings saved by an earlier --out run. Makes no "
+            "model calls at all.",
+        ),
+    ] = None,
     out: Annotated[
         Path | None,
-        typer.Option("--out", "-o", help="Also write the full verdict to this file as JSON."),
+        typer.Option("--out", "-o", help="Write the readings and the verdict to this file."),
     ] = None,
 ) -> None:
     """Read one invoice twice and report how much of it can be trusted.
@@ -156,50 +174,100 @@ def confidence(
     Two model calls: the vision model over the page image, then the cheaper text
     model over the PDF's own characters. Where they agree *and* the value is
     present in the text layer, the field passes; anything else is named in
-    ``needs_human``.
+    ``needs_human``, with the field to open the document for.
 
-    This spends tokens, roughly the cost of ``extract`` plus a few cents.
+    This spends tokens, roughly the cost of ``extract`` plus a few cents - unless
+    ``--from-extraction`` is given, which replays saved readings and calls
+    nothing. Use it whenever the question is about the *check* rather than about
+    the models: the thresholds here will be argued with many more times than the
+    readings will change.
 
-    Nothing is persisted unless ``--out`` is given, and nothing is wired into the
-    agent loop yet - this command exists so the check can be run against real
-    invoices and its thresholds argued with before it decides anything.
+    Exits 2 when a person is needed, so it composes with a shell.
     """
     try:
-        document = ingest_document(IngestDocumentInput(path=path))
-        vision = extract_invoice_vision(ExtractInvoiceVisionInput(path=path))
-        text = extract_invoice_text(ExtractInvoiceTextInput(path=path))
-        verdict = compute_extraction_confidence(
-            ComputeExtractionConfidenceInput(
-                primary=vision.extraction,
-                secondary=text.second_read,
-                raw_text=text.raw_text,
-                vendor_country=country,
-                min_sharpness=document.min_sharpness,
-            )
-        ).confidence
+        readings = (
+            _load_readings(from_extraction, country)
+            if from_extraction is not None
+            else _read_twice(path, country)
+        )
+        verdict = compute_extraction_confidence(readings).confidence
     except APAgentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
-    _print_confidence(verdict, vision, text)
+    received = received_at.date() if received_at is not None else None
+    _print_confidence(verdict, readings, received)
 
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(verdict.model_dump(mode="json"), indent=2) + "\n", encoding="utf-8"
-        )
+        document = {
+            "readings": readings.model_dump(mode="json"),
+            "confidence": verdict.model_dump(mode="json"),
+        }
+        out.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         typer.secho(f"written to {out}", fg=typer.colors.GREEN, err=True)
 
     raise typer.Exit(code=0 if verdict.auto_ok else 2)
 
 
+def _read_twice(path: Path, country: str | None) -> ComputeExtractionConfidenceInput:
+    """Ingest, read the page image, read the text layer. Two model calls."""
+    document = ingest_document(IngestDocumentInput(path=path))
+    vision = extract_invoice_vision(ExtractInvoiceVisionInput(path=path))
+    text = extract_invoice_text(ExtractInvoiceTextInput(path=path))
+    typer.secho(
+        f"vision {vision.model_id} in={vision.input_tokens} out={vision.output_tokens}"
+        f"  |  text {text.model_id} in={text.input_tokens} out={text.output_tokens}"
+        f"  |  text layer {len(text.raw_text)} chars",
+        fg=typer.colors.CYAN,
+        err=True,
+    )
+    return ComputeExtractionConfidenceInput(
+        primary=vision.extraction,
+        secondary=text.second_read,
+        raw_text=text.raw_text,
+        vendor_country=country,
+        min_sharpness=document.min_sharpness,
+    )
+
+
+def _load_readings(source: Path, country: str | None) -> ComputeExtractionConfidenceInput:
+    """Rebuild the check's inputs from a file an earlier ``--out`` run wrote.
+
+    Accepts the whole ``{readings, confidence}`` document or a bare readings
+    object, so a file can be hand-trimmed without the command rejecting it.
+    ``--country`` still overrides what was saved: the country is the one input
+    that is not a property of the document.
+    """
+    try:
+        parsed: object = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        msg = f"could not read saved readings from {source}: {exc}"
+        raise APAgentError(msg) from exc
+
+    if not isinstance(parsed, dict):
+        msg = f"{source} does not contain a JSON object"
+        raise APAgentError(msg)
+
+    payload = cast("dict[str, object]", parsed)
+    nested = payload.get("readings")
+    body = cast("dict[str, object]", nested) if isinstance(nested, dict) else payload
+    try:
+        readings = ComputeExtractionConfidenceInput.model_validate(body)
+    except ValidationError as exc:
+        msg = f"{source} is not a saved readings file: {exc}"
+        raise APAgentError(msg) from exc
+
+    return readings if country is None else readings.model_copy(update={"vendor_country": country})
+
+
 def _print_confidence(
     verdict: ExtractionConfidence,
-    vision: ExtractInvoiceVisionOutput,
-    text: ExtractInvoiceTextOutput,
+    readings: ComputeExtractionConfidenceInput,
+    received_at: date | None,
 ) -> None:
     """Render the verdict as a table. Two colours: passed, or did not."""
-    primary = vision.extraction
+    primary = readings.primary
     typer.echo(f"{'field':<16}{'primary':<34}{'agreed':<8}{'grounded':<10}{'score':<7}reason")
     typer.echo("-" * 100)
     for entry in verdict.fields:
@@ -212,7 +280,7 @@ def _print_confidence(
             fg=typer.colors.GREEN if passed else typer.colors.YELLOW,
         )
 
-    _print_date_note(verdict, primary.invoice_date, text.raw_text)
+    _print_date_note(verdict, primary.invoice_date, received_at)
 
     typer.echo("")
     if verdict.auto_ok:
@@ -221,45 +289,57 @@ def _print_confidence(
         blocking = ", ".join(f"{item.field} ({item.reason})" for item in verdict.needs_human)
         typer.secho(f"auto_ok: no  needs_human: {blocking}", fg=typer.colors.RED, bold=True)
 
-    typer.secho(
-        f"\nvision {vision.model_id} in={vision.input_tokens} out={vision.output_tokens}"
-        f"  |  text {text.model_id} in={text.input_tokens} out={text.output_tokens}"
-        f"  |  text layer {len(text.raw_text)} chars",
-        fg=typer.colors.CYAN,
-        err=True,
-    )
 
+def _print_date_note(
+    verdict: ExtractionConfidence, extracted: date, received_at: date | None
+) -> None:
+    """Say what happened to the invoice date, in the terms the page states it.
 
-def _print_date_note(verdict: ExtractionConfidence, extracted: date, raw_text: str) -> None:
-    """Explain an ambiguous date in the terms the page states it.
-
-    ``-> None`` is not an explanation. Whoever is reading this needs to see the
-    digits that are ambiguous and both ways they can be read, because they are
-    the one who has to decide which vendor this is.
+    ``-> None`` is not an explanation. Whoever reads this is the person who has
+    to decide, so they get the digits, both readings, and what would settle it.
     """
-    if verdict.resolved_invoice_date == extracted:
+    if verdict.date_verdict is DateVerdict.UNAMBIGUOUS:
         return
 
-    raw = find_raw_date(raw_text, extracted)
-    rendering = f"the page reads {raw.text}" if raw else "the page is ambiguous"
+    rendering = f"the page reads {verdict.date_raw_text}" if verdict.date_raw_text else "the page"
 
-    if verdict.resolved_invoice_date is None:
-        readings = ""
-        if raw is not None:
-            day_first = raw.resolve(day_first=True)
-            month_first = raw.resolve(day_first=False)
-            readings = f", which is {day_first} day-first or {month_first} month-first"
+    if verdict.date_verdict is DateVerdict.RESOLVED:
         typer.secho(
-            f"\ninvoice_date unresolved: {rendering}{readings}. Pass --country to settle it.",
+            f"\ninvoice_date resolved: read as {extracted}, resolved to "
+            f"{verdict.resolved_invoice_date} ({_reason_text(verdict)})",
             fg=typer.colors.MAGENTA,
         )
         return
 
+    candidates = " or ".join(day.isoformat() for day in verdict.date_candidates)
     typer.secho(
-        f"\ninvoice_date reinterpreted: {rendering}, read as {extracted} and "
-        f"resolved to {verdict.resolved_invoice_date}",
+        f"\ninvoice_date ambiguous: {rendering}, which is {candidates}.",
         fg=typer.colors.MAGENTA,
     )
+
+    if received_at is None:
+        typer.secho(
+            "  not a failure - the loop carries both readings forward. "
+            "Pass --country or --received-at to settle it here.",
+            fg=typer.colors.MAGENTA,
+        )
+        return
+
+    chosen = resolve_date_by_receipt_window(verdict.date_candidates, received_at)
+    if chosen is None:
+        typer.secho(
+            f"  both readings survive a {received_at} receipt date; still open.",
+            fg=typer.colors.MAGENTA,
+        )
+    else:
+        typer.secho(
+            f"  received {received_at} -> {chosen} ({DateResolutionReason.RECEIPT_WINDOW.value})",
+            fg=typer.colors.MAGENTA,
+        )
+
+
+def _reason_text(verdict: ExtractionConfidence) -> str:
+    return verdict.date_resolution_reason.value if verdict.date_resolution_reason else "resolved"
 
 
 def _tick(value: bool | None) -> str:
@@ -302,29 +382,65 @@ def run_invoice(
     max_steps: Annotated[
         int, typer.Option("--max-steps", min=1, help="Step budget before escalating.")
     ] = DEFAULT_MAX_STEPS,
+    received_at: Annotated[
+        datetime | None,
+        typer.Option(
+            "--received-at",
+            formats=["%Y-%m-%d"],
+            help="The day the document arrived. Lets the loop settle an ambiguous date.",
+        ),
+    ] = None,
     audit_dir: Annotated[
         Path, typer.Option("--audit-dir", help="Where the JSONL trail is written.")
     ] = REPO_ROOT / "data" / "audit",
 ) -> None:
     """Run one invoice through the loop and print where it stopped.
 
-    This spends tokens: the extraction step calls the API. Most other steps are
-    stubs, so a run that reaches CLOSED has proved the pipeline's shape, not
-    that an invoice was really matched, approved or posted.
+    This spends tokens: the extraction step reads the document twice. Most other
+    steps are stubs, so a run that reaches CLOSED has proved the pipeline's
+    shape, not that an invoice was really matched, approved or posted.
+
+    ``--received-at`` is the caller's to supply. The loop never reads a clock to
+    decide when a document arrived - a receipt date it invented would be
+    evidence it made up about itself.
     """
-    record = InvoiceRecord(source_path=path, created_at=utc_now())
+    record = InvoiceRecord(
+        source_path=path,
+        created_at=utc_now(),
+        received_at=received_at.replace(tzinfo=UTC) if received_at else None,
+    )
     writer = JsonlAuditWriter(audit_dir)
     ctx = RunContext(run_id=str(ULID()), writer=writer)
 
     final = loop_run(record, ctx, max_steps=max_steps)
 
+    moves = [event for event in ctx.events if event.to_state is not None]
     colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
     typer.secho(f"final state : {final.state.value}", fg=colour)
-    typer.echo(f"steps       : {len(ctx.events)}")
+    typer.echo(f"steps       : {len(moves)}")
+    typer.echo(f"audit rows  : {len(ctx.events)}")
     typer.echo(f"audit trail : {writer.path_for(str(record.invoice_id))}")
     typer.echo(f"chain intact: {writer.verify(str(record.invoice_id))}")
+    _print_run_date(final)
     if final.validation_flags:
         typer.secho(f"validation  : {', '.join(final.validation_flags)}", fg=typer.colors.YELLOW)
+
+
+def _print_run_date(final: InvoiceRecord) -> None:
+    """Say what the invoice date ended up as, and whether anything had to decide it."""
+    if final.date_is_open:
+        candidates = " or ".join(day.isoformat() for day in final.date_candidates)
+        typer.secho(
+            f"invoice date: still open - {candidates}. Pass --received-at, or wait for "
+            "lookup_vendor to supply the country.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    if final.date_resolution_reason is not None:
+        typer.secho(
+            f"invoice date: {final.invoice_date_resolved} ({final.date_resolution_reason.value})",
+            fg=typer.colors.MAGENTA,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
