@@ -7,6 +7,14 @@ received" has no home in the ERP and has to be owned here. That is why this
 script writes two files: a manifest of what was created in QuickBooks, and a
 separate receipts file that exists only in this system.
 
+The vendors come from ``config/sandbox_vendor_master.yaml``, which is also what
+``generate_invoices.py`` reads to print a vendor block and a remittance address.
+One definition, two consumers: a supplier cannot exist in QuickBooks under terms
+the generated invoices disagree with. The manifest this script writes stays a
+record of what was created *in QuickBooks* and carries only what QuickBooks was
+told - the country and the postal address are vendor-master facts the ERP never
+receives, and the two are joined on ``display_name``.
+
 Idempotent by query. Every create is preceded by a lookup on the natural key -
 DisplayName for a vendor, Name for an item, DocNumber for a purchase order - and
 skipped if something is already there. Running it twice creates nothing, which
@@ -34,6 +42,7 @@ import typer
 from ap_agent.config import REPO_ROOT
 from ap_agent.errors import APAgentError
 from ap_agent.integrations.qbo.client import QboClient
+from ap_agent.vendor_master import MasterVendor, load_vendor_master
 
 app = typer.Typer(add_completion=False, help=__doc__)
 
@@ -45,13 +54,14 @@ SEED = 20260910
 """Fixed, so the same corpus comes out every time and a failure is reproducible."""
 
 
-@dataclass(frozen=True)
-class VendorSpec:
-    """One supplier in the fixture."""
+VendorSpec = MasterVendor
+"""One supplier in the fixture.
 
-    display_name: str
-    currency: str
-    tax_id: str
+Loaded from ``config/sandbox_vendor_master.yaml`` rather than declared here, so
+that the country and postal address a generated invoice prints and the vendor
+QuickBooks is told about are the same record. The alias keeps the name this
+module and its tests already use.
+"""
 
 
 @dataclass(frozen=True)
@@ -77,18 +87,16 @@ class PoLine:
         self.amount = (self.qty * self.unit_price).quantize(Decimal("0.01"))
 
 
-VENDORS: tuple[VendorSpec, ...] = (
-    VendorSpec("TechVision Distributors Pvt Ltd", "INR", "27AABCT1234F1Z5"),
-    VendorSpec("Meridian Office Supplies", "USD", "84-1938472"),
-    VendorSpec("Kestrel Components Ltd", "USD", "91-2274618"),
-    VendorSpec("Sundar Electronics Trading", "INR", "29AAGCS8842K1ZP"),
-    VendorSpec("Northwind Peripherals Inc", "USD", "27-6653019"),
-    VendorSpec("Anand Cables and Connectors", "INR", "07AACCA5521M1Z8"),
-    VendorSpec("Blue Harbour Furniture Co", "USD", "45-8871223"),
-    VendorSpec("Deccan Print and Paper", "INR", "36AADCD7719L1ZQ"),
-    VendorSpec("Orion Networking Supplies", "USD", "13-4429087"),
-    VendorSpec("Vasanth Industrial Tools", "INR", "33AAHCV2298N1ZR"),
-)
+VENDORS: tuple[VendorSpec, ...] = load_vendor_master()
+"""The sandbox suppliers, in the order the vendor master lists them.
+
+Order is load-bearing: purchase orders are numbered by the vendor's index, so
+``AP-SEED-001`` belongs to the first vendor in the file. Reordering the master
+renumbers the fixture against a sandbox that already holds the old numbers.
+
+Read at import, and a malformed or missing master raises here rather than
+halfway through a run of creates.
+"""
 
 ITEMS: tuple[ItemSpec, ...] = (
     ItemSpec("Mechanical Keyboard TKL", Decimal("6450.00"), "Tenkeyless mechanical keyboard"),

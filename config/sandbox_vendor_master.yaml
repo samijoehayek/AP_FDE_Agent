@@ -1,0 +1,124 @@
+# The sandbox vendor master, version 1.
+#
+# This file defines the vendors. `scripts/seed_sandbox.py` builds VENDORS from
+# it, and `scripts/generate_invoices.py` reads the country and postal address
+# from it when rendering an invoice. There is one definition of a vendor and
+# both scripts read it, so a vendor cannot exist in QuickBooks under terms this
+# repository disagrees with.
+#
+# Why a file rather than the manifest: `data/generated/seed_manifest.json` is a
+# record of what was created *in QuickBooks*, and QuickBooks was never told
+# either of these facts - the vendor create sends DisplayName, CompanyName and
+# TaxIdentifier and nothing else. The country and the postal address are things
+# the vendor master knows and the ERP does not, which is exactly what
+# ARCHITECTURE.md means when it says the vendor master is the authority. The
+# manifest is joined to this file on `display_name`.
+#
+# `country` is load-bearing, not decoration. It is the input to the ambiguous-
+# date rule (`country_reads_day_first` in
+# `src/ap_agent/tools/compute_extraction_confidence.py`): 09/03/2024 on an
+# Indian invoice is 9 March and on a US invoice is 3 September, and nothing in
+# the document settles it. Every value here is derived from the tax identifier
+# that was already in the fixture - a 15-character GSTIN is Indian and its first
+# two digits are the state code; an NN-NNNNNNN EIN is US - so the countries are
+# read off the data rather than chosen. The Indian addresses sit in the state
+# their GSTIN prefix names.
+#
+# Addresses are synthetic, for fictional companies. No bank details appear here
+# or anywhere else in this repository: the remittance block on a generated
+# invoice carries a postal address and nothing more, and rule 2 of CLAUDE.md
+# means the only authority for remittance is this vendor master, compared
+# server-side. Adding an account number to this file would defeat that.
+
+version: "v1"
+
+vendors:
+  - display_name: "TechVision Distributors Pvt Ltd"
+    currency: "INR"
+    tax_id: "27AABCT1234F1Z5"      # GSTIN state 27, Maharashtra
+    country: "IN"
+    address:
+      - "Unit 14, Sahyadri Industrial Estate"
+      - "Kondhwa Budruk"
+      - "Pune 411048"
+      - "Maharashtra"
+
+  - display_name: "Meridian Office Supplies"
+    currency: "USD"
+    tax_id: "84-1938472"
+    country: "US"
+    address:
+      - "2140 Larkspur Commerce Way"
+      - "Suite 300"
+      - "Denver, CO 80216"
+
+  - display_name: "Kestrel Components Ltd"
+    currency: "USD"
+    tax_id: "91-2274618"
+    country: "US"
+    address:
+      - "805 Foundry Street"
+      - "Building C"
+      - "Tacoma, WA 98421"
+
+  - display_name: "Sundar Electronics Trading"
+    currency: "INR"
+    tax_id: "29AAGCS8842K1ZP"      # GSTIN state 29, Karnataka
+    country: "IN"
+    address:
+      - "No. 42, Brigade Export Park"
+      - "Mahadevapura Post"
+      - "Bengaluru 560048"
+      - "Karnataka"
+
+  - display_name: "Northwind Peripherals Inc"
+    currency: "USD"
+    tax_id: "27-6653019"
+    country: "US"
+    address:
+      - "6600 Cedar Bluff Parkway"
+      - "Saint Paul, MN 55114"
+
+  - display_name: "Anand Cables and Connectors"
+    currency: "INR"
+    tax_id: "07AACCA5521M1Z8"      # GSTIN state 07, Delhi
+    country: "IN"
+    address:
+      - "Plot 9, Okhla Industrial Area Phase II"
+      - "New Delhi 110020"
+      - "Delhi"
+
+  - display_name: "Blue Harbour Furniture Co"
+    currency: "USD"
+    tax_id: "45-8871223"
+    country: "US"
+    address:
+      - "1275 Dockside Avenue"
+      - "Baltimore, MD 21230"
+
+  - display_name: "Deccan Print and Paper"
+    currency: "INR"
+    tax_id: "36AADCD7719L1ZQ"      # GSTIN state 36, Telangana
+    country: "IN"
+    address:
+      - "Survey No. 118, Balanagar Industrial Area"
+      - "Hyderabad 500037"
+      - "Telangana"
+
+  - display_name: "Orion Networking Supplies"
+    currency: "USD"
+    tax_id: "13-4429087"
+    country: "US"
+    address:
+      - "410 West 39th Street"
+      - "Floor 6"
+      - "New York, NY 10018"
+
+  - display_name: "Vasanth Industrial Tools"
+    currency: "INR"
+    tax_id: "33AAHCV2298N1ZR"      # GSTIN state 33, Tamil Nadu
+    country: "IN"
+    address:
+      - "No. 7, Ambattur Industrial Estate"
+      - "Chennai 600058"
+      - "Tamil Nadu"

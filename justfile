@@ -91,6 +91,10 @@ extract PATH *ARGS:
 confidence PATH *ARGS:
     uv run ap-agent confidence {{PATH}} {{ARGS}}
 
+# Seed the QuickBooks sandbox from config/sandbox_vendor_master.yaml. Live calls.
+seed *ARGS:
+    uv run python scripts/seed_sandbox.py {{ARGS}}
+
 # Walk data/ and write data/index.csv.
 ingest *ARGS:
     uv run python scripts/index_invoices.py {{ARGS}}
