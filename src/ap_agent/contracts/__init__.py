@@ -48,6 +48,14 @@ from ap_agent.contracts.enums import (
     SuggestedResolver,
 )
 from ap_agent.contracts.exceptions import ExceptionClassification
+from ap_agent.contracts.generated import (
+    GENERATOR_VERSION,
+    ExpectedInvoice,
+    ExpectedLine,
+    ExpectedMatch,
+    GeneratedInvoiceTruth,
+    GeneratedVariant,
+)
 from ap_agent.contracts.invoice import (
     EVIDENCE_FIELDS,
     EvidenceEntry,
@@ -68,6 +76,7 @@ from ap_agent.contracts.vendor import VendorRef
 __all__ = [
     "CURRENCY_ALLOWLIST",
     "EVIDENCE_FIELDS",
+    "GENERATOR_VERSION",
     "GENESIS_HASH",
     "Actor",
     "ActorKind",
@@ -80,6 +89,11 @@ __all__ = [
     "EvidenceEntry",
     "EvidenceField",
     "ExceptionClassification",
+    "ExpectedInvoice",
+    "ExpectedLine",
+    "ExpectedMatch",
+    "GeneratedInvoiceTruth",
+    "GeneratedVariant",
     "GoodsReceipt",
     "GoodsReceiptLine",
     "HumanActor",
