@@ -218,11 +218,8 @@ def _print_confidence(
     if verdict.auto_ok:
         typer.secho("auto_ok: yes", fg=typer.colors.GREEN, bold=True)
     else:
-        typer.secho(
-            f"auto_ok: no  needs_human: {', '.join(verdict.needs_human)}",
-            fg=typer.colors.RED,
-            bold=True,
-        )
+        blocking = ", ".join(f"{item.field} ({item.reason})" for item in verdict.needs_human)
+        typer.secho(f"auto_ok: no  needs_human: {blocking}", fg=typer.colors.RED, bold=True)
 
     typer.secho(
         f"\nvision {vision.model_id} in={vision.input_tokens} out={vision.output_tokens}"

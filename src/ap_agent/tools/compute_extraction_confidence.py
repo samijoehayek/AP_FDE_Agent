@@ -35,6 +35,7 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from enum import StrEnum
 from typing import Final
 
 from pydantic import Field
@@ -113,8 +114,38 @@ DAY_FIRST_COUNTRIES: Final[frozenset[str]] = frozenset(
 )
 MONTH_FIRST_COUNTRIES: Final[frozenset[str]] = frozenset({"US"})
 
+
+class DateVerdict(StrEnum):
+    """How much interpretation the invoice date needed."""
+
+    UNAMBIGUOUS = "unambiguous"
+    """The page states one date and only one reading of it is possible."""
+
+    RESOLVED = "resolved"
+    """The page was ambiguous and something outside the page settled it."""
+
+    AMBIGUOUS = "ambiguous"
+    """Two readings are still live. Not a failure - an open question."""
+
+
+class DateResolutionReason(StrEnum):
+    """What settled an ambiguous date. Recorded so the trail shows which rule ran."""
+
+    LOCALE = "date_resolved_from_locale"
+    """The vendor's country was supplied to this tool."""
+
+    RECEIPT_WINDOW = "date_resolved_from_receipt_window"
+    """Only one candidate could have been received when the document was."""
+
+    VENDOR_LOCALE = "date_resolved_from_vendor_locale"
+    """The vendor master's country, known only once the vendor is resolved."""
+
+
+AGREED_AND_GROUNDED: Final = "agreed_and_grounded"
+"""The only reason that means nothing is wrong. Everything else blocks or qualifies."""
+
 AMBIGUOUS_DATE_REASON: Final = "ambiguous_date_unknown_locale"
-RESOLVED_DATE_REASON: Final = "date_resolved_from_locale"
+RESOLVED_DATE_REASON: Final = DateResolutionReason.LOCALE.value
 
 AMBIGUOUS_DATE_CEILING: Final = 0.4
 RESOLVED_DATE_CEILING: Final = 0.9
@@ -141,6 +172,9 @@ _NAME_NOISE = re.compile(r"[^a-z0-9 ]+")
 MAX_MONTH: Final = 12
 """Above this a component cannot be a month, which resolves the order for free."""
 
+MIN_LIVE_READINGS: Final = 2
+"""Fewer than this and there is nothing to be ambiguous between."""
+
 
 class FieldConfidence(StrictModel):
     """What is known about one extracted field."""
@@ -154,26 +188,66 @@ class FieldConfidence(StrictModel):
     reason: str = Field(max_length=200, description="Why the score is what it is.")
 
 
+class HumanReviewItem(StrictModel):
+    """One thing a person has to look at, and where to look.
+
+    A bare reason string is not enough to build a queue on. "not_in_text_layer"
+    tells a reviewer what went wrong but not which of seven fields to open the
+    document for, and a queue that cannot say that makes every item a full
+    re-read.
+    """
+
+    field: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class ExtractionConfidence(StrictModel):
     """Whether this extraction can proceed without a person looking at it."""
 
     fields: list[FieldConfidence] = Field(default_factory=list[FieldConfidence])
     auto_ok: bool = Field(
-        description="True only when every load-bearing field both agreed and was grounded."
+        description="True if and only if every load-bearing field both agreed and was grounded."
     )
-    needs_human: list[str] = Field(
-        default_factory=list[str],
-        description="Field names and blocking reasons, in the order found.",
+    needs_human: list[HumanReviewItem] = Field(
+        default_factory=list[HumanReviewItem],
+        description="Which field to look at and why, in the order found. Empty iff auto_ok.",
+    )
+
+    date_verdict: DateVerdict = Field(
+        default=DateVerdict.UNAMBIGUOUS,
+        description="How much interpretation the invoice date needed.",
     )
     resolved_invoice_date: date | None = Field(
         default=None,
-        description="The date after resolving an ambiguous rendering from the vendor's country. "
-        "May differ from the extracted date - that is the point.",
+        description="The effective date. None only when the verdict is ambiguous - the page "
+        "supports two readings and nothing here can choose between them.",
+    )
+    date_candidates: list[date] = Field(
+        default_factory=list[date],
+        max_length=2,
+        description="Both live readings, ascending. Empty unless the verdict is ambiguous. "
+        "Carried forward so a later state can settle it without re-reading the document.",
+    )
+    date_resolution_reason: DateResolutionReason | None = Field(
+        default=None, description="What settled it. None when nothing had to."
+    )
+    date_raw_text: str | None = Field(
+        default=None,
+        max_length=32,
+        description="The date exactly as the page renders it, e.g. '09/03/2024'. Empty unless "
+        "the verdict is ambiguous. Carried because the two candidates alone cannot say "
+        "which of them was the day-first reading - {2024-03-09, 2024-09-03} is the same "
+        "pair whether the page said 09/03 or 03/09 - so a later locale rule needs the "
+        "digits. Computed by code from the text layer, never asked of a model.",
     )
 
     def by_field(self) -> dict[str, FieldConfidence]:
         """Return the per-field entries keyed by field name."""
         return {entry.field: entry for entry in self.fields}
+
+    def blocking_fields(self) -> list[str]:
+        """The field names a person must look at, in the order found."""
+        return [item.field for item in self.needs_human]
 
 
 class ComputeExtractionConfidenceInput(ToolInput):
@@ -348,6 +422,26 @@ def _candidates(raw_text: str) -> list[RawDate]:
     return found
 
 
+def parse_raw_date(text: str) -> RawDate | None:
+    """Parse one date-shaped string, e.g. ``"09/03/2024"``. None if it is not one.
+
+    Public because a later state re-reads a carried-forward rendering to settle
+    it, and re-implementing this parser there is how two parsers drift apart.
+    """
+    found = _candidates(text)
+    return found[0] if found else None
+
+
+def country_reads_day_first(vendor_country: str | None) -> bool | None:
+    """True for day-first, False for month-first, None when the country is unknown.
+
+    Public for the same reason as :func:`parse_raw_date`: the locale table is one
+    table, and a second copy of it in the loop would answer differently the first
+    time either was edited.
+    """
+    return _country_reading(vendor_country)
+
+
 def _country_reading(vendor_country: str | None) -> bool | None:
     """Return True for day-first, False for month-first, None for unknown."""
     if not vendor_country:
@@ -387,7 +481,7 @@ def _reason(agreed: bool | None, grounded: bool, has_text: bool) -> str:
         return "not_in_text_layer" if has_text else "no_text_layer"
     if agreed is None:
         return "single_read"
-    return "agreed_and_grounded"
+    return AGREED_AND_GROUNDED
 
 
 def _field_values(extraction: InvoiceExtraction) -> dict[str, object]:
@@ -451,10 +545,95 @@ def _dates_agree(primary_value: object, secondary_value: object, raw_text: str) 
     return left is not None and right is not None and left.text == right.text
 
 
+class DateAssessment(StrictModel):
+    """What the invoice date is, and how much interpretation that took."""
+
+    verdict: DateVerdict
+    resolved: date | None = None
+    candidates: list[date] = Field(default_factory=list[date], max_length=2)
+    reason: DateResolutionReason | None = None
+    raw_text: str | None = Field(default=None, max_length=32)
+    """The rendering on the page, kept only while the date is still open."""
+
+    note: str = Field(default="", max_length=200)
+    """The per-field reason string, empty when the date needed no interpretation."""
+
+    @property
+    def ceiling(self) -> float:
+        """The most this field may score. A rule's answer is weaker than the page's."""
+        if self.verdict is DateVerdict.AMBIGUOUS:
+            return AMBIGUOUS_DATE_CEILING
+        if self.verdict is DateVerdict.RESOLVED:
+            return RESOLVED_DATE_CEILING
+        return 1.0
+
+
+def assess_date(
+    primary: InvoiceExtraction, raw_text: str, vendor_country: str | None
+) -> DateAssessment:
+    """Decide what the invoice date is, and say how sure that is.
+
+    An unambiguous rendering resolves to itself and says nothing. An ambiguous
+    one resolves from the vendor's country - and says so, because a date a rule
+    reinterpreted is not the same kind of fact as one the document stated
+    plainly, and six months later the trail should show which it was.
+
+    Where the country is unknown, the date does **not** resolve and both
+    readings are carried forward. That is deliberately not a failure: the state
+    that knows the vendor's country runs two states after this one, and failing
+    here would send every slash-dated invoice to a person for a question the
+    pipeline can answer itself a moment later. A consistent guess would be
+    worse than either - silently and reproducibly wrong.
+    """
+    raw = find_raw_date(raw_text, primary.invoice_date) if raw_text else None
+    if raw is None or not raw.is_ambiguous:
+        return DateAssessment(verdict=DateVerdict.UNAMBIGUOUS, resolved=primary.invoice_date)
+
+    readings = sorted(
+        {
+            reading
+            for reading in (raw.resolve(day_first=True), raw.resolve(day_first=False))
+            if reading is not None
+        }
+    )
+    if len(readings) < MIN_LIVE_READINGS:
+        # 05/05/2024 reads the same both ways, and 31/02/2024 reads only one.
+        # Either way there is nothing left to choose between.
+        return DateAssessment(
+            verdict=DateVerdict.UNAMBIGUOUS,
+            resolved=readings[0] if readings else primary.invoice_date,
+        )
+
+    day_first = _country_reading(vendor_country)
+    if day_first is None:
+        return DateAssessment(
+            verdict=DateVerdict.AMBIGUOUS,
+            candidates=readings,
+            raw_text=raw.text,
+            note=AMBIGUOUS_DATE_REASON,
+        )
+
+    resolved = raw.resolve(day_first=day_first)
+    if resolved is None:
+        return DateAssessment(verdict=DateVerdict.UNAMBIGUOUS, resolved=primary.invoice_date)
+    return DateAssessment(
+        verdict=DateVerdict.RESOLVED,
+        resolved=resolved,
+        reason=DateResolutionReason.LOCALE,
+        note=RESOLVED_DATE_REASON,
+    )
+
+
 def compute_extraction_confidence(
     payload: ComputeExtractionConfidenceInput,
 ) -> ComputeExtractionConfidenceOutput:
     """Score an extraction on agreement and grounding, and decide who sees it next.
+
+    ``auto_ok`` is true if and only if every load-bearing field both agreed and
+    was grounded. Nothing else can block it - not a blurry page, not an
+    ambiguous date. Those lower the score and are recorded, because they are
+    real observations, but neither is evidence that a value is *wrong*, and a
+    gate that stops on everything suspicious teaches reviewers to click through.
 
     Args:
         payload: The two readings, the document text, the vendor's country and
@@ -462,7 +641,7 @@ def compute_extraction_confidence(
 
     Returns:
         A per-field verdict, whether the invoice may proceed unattended, and
-        the invoice date after resolving an ambiguous rendering.
+        what is known about the invoice date.
     """
     primary = payload.primary
     secondary = payload.secondary
@@ -475,10 +654,10 @@ def compute_extraction_confidence(
     primary_values = _field_values(primary)
     secondary_values = _field_values(secondary) if secondary else {}
 
-    resolved_date, date_note, date_blocks = _resolve_date(primary, raw_text, payload.vendor_country)
+    date_assessment = assess_date(primary, raw_text, payload.vendor_country)
 
     entries: list[FieldConfidence] = []
-    needs_human: list[str] = []
+    needs_human: list[HumanReviewItem] = []
 
     for field in CHECKED_FIELDS:
         agreed, grounded = _assess(
@@ -491,9 +670,17 @@ def compute_extraction_confidence(
         reason = _reason(agreed, grounded, has_text)
         score = _SCORES[(agreed, grounded)]
 
-        if field == "invoice_date" and date_note:
-            reason = date_note
-            score = min(score, AMBIGUOUS_DATE_CEILING if date_blocks else RESOLVED_DATE_CEILING)
+        if field == "invoice_date" and date_assessment.note:
+            # The date note replaces a clean reason and *qualifies* a blocking
+            # one. A field flagged for single_read that then reads
+            # "date_resolved_from_locale" would send a reviewer looking for a
+            # date problem that is not the reason it was flagged.
+            reason = (
+                date_assessment.note
+                if reason == AGREED_AND_GROUNDED
+                else f"{reason}, {date_assessment.note}"
+            )
+            score = min(score, date_assessment.ceiling)
 
         if low_sharpness:
             score *= LOW_SHARPNESS_MULTIPLIER
@@ -505,59 +692,25 @@ def compute_extraction_confidence(
             )
         )
 
-        # A single read is one fact about the run, not seven facts about
-        # fields; it is reported once below rather than against every name.
-        blocked = agreed is False or not grounded
-        if field in LOAD_BEARING_FIELDS and blocked:
-            needs_human.append(field)
-
-    if not has_secondary:
-        needs_human.append("single_read")
-    if date_blocks:
-        needs_human.append(date_note)
-    if low_sharpness:
-        needs_human.append("low_sharpness")
-
-    auto_ok = not needs_human
+        if field in LOAD_BEARING_FIELDS and not (agreed and grounded):
+            needs_human.append(HumanReviewItem(field=field, reason=reason))
 
     return ComputeExtractionConfidenceOutput(
         confidence=ExtractionConfidence(
             fields=entries,
-            auto_ok=auto_ok,
+            auto_ok=not needs_human,
             needs_human=needs_human,
-            resolved_invoice_date=resolved_date,
+            date_verdict=date_assessment.verdict,
+            resolved_invoice_date=date_assessment.resolved,
+            date_candidates=date_assessment.candidates,
+            date_resolution_reason=date_assessment.reason,
+            date_raw_text=date_assessment.raw_text,
         )
     )
 
 
-def _resolve_date(
-    primary: InvoiceExtraction, raw_text: str, vendor_country: str | None
-) -> tuple[date | None, str, bool]:
-    """Return ``(resolved_date, note, blocks)`` for the invoice date.
-
-    An unambiguous rendering resolves to itself and says nothing. An ambiguous
-    one resolves from the vendor's country - and says so, because a date that a
-    locale rule reinterpreted is not the same kind of fact as one the document
-    stated plainly, and six months later the audit trail should show which it
-    was. Where the country is unknown it does not resolve at all: a consistent
-    guess about a date the document never specified is worse than an escalation,
-    because it is wrong silently.
-    """
-    raw = find_raw_date(raw_text, primary.invoice_date) if raw_text else None
-    if raw is None or not raw.is_ambiguous:
-        return primary.invoice_date, "", False
-
-    reading = _country_reading(vendor_country)
-    if reading is None:
-        return None, AMBIGUOUS_DATE_REASON, True
-
-    resolved = raw.resolve(day_first=reading)
-    if resolved is None:
-        return primary.invoice_date, "", False
-    return resolved, RESOLVED_DATE_REASON, False
-
-
 __all__ = [
+    "AGREED_AND_GROUNDED",
     "AMBIGUOUS_DATE_REASON",
     "CHECKED_FIELDS",
     "DAY_FIRST_COUNTRIES",
@@ -567,10 +720,17 @@ __all__ = [
     "RESOLVED_DATE_REASON",
     "ComputeExtractionConfidenceInput",
     "ComputeExtractionConfidenceOutput",
+    "DateAssessment",
+    "DateResolutionReason",
+    "DateVerdict",
     "ExtractionConfidence",
     "FieldConfidence",
+    "HumanReviewItem",
     "RawDate",
+    "assess_date",
     "compute_extraction_confidence",
+    "country_reads_day_first",
     "find_raw_date",
     "name_similarity",
+    "parse_raw_date",
 ]

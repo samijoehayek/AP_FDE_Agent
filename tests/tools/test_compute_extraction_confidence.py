@@ -20,6 +20,8 @@ from ap_agent.tools.compute_extraction_confidence import (
     MIN_SHARPNESS,
     RESOLVED_DATE_REASON,
     ComputeExtractionConfidenceInput,
+    DateResolutionReason,
+    DateVerdict,
     ExtractionConfidence,
     compute_extraction_confidence,
     find_raw_date,
@@ -121,19 +123,48 @@ def test_the_same_digits_resolve_the_other_way_for_a_us_vendor() -> None:
     assert check(vendor_country="US").resolved_invoice_date == date(2024, 9, 3)
 
 
-def test_an_unknown_locale_escalates_rather_than_guessing() -> None:
+def test_an_unknown_locale_leaves_the_date_open_rather_than_guessing() -> None:
     """A consistent guess would be worse than none: it would be silently wrong."""
     result = check(vendor_country=None)
+    assert result.date_verdict is DateVerdict.AMBIGUOUS
     assert result.resolved_invoice_date is None
-    assert result.auto_ok is False
-    assert AMBIGUOUS_DATE_REASON in result.needs_human
+    assert result.date_candidates == [date(2024, 3, 9), date(2024, 9, 3)]
+    assert result.by_field()["invoice_date"].reason == AMBIGUOUS_DATE_REASON
+
+
+def test_an_open_date_does_not_send_the_invoice_to_a_person() -> None:
+    """The state that knows the vendor's country runs two states later.
+
+    Failing here would route roughly two in five slash-dated invoices to a human
+    for a question the pipeline answers itself a moment afterwards.
+    """
+    result = check(vendor_country=None)
+    assert result.auto_ok is True
+    assert result.needs_human == []
+
+
+def test_an_open_date_still_carries_the_digits_that_made_it_open() -> None:
+    """Two candidate dates cannot say which of them was the day-first reading.
+
+    ``{2024-03-09, 2024-09-03}`` is the same pair whether the page said 09/03 or
+    03/09, so a later locale rule needs the rendering, not just the candidates.
+    """
+    assert check(vendor_country=None).date_raw_text == "09/03/2024"
+
+
+def test_a_settled_date_carries_no_candidates_and_no_digits() -> None:
+    assert check(vendor_country="IN").date_candidates == []
+    assert check(vendor_country="IN").date_raw_text is None
 
 
 def test_a_resolved_date_is_marked_as_interpreted_not_as_read() -> None:
     """The audit trail must show that a rule touched this field."""
-    entry = check(vendor_country="IN").by_field()["invoice_date"]
+    result = check(vendor_country="IN")
+    entry = result.by_field()["invoice_date"]
     assert entry.reason == RESOLVED_DATE_REASON
     assert entry.score < 1.0
+    assert result.date_verdict is DateVerdict.RESOLVED
+    assert result.date_resolution_reason is DateResolutionReason.LOCALE
 
 
 def test_resolving_a_date_does_not_by_itself_require_a_human() -> None:
@@ -201,7 +232,7 @@ def test_disagreement_blocks_and_scores_lowest_even_when_grounded() -> None:
     assert entry.reason == "readings_disagree"
     assert entry.score < 0.5
     assert result.auto_ok is False
-    assert "total" in result.needs_human
+    assert "total" in result.blocking_fields()
 
 
 def test_amounts_agree_across_separators_and_trailing_zeros() -> None:
@@ -235,6 +266,36 @@ def test_two_readings_of_an_ambiguous_date_agree_on_the_characters() -> None:
     """
     result = check(secondary=extraction(invoice_date=date(2024, 3, 9)))
     assert result.by_field()["invoice_date"].agreed is True
+
+
+def test_the_two_readings_disagreeing_on_order_is_not_a_disagreement() -> None:
+    """The case that would have poisoned the whole check.
+
+    The vision model reads 09/03/2024 month-first and the text model reads it
+    day-first. They read the *same digits*; the document is what is ambiguous.
+    Scoring that as a disagreement would flag every slash date and bury the
+    handful where the models genuinely saw different characters.
+    """
+    result = check(
+        primary=extraction(invoice_date=date(2024, 9, 3)),
+        secondary=extraction(invoice_date=date(2024, 3, 9)),
+        vendor_country=None,
+    )
+    entry = result.by_field()["invoice_date"]
+
+    assert entry.agreed is True
+    assert entry.grounded is True
+    assert result.date_verdict is DateVerdict.AMBIGUOUS
+    assert result.date_candidates == [date(2024, 3, 9), date(2024, 9, 3)]
+    assert result.auto_ok is True
+
+
+def test_a_date_that_reads_the_same_both_ways_is_not_ambiguous() -> None:
+    """05/05/2024. Both components are plausible months and it makes no difference."""
+    raw = RAW_51109305.replace("09/03/2024", "05/05/2024")
+    result = check(extraction(invoice_date=date(2024, 5, 5)), raw_text=raw, vendor_country=None)
+    assert result.date_verdict is DateVerdict.UNAMBIGUOUS
+    assert result.date_candidates == []
 
 
 def test_genuinely_different_dates_still_disagree() -> None:
@@ -276,7 +337,7 @@ def test_an_empty_text_layer_grounds_nothing_and_says_why() -> None:
     assert all(not entry.grounded for entry in result.fields)
     assert all(entry.reason.startswith("no_text_layer") for entry in result.fields)
     assert result.auto_ok is False
-    assert set(result.needs_human) == set(LOAD_BEARING_FIELDS)
+    assert set(result.blocking_fields()) == set(LOAD_BEARING_FIELDS)
 
 
 # --- one reading -------------------------------------------------------------
@@ -289,9 +350,23 @@ def test_a_single_reading_leaves_agreement_unknown() -> None:
 
 
 def test_a_single_reading_is_never_automatic() -> None:
+    """One reading is not agreement. An image has no text layer and gets one."""
     result = check(secondary=None)
     assert result.auto_ok is False
-    assert result.needs_human == ["single_read"]
+    assert result.blocking_fields() == list(LOAD_BEARING_FIELDS)
+
+
+def test_a_single_reading_names_the_field_and_the_reason() -> None:
+    """A review queue needs somewhere to send the reviewer, not just a verdict."""
+    result = check(secondary=None)
+    assert all(item.reason.startswith("single_read") for item in result.needs_human)
+    assert result.needs_human[0].field == "vendor_name"
+
+
+def test_a_date_note_qualifies_a_blocking_reason_instead_of_hiding_it() -> None:
+    """The reviewer must see why the field was flagged, not just what is odd about it."""
+    entry = check(secondary=None).by_field()["invoice_date"]
+    assert entry.reason == f"single_read, {RESOLVED_DATE_REASON}"
 
 
 def test_a_single_reading_still_scores_above_a_contradicted_one() -> None:
@@ -303,14 +378,23 @@ def test_a_single_reading_still_scores_above_a_contradicted_one() -> None:
 # --- sharpness ---------------------------------------------------------------
 
 
-def test_a_blurry_page_lowers_every_score_and_requires_a_human() -> None:
+def test_a_blurry_page_lowers_every_score_and_says_so() -> None:
     sharp = check()
     blurry = check(min_sharpness=MIN_SHARPNESS - 1)
-    assert blurry.auto_ok is False
-    assert "low_sharpness" in blurry.needs_human
     for before, after in zip(sharp.fields, blurry.fields, strict=True):
         assert after.score < before.score
         assert after.reason.endswith("low_sharpness")
+
+
+def test_a_blurry_page_does_not_by_itself_require_a_human() -> None:
+    """Sharpness is a proxy; agreement and grounding are the direct evidence.
+
+    If two models read a blurry page identically and the values are on the page,
+    the blur did not cost anything. It is recorded in the score, not used as a
+    veto - a gate that stops on everything suspicious teaches reviewers to click
+    through the ones that matter.
+    """
+    assert check(min_sharpness=MIN_SHARPNESS - 1).auto_ok is True
 
 
 def test_a_sharp_page_is_not_penalised() -> None:
@@ -337,7 +421,7 @@ def test_every_load_bearing_field_can_block_on_its_own(field: str) -> None:
     }[field]
     result = check(secondary=extraction(**{field: broken}))
     assert result.auto_ok is False
-    assert field in result.needs_human
+    assert field in result.blocking_fields()
 
 
 @pytest.mark.parametrize("field", ["subtotal", "tax_total"])
@@ -345,7 +429,7 @@ def test_a_supporting_field_is_reported_but_does_not_block(field: str) -> None:
     """A person can correct a subtotal. Paying the wrong vendor is not correctable."""
     result = check(secondary=extraction(**{field: Decimal("1.00")}))
     assert result.by_field()[field].agreed is False
-    assert field not in result.needs_human
+    assert field not in result.blocking_fields()
     assert result.auto_ok is True
 
 
