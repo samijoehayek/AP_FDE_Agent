@@ -8,6 +8,7 @@ nobody has to read the loop to find out how much of the pipeline is real.
 
 from __future__ import annotations
 
+from ap_agent.loop.runner import STUB_HOOKS, VENDOR_LOCALE_DATE_HOOK
 from ap_agent.states.machine import (
     STUB_TRANSITIONS,
     TRANSITIONS,
@@ -76,6 +77,30 @@ def test_no_stub_reaches_anywhere_the_real_table_cannot() -> None:
     }
     stub_pairs = {(src, dst) for (src, _event), dst in STUB_TRANSITIONS.items()}
     assert stub_pairs <= real_pairs, sorted((s.value, d.value) for s, d in stub_pairs - real_pairs)
+
+
+EXPECTED_STUB_HOOKS: set[str] = {VENDOR_LOCALE_DATE_HOOK}
+"""Behaviour a stub *step* performs, as opposed to an edge it travels.
+
+A stub is supposed to do nothing. Exactly one does something, because the tool
+that will own it does not exist and the alternative is worse - see
+``ap_agent.loop.runner.STUB_HOOKS``.
+"""
+
+
+def test_the_stub_hooks_are_exactly_these() -> None:
+    """A stub edge is scaffolding; a stub *hook* is scaffolding that acts.
+
+    Listed for the same reason as the edges: so that deleting it when the real
+    tool lands is a deliberate act with a failing test to confirm it, and so
+    nobody has to read the loop to find out what the scaffolding does.
+    """
+    assert STUB_HOOKS == EXPECTED_STUB_HOOKS
+
+
+def test_the_only_stub_hook_belongs_to_an_unwritten_tool() -> None:
+    """When lookup_vendor is real it owns the vendor's country, and this goes."""
+    assert VENDOR_LOCALE_DATE_HOOK.startswith("vendor_")
 
 
 def test_the_approval_gate_still_holds_with_stubs_present() -> None:
