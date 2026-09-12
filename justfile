@@ -95,6 +95,18 @@ confidence PATH *ARGS:
 seed *ARGS:
     uv run python scripts/seed_sandbox.py {{ARGS}}
 
+# Resolve a vendor name against the vendor master. No network, no tokens.
+vendor NAME *ARGS:
+    uv run ap-agent vendor "{{NAME}}" {{ARGS}}
+
+# Print what was received against a purchase order. Reads a local file only.
+receipts PO:
+    uv run ap-agent receipts {{PO}}
+
+# Fetch one purchase order from QuickBooks. LIVE CALL, no tokens.
+po PO:
+    uv run ap-agent po {{PO}}
+
 # Walk data/ and write data/index.csv.
 ingest *ARGS:
     uv run python scripts/index_invoices.py {{ARGS}}

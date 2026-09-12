@@ -49,7 +49,10 @@ from ap_agent.tools.extract_invoice_vision import (
     ExtractInvoiceVisionInput,
     extract_invoice_vision,
 )
+from ap_agent.tools.get_purchase_order import GetPurchaseOrderInput, get_purchase_order
+from ap_agent.tools.get_receipts import GetReceiptsInput, get_receipts
 from ap_agent.tools.ingest_document import IngestDocumentInput, ingest_document
+from ap_agent.tools.lookup_vendor import LookupVendorInput, lookup_vendor
 
 app = typer.Typer(
     name="ap-agent",
@@ -376,6 +379,78 @@ def states_check(
         raise typer.Exit(code=1) from exc
 
 
+@app.command()
+def vendor(
+    name: Annotated[str, typer.Argument(help="Vendor name as printed on the invoice.")],
+    tax_id: Annotated[
+        str | None, typer.Option("--tax-id", help="Tax identifier, if the document carried one.")
+    ] = None,
+) -> None:
+    """Resolve a vendor against config/sandbox_vendor_master.yaml.
+
+    Reads a committed file and calls nothing. Use it to see why a name did or
+    did not resolve before spending a model call on the whole loop.
+    """
+    try:
+        match = lookup_vendor(LookupVendorInput(vendor_name=name, vendor_tax_id=tax_id)).match
+    except APAgentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(match.model_dump_json(indent=2))
+    if not match.resolved:
+        typer.secho(
+            "\nno match: this invoice would route to NEW_VENDOR and wait for a person.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@app.command()
+def receipts(
+    po_number: Annotated[str, typer.Argument(help="Purchase-order number, e.g. AP-SEED-001.")],
+) -> None:
+    """Print what was received against a purchase order.
+
+    Reads ``data/generated/receipts.json`` and calls nothing. An unknown order
+    prints an empty line list, which is the honest answer: nothing arrived.
+    """
+    try:
+        found = get_receipts(GetReceiptsInput(po_number=po_number)).receipts
+    except APAgentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(found.model_dump_json(indent=2))
+    if found.is_empty:
+        typer.secho(
+            "\nnothing received: an invoice against this order is an exception however "
+            "clean its arithmetic.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@app.command()
+def po(
+    po_number: Annotated[str, typer.Argument(help="Purchase-order number, e.g. AP-SEED-001.")],
+) -> None:
+    """Fetch one purchase order from QuickBooks and print it.
+
+    **This makes a live call.** It is the only command here that does: `vendor`
+    reads a committed config file and `receipts` reads a local one. It needs
+    working QuickBooks credentials in .env and spends no tokens.
+    """
+    try:
+        found = get_purchase_order(GetPurchaseOrderInput(po_number=po_number)).purchase_order
+    except APAgentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    if found is None:
+        typer.secho(f"no purchase order {po_number} in QuickBooks", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    typer.echo(found.model_dump_json(indent=2))
+
+
 @app.command(name="run")
 def run_invoice(
     path: Annotated[Path, typer.Argument(help="Invoice document to process.")],
@@ -422,8 +497,28 @@ def run_invoice(
     typer.echo(f"audit trail : {writer.path_for(str(record.invoice_id))}")
     typer.echo(f"chain intact: {writer.verify(str(record.invoice_id))}")
     _print_run_date(final)
+    _print_staleness(final)
     if final.validation_flags:
         typer.secho(f"validation  : {', '.join(final.validation_flags)}", fg=typer.colors.YELLOW)
+
+
+def _print_staleness(final: InvoiceRecord) -> None:
+    """Say when the age check did not run, so a pass is not read as a check.
+
+    The staleness rule measures an invoice's age against the day it *arrived*,
+    and the loop never invents an arrival date - a receipt date it made up would
+    be evidence about itself. So with no ``--received-at`` the check is skipped
+    entirely, and a run that says nothing would look exactly like a run that
+    checked and was satisfied.
+    """
+    if final.received_at is None:
+        typer.secho(
+            "staleness   : SKIPPED - no --received-at, so the invoice's age was never "
+            "checked. Pass --received-at YYYY-MM-DD to run it.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    typer.echo(f"staleness   : checked against received_at={final.received_at.date().isoformat()}")
 
 
 def _print_run_date(final: InvoiceRecord) -> None:

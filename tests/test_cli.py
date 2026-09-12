@@ -72,10 +72,18 @@ def test_states_check_rejects_an_illegal_transition() -> None:
 def test_run_processes_an_invoice_and_reports_where_it_stopped(
     born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The extraction seat is replaced, so this never reaches the API."""
+    """The extraction seat is replaced, so this never reaches the API.
+
+    The vendor is a real one from the committed master, and the invoice cites no
+    purchase order - so the run resolves the vendor against a local file and
+    routes down the NON_PO path. Nothing here touches QuickBooks:
+    ``get_purchase_order`` is never reached, because an invoice with no PO
+    reference has nothing to fetch.
+    """
     extraction = InvoiceExtraction.model_validate(
         {
-            "vendor_name": "Acme",
+            "vendor_name": "TechVision Distributors Pvt Ltd",
+            "vendor_tax_id": "27AABCT1234F1Z5",
             "invoice_number": "INV-1",
             "invoice_date": date(2026, 1, 1),
             "currency": "USD",
@@ -107,7 +115,7 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     # A text layer that grounds every claimed value, because the confidence
     # check between the two seats is left real.
     page = (
-        "Acme\n"
+        "TechVision Distributors Pvt Ltd\n"
         "Invoice No: INV-1\n"
         "Date of issue: 2026-01-01\n"
         "Subtotal 100.00\n"
@@ -138,8 +146,10 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     )
     assert result.exit_code == 0, result.output
     assert "final state : CLOSED" in result.output
+    # Fourteen moves. Eighteen rows: the extraction step is one move and four
+    # rows, and resolving the vendor is one move and two.
     assert "steps       : 14" in result.output
-    assert "audit rows  : 17" in result.output
+    assert "audit rows  : 18" in result.output
     assert "chain intact: True" in result.output
 
 
