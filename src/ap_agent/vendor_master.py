@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 VENDOR_MASTER_PATH = REPO_ROOT / "config" / "sandbox_vendor_master.yaml"
 """The one definition of the sandbox vendors, committed and reviewable."""
 
-REQUIRED_FIELDS = ("display_name", "currency", "tax_id", "country", "address")
+REQUIRED_FIELDS = ("display_name", "erp_id", "currency", "tax_id", "country", "address")
 
 COUNTRY_CODE_LENGTH = 2
 """ISO-3166-1 alpha-2. The date-resolution rule reads nothing else."""
@@ -66,6 +66,15 @@ class MasterVendor:
     """
 
     display_name: str
+    erp_id: str
+    """The vendor's id in the ERP.
+
+    The key the purchase-order identity check compares. A PO names its vendor by
+    the ERP's id, and an invoice quoting another supplier's PO number has to be
+    caught by comparing ids - names are what the document is claiming, and the
+    claim is the thing under suspicion.
+    """
+
     currency: str
     tax_id: str
     country: str
@@ -100,6 +109,7 @@ def _require(record: dict[str, Any], index: int) -> MasterVendor:
 
     return MasterVendor(
         display_name=str(record["display_name"]),
+        erp_id=str(record["erp_id"]),
         currency=str(record["currency"]).strip().upper(),
         tax_id=str(record["tax_id"]),
         country=country,

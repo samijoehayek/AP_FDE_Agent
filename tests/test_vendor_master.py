@@ -31,6 +31,7 @@ ONE_VENDOR = """
 version: "v1"
 vendors:
   - display_name: "Kestrel Components Ltd"
+    erp_id: "60"
     currency: "usd"
     tax_id: "91-2274618"
     country: "us"
@@ -127,11 +128,14 @@ def test_broken_yaml_is_an_error(tmp_path: Path) -> None:
         load_vendor_master(_write(tmp_path, "vendors: [oops\n"))
 
 
-@pytest.mark.parametrize("field", ["display_name", "currency", "tax_id", "country", "address"])
+@pytest.mark.parametrize(
+    "field", ["display_name", "erp_id", "currency", "tax_id", "country", "address"]
+)
 def test_a_missing_field_names_the_vendor_and_the_field(tmp_path: Path, field: str) -> None:
     """The error has to say what to add and where, or it is just a stack trace."""
     record: dict[str, object] = {
         "display_name": "Kestrel Components Ltd",
+        "erp_id": "60",
         "currency": "USD",
         "tax_id": "91-2274618",
         "country": "US",
@@ -151,6 +155,7 @@ def test_an_address_that_is_not_a_list_is_refused(tmp_path: Path) -> None:
             "vendors": [
                 {
                     "display_name": "Kestrel Components Ltd",
+                    "erp_id": "60",
                     "currency": "USD",
                     "tax_id": "91-2274618",
                     "country": "US",

@@ -14,6 +14,14 @@
 # ARCHITECTURE.md means when it says the vendor master is the authority. The
 # manifest is joined to this file on `display_name`.
 #
+# `erp_id` is the vendor's QuickBooks Id, copied from the seed manifest after the
+# sandbox was seeded. It is here because it is the key the PO identity check
+# compares: a purchase order names a vendor by the ERP's id, and an invoice
+# quoting another supplier's PO number has to be caught by comparing ids rather
+# than names. A test asserts these still agree with the manifest whenever the
+# manifest is present, so a re-seed into a fresh company fails loudly instead of
+# silently matching the wrong supplier.
+#
 # `country` is load-bearing, not decoration. It is the input to the ambiguous-
 # date rule (`country_reads_day_first` in
 # `src/ap_agent/tools/compute_extraction_confidence.py`): 09/03/2024 on an
@@ -34,6 +42,7 @@ version: "v1"
 
 vendors:
   - display_name: "TechVision Distributors Pvt Ltd"
+    erp_id: "58"
     currency: "INR"
     tax_id: "27AABCT1234F1Z5"      # GSTIN state 27, Maharashtra
     country: "IN"
@@ -44,6 +53,7 @@ vendors:
       - "Maharashtra"
 
   - display_name: "Meridian Office Supplies"
+    erp_id: "59"
     currency: "USD"
     tax_id: "84-1938472"
     country: "US"
@@ -53,6 +63,7 @@ vendors:
       - "Denver, CO 80216"
 
   - display_name: "Kestrel Components Ltd"
+    erp_id: "60"
     currency: "USD"
     tax_id: "91-2274618"
     country: "US"
@@ -62,6 +73,7 @@ vendors:
       - "Tacoma, WA 98421"
 
   - display_name: "Sundar Electronics Trading"
+    erp_id: "61"
     currency: "INR"
     tax_id: "29AAGCS8842K1ZP"      # GSTIN state 29, Karnataka
     country: "IN"
@@ -72,6 +84,7 @@ vendors:
       - "Karnataka"
 
   - display_name: "Northwind Peripherals Inc"
+    erp_id: "62"
     currency: "USD"
     tax_id: "27-6653019"
     country: "US"
@@ -80,6 +93,7 @@ vendors:
       - "Saint Paul, MN 55114"
 
   - display_name: "Anand Cables and Connectors"
+    erp_id: "63"
     currency: "INR"
     tax_id: "07AACCA5521M1Z8"      # GSTIN state 07, Delhi
     country: "IN"
@@ -89,6 +103,7 @@ vendors:
       - "Delhi"
 
   - display_name: "Blue Harbour Furniture Co"
+    erp_id: "64"
     currency: "USD"
     tax_id: "45-8871223"
     country: "US"
@@ -97,6 +112,7 @@ vendors:
       - "Baltimore, MD 21230"
 
   - display_name: "Deccan Print and Paper"
+    erp_id: "65"
     currency: "INR"
     tax_id: "36AADCD7719L1ZQ"      # GSTIN state 36, Telangana
     country: "IN"
@@ -106,6 +122,7 @@ vendors:
       - "Telangana"
 
   - display_name: "Orion Networking Supplies"
+    erp_id: "66"
     currency: "USD"
     tax_id: "13-4429087"
     country: "US"
@@ -115,6 +132,7 @@ vendors:
       - "New York, NY 10018"
 
   - display_name: "Vasanth Industrial Tools"
+    erp_id: "67"
     currency: "INR"
     tax_id: "33AAHCV2298N1ZR"      # GSTIN state 33, Tamil Nadu
     country: "IN"
