@@ -138,6 +138,7 @@ stateDiagram-v2
     NON_PO --> CANCELLED: cancel
     NON_PO --> CODED: code
     NON_PO --> REJECTED: reject
+    NON_PO --> CODED: stub_ok
     ON_HOLD_DUPLICATE --> CANCELLED: cancel
     ON_HOLD_DUPLICATE --> REJECTED: confirm_duplicate
     ON_HOLD_DUPLICATE --> DUPLICATE_CHECKED: duplicate_cleared
@@ -159,7 +160,6 @@ stateDiagram-v2
     SCHEDULED --> PAID: stub_ok
     VALIDATED --> CANCELLED: cancel
     VALIDATED --> VENDOR_RESOLVED: resolve_vendor
-    VALIDATED --> VENDOR_RESOLVED: stub_ok
     VALIDATED --> NEW_VENDOR: vendor_not_found
     VENDOR_RESOLVED --> CANCELLED: cancel
     VENDOR_RESOLVED --> DUPLICATE_CHECKED: check_duplicates

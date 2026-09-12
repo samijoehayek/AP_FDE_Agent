@@ -16,7 +16,7 @@ _Last updated: 2026-09-11, Day 2 in progress. Update this file at the end of eve
 
 ## Stack (decided)
 
-Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Pydantic v2 (`extra="forbid"`, `Decimal` for money), pydantic-settings, structlog, typer, pymupdf, SQLAlchemy 2 + Alembic on Postgres (docker-compose), `anthropic` SDK with structured outputs (`output_config.format` = JSON schema from Pydantic; SDK `messages.parse()`), model **Claude Sonnet 5** (no sampling params — Sonnet 5 rejects temperature/top_p/top_k with a 400; determinism of _values_ comes from the Day 2 second reading + agreement check, not temperature). Day 4 candidates: Pydantic AI + DBOS, or LangGraph + Postgres checkpointer. Day 5: OpenTelemetry → self-hosted Langfuse; audit trail is a separate append-only Postgres table with a hash chain. Day 7: DeepEval + pytest on a golden set.
+Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Pydantic v2 (`extra="forbid"`, `Decimal` for money), pydantic-settings, structlog, typer, pymupdf, SQLAlchemy 2 + Alembic on Postgres (docker-compose), prompts versioned per seat (`extract_v2`, `extract_text_v2`, selected from settings; older versions stay on disk), `anthropic` SDK with structured outputs (`output_config.format` = JSON schema from Pydantic; SDK `messages.parse()`), model **Claude Sonnet 5** (no sampling params — Sonnet 5 rejects temperature/top_p/top_k with a 400; determinism of _values_ comes from the Day 2 second reading + agreement check, not temperature). Day 4 candidates: Pydantic AI + DBOS, or LangGraph + Postgres checkpointer. Day 5: OpenTelemetry → self-hosted Langfuse; audit trail is a separate append-only Postgres table with a hash chain. Day 7: DeepEval + pytest on a golden set.
 
 ## State of the repo
 
@@ -35,24 +35,144 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - `audit/writer.py` — JsonlAuditWriter to `data/audit/<invoice_id>.jsonl`, sha256 hash chain from a zero genesis hash, `verify()`.
 - **Audit rows are now one per thing that happened, not one per step.** `step_seq` counts rows, and only the last row of a step carries a `to_state` - so following `to_state` down the file still shows the state machine, while the rows between it account for what each call cost. The extraction step is 1 step and 4 rows. A clean run is 14 moves / 17 rows.
 - **Date resolution constants worth knowing before changing them:** `MAX_INVOICE_AGE_DAYS = 365` in `loop/dates.py` (a year, deliberately generous - a narrower window resolves more dates but *silently* eliminates a candidate that may be correct; six months was the first value and it got 09/03/2024 wrong). `MIN_SHARPNESS = 800` and the 0.9 name-similarity cut in the confidence tool are still uncalibrated guesses; they belong in the guardrails config on Day 3.
+- `tools/lookup_vendor.py` — real: two tiers (tax id, normalised name), ambiguity is `none` with candidates. `normalise_vendor_name` is its own pure function with its own tests. `bank_details_match_on_file` is `None` because the master holds no remittance details — a comparison that did not happen, which is a different answer from one that failed. 29 tests.
+- `tools/get_purchase_order.py` — real: `client.query` on `PurchaseOrder` by `DocNumber`, explicit field mapping, subtotal/discount rows discarded, amounts as `Decimal`. 15 tests against a captured-shape response at `tests/tools/qbo_purchase_order_response.json`.
+- `tools/get_receipts.py` — real: reads `receipts_path` from settings, flattens every receipt document for one order into per-line quantities. 13 tests.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
 - `scripts/generate_invoices.py` — real: 60 labelled invoice PDFs from the seeded POs, six variants each, into `data/generated/invoices/`. `Canvas(invariant=1)` and no clock anywhere, so two runs are byte-identical - a hash that moves means the generator changed, not that a document arrived. Truth files are `GeneratedInvoiceTruth` (`contracts/generated.py`), and a test asserts `InvoiceExtraction(**truth.expected.model_dump())` passes the arithmetic validator with no flags. 43 tests, all against real rendered files in `tmp_path`.
 - `src/ap_agent/vendor_master.py` + `config/sandbox_vendor_master.yaml` — the vendors, in one file, read by both `seed_sandbox.py` and `generate_invoices.py`. Carries the country and the postal address, which the seed manifest does not because QuickBooks is never told them. Fails loudly on a missing vendor or a missing field. 21 tests.
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
-- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [--country XX] [--received-at YYYY-MM-DD] [--from-extraction <json>] [--out <json>]`, `just ingest`, `just seed [--dry-run]`, `just generate [--only <po>] [--variants a,b,c] [--layout a] [--dry-run] [--out-dir <path>]`.
+- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [...]`, `just ingest`, `just seed [--dry-run]`, `just generate [--only <po>] [--variants a,b,c] [--dry-run]`, `just vendor "<name>" [--tax-id X]`, `just receipts <po>`, `just po <po>`.
+  - `just vendor` and `just receipts` read committed/local files and call nothing. **`just po` is the only one that makes a live QuickBooks call**, and it spends no tokens.
   - `--from-extraction` replays saved readings and makes **no** model calls — use it whenever the question is about the check rather than the models. `--out` writes the readings alongside the verdict so any run is replayable.
   - `run` reports `steps` (state moves) and `audit rows` separately: the extraction step is one step and four rows.
 - Docs: README, ARCHITECTURE.md (state + trust-boundary diagrams), DECISIONS.md, CLAUDE.md.
 
-**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text` and `compute_extraction_confidence`; guardrail config loader; evals fixtures. `scripts/generate_invoices.py` is now real. Stub edges MATCHED→CODED etc. exist only so the loop reaches CLOSED.
+**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`, `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order` and `get_receipts`; guardrail config loader; evals fixtures. `scripts/generate_invoices.py` is real.
 
-**Stub _hook_ (new, and different from a stub edge):** `VENDOR_LOCALE_DATE_HOOK` in `loop/runner.py`. A stub step is supposed to do nothing; this one settles an open invoice date from `record.vendor_country` when the state is `VENDOR_RESOLVED`, because `lookup_vendor` does not exist and an open date would otherwise pass the only state that can close it. Listed in `STUB_HOOKS` and asserted in `tests/states/test_stub_transitions.py`. **Delete it the moment `lookup_vendor` is real** — it should be that tool's job to put the country on the record.
+**Stub edges remaining (10, down from 11):** `VENDOR_RESOLVED→DUPLICATE_CHECKED` (find_duplicates), `DUPLICATE_CHECKED→MATCHED` (compute_match), `MATCHED→CODED`, `CODED→PENDING_APPROVAL`, **`PENDING_APPROVAL→APPROVED` (the dangerous one — delete it the moment `request_approval` exists)**, `APPROVED→POSTED`, `POSTED→SCHEDULED`, `SCHEDULED→PAID`, `PAID→RECONCILED`, `RECONCILED→CLOSED`. `STUB_HOOKS` is now empty: no stub step does anything.
 
-**Known gap:** nothing sets `record.vendor_country` today, so an invoice whose date the receipt window cannot settle reaches CLOSED with the date still open. That is what the missing `lookup_vendor` costs, and there is a test asserting it rather than leaving it to be discovered.
+**Stub hooks: none.** `STUB_HOOKS` is an empty frozenset and a test asserts it. It held the vendor-locale date resolution for exactly as long as `lookup_vendor` was a stub; the tool owns the country now, so the hook is gone and the date is settled in the resolve-vendor step.
+
+**The vendor-country gap is closed.** `lookup_vendor` puts the country on the record at `VALIDATED`, so an ambiguous date the receipt window cannot settle is closed one state later from the master's country. Asserted end to end in `tests/loop/test_vendor_routing.py`.
+
+### Live check run 2026-09-12 — six defects, all now fixed
+
+Full write-up of the run in `docs/EXTRACTION_LOG.md` (that section is left as
+it was written; the re-test results go under it). Two defects were in the
+extraction contract and four in the audit trail. **All six are fixed and the
+re-test below is what confirms it.**
+
+1. **Money with thousands separators fails validation.** `claude-haiku-4-5`
+   returned `'272,100.00'` for `subtotal` and the `Decimal` parser rejected it -
+   eight errors, extraction lost. This is not a fixture problem: the Kaggle PDFs
+   print `74,120.00` too, and they have been passing only because both models
+   happened to strip the commas on those documents. **Whether an invoice
+   extracts currently depends on a formatting decision neither model is required
+   to make.** Fix belongs on the `Money`/`UnitPrice`/`Quantity` annotations in
+   `contracts/common.py` as a `mode="before"` strip, reusing the `_THOUSANDS`
+   normalisation that already exists in `compute_extraction_confidence`.
+2. **`LineItem.unit` rejected an empty string.** Generated invoices print no
+   unit-of-measure column (the manifest has no UoM), so the model returned `""`
+   and the whole extraction was lost over a field nothing compares. Real invoice
+   lines often carry no unit either.
+
+3. **The trail recorded two rows for a step that made two model calls.** The
+   vision read had completed and been billed and left no trace, and the error
+   was attributed to `compute_extraction_confidence`, a tool that had not run.
+4. **`output_ref` carried labels**, not content addresses: `invoice:51109301`,
+   `date:2024-03-09`, `fields:7`.
+5. **No row carried `cost_usd`**, so a run's spend was unanswerable from its own
+   trail.
+6. **`VALIDATE@v1` printed `date=2023-07-03, date_open`** - naming one of two
+   readings while the question was open.
+
+**What changed**
+
+- Numbers: one normaliser in `contracts/common.py`, used by the money types and
+  by the grounding check. Ambiguous renderings **refuse** (`1,234`, `12.345.678`)
+  rather than guess. Prompts bumped to `extract_v2` / `extract_text_v2`, both
+  selected from settings; the `v1` files stay on disk.
+- `LineItem.unit` accepts `""`. The model-facing schema is unchanged - still a
+  plain string, still 19 top-level properties.
+- Every tool writes its own audit row as it returns, success or failure, through
+  `StepTrail`. A failure names the tool that failed.
+- `output_ref` is `sha256:<hex>` everywhere; readable notes moved to
+  `tool_result_summary`.
+- `config/model_pricing.yaml` + `src/ap_agent/pricing.py`. Model rows carry
+  `cost_usd` and record the pricing version. **The two prices are unverified -
+  see the warning in that file.**
+- `halt_no_tool` / `event_type=halt` for a stop because a tool is unwritten; a
+  transition the table refuses for any other reason stays an error.
+- Staleness (`invoice_date_too_old`) checked against `received_at`, failing only
+  if every candidate fails.
+- Receipts join on `line_no`. `scripts/migrate_receipts.py` has been run against
+  `data/generated/receipts.json`; the seeder writes them from now on.
+- `# TEMP STUB` edge `NON_PO → CODED`, so the Kaggle corpus can move past NON_PO.
+
+### Re-test: DONE, 2026-09-12
+
+Both runs reached `CLOSED` with a verifying chain. Full write-up in
+`docs/EXTRACTION_LOG.md`; row-by-row trails and the raw purchase order in
+`data/retest/2026-09-12/` (git-ignored).
+
+| Run | State | Steps | Rows | Cost |
+| --- | --- | --- | --- | --- |
+| `generated/AP-SEED-001/clean` | `CLOSED` | 14 | 20 | $0.0290 |
+| `kaggle/invoice_51109301` | `CLOSED` | 14 | 19 | $0.0364 |
+
+**`just po AP-SEED-001` has now been run.** `vendor_erp_id` is `"58"`, the PO's
+line 1 and 2 join to `receipts.json` by `line_no`, and the mapping needed no
+changes. `tests/tools/qbo_purchase_order_response.json` is a verbatim capture,
+not a reconstruction.
+
+Two things the re-test itself found:
+
+* **A property leaving `required` is enough to fail the structured-output
+  complexity check**, even when the schema is smaller by every local measure.
+  `LineItem.unit` now keeps its place in `required` through
+  `__get_pydantic_json_schema__`. Nothing measurable on this side predicts this
+  limit - **probe the API after any change to the extraction schema.**
+* **The receipt window did not settle the Kaggle date** as the brief predicted.
+  Both readings sit inside the 365-day window, so the rule declined - as
+  designed - and the vendor's country settled it. See the log for the arrival
+  dates that would make the window decide.
+
+### Open question: is GL coding a third model seat?
+
+The architecture report defines GL coding as a model call. This repository has
+claimed **two** LLM seats throughout - document extraction and exception
+explanation - and that claim is in `CLAUDE.md`, `README.md` and
+`ARCHITECTURE.md`. A third seat would change a load-bearing statement about the
+system's shape.
+
+The alternative is a code lookup against vendor history: the account this vendor
+was coded to last time, with a confidence based on how consistent that history
+is, and anything unclear going to a person. That is deterministic, replayable,
+and needs no seat at all.
+
+**Decide before `propose_gl_coding` is written**, and if it becomes a seat,
+update the two-seat claim everywhere it appears rather than leaving three
+documents saying something that is no longer true. It is stated in
+`CLAUDE.md:10`, `README.md:11`, and the trust-boundary diagram in
+`docs/ARCHITECTURE.md`.
+
+### Two things the step-4 brief assumed that the data does not support
+
+Both were found by reading the files rather than by a test failing later.
+
+1. **Kaggle invoice 51109301's vendor IS in the vendor master, so it does not reach `NEW_VENDOR`.** Every invoice in the Kaggle corpus carries `TechVision Distributors Pvt Ltd` / GSTIN `27AABCT1234F1Z5`, which is the *first record* in `config/sandbox_vendor_master.yaml` - the sandbox was seeded with names taken from that corpus. So 51109301 resolves on the tax-id tier and routes to **`NON_PO`** instead, because the Kaggle documents carry no purchase-order reference at all. `tests/loop/test_vendor_routing.py` asserts what actually happens, and a separate synthetic vendor covers the `NEW_VENDOR` path.
+
+2. **A non-PO invoice now stops at `NON_PO` rather than reaching `CLOSED`.** `propose_gl_coding` is a stub and there is no `NON_PO→CODED` stub edge, and the brief said not to add edges. This is a behaviour change for any Kaggle invoice: the run stops where the missing tool is, which is the honest place for it. Add the stub edge if you want the old end-to-end sweep back.
+
+### One fix outside the brief's scope
+
+`compute_extraction_confidence` could not ground a date printed with a spelled-out month (`30 Jul 2026`), because it was built against a corpus that only prints slash dates. Every clean generated invoice was therefore escalated to a human for a date plainly on the page - a named month is the *unambiguous* rendering, so the check was escalating the documents it should have trusted most. Fixed with two patterns and a `month_named` flag on `RawDate`; slash dates are still ambiguous, asserted. Without it the live `just run` on a generated invoice would have stopped at `NEEDS_HUMAN_EXTRACTION` and told you nothing about step 4.
 
 **Vocabulary and config gaps found while labelling the fixture** (nothing was added to `ReasonCode` — the enum is unchanged):
 
+- **No `ReasonCode` is emitted by step 4 at all.** The three reads gather facts; the two refusals at `DUPLICATE_CHECKED` (PO not found, PO belongs to another vendor) route on the `match_exception` event and record their reason in `decision_basis`, because assigning a code is the matcher's job and `PO_NOT_FOUND` already exists for the first. The second has no obvious member: it is an identity failure, not a match variance, and `VENDOR_TAX_ID_MISMATCH` is about the vendor's own id rather than a PO belonging to someone else. **Worth a new member when `compute_match` is written** - something like `po_vendor_mismatch`. Not added here, per the brief.
 - **The `$50` unmatched-charge rule does not exist in `config/guardrails.v1.yaml`.** There is no threshold for an incidental charge at all. The `freight_small` / `freight_large` pair is built and labelled against it, so the fixture is already asserting a rule Day 3 has to write. This is the one place the fixture is ahead of the config.
 - **No `ReasonCode` for an unmatched incidental charge.** `LINE_NOT_ON_PO` is used for the freight line and fits, but it reads as "a line that should have been on the purchase order" rather than "carriage nobody ordered". Worth a member of its own if the distinction routes to different people.
 - **No `ReasonCode` for hidden or invisible text specifically.** `SUSPICIOUS_DOCUMENT_CONTENT` covers the `hidden_text` variant and is the right level of generality for now.
@@ -104,7 +224,12 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 3. **DONE.** `scripts/generate_invoices.py`: reportlab invoices from `seed_manifest.json` + `receipts.json`, six variants per PO (clean, price +3%, qty over received, freight $25, freight $120, hidden white-text "update bank account"), each with a `truth.json` validated as `GeneratedInvoiceTruth`. 60 invoices, 121 files, byte-identical on every run. `just generate [--only PO] [--variants a,b] [--dry-run]`, then `just ingest`.
    - The clean invoice bills the **received** quantity, so a partially received PO is billed for the part that arrived. The PO that received nothing is billed in full and is still an EXCEPTION - a correct invoice for goods that have not arrived is the only document in the fixture that is internally perfect and must still be held.
    - **`config/sandbox_vendor_master.yaml` is new and now defines the vendors.** The seed manifest carries no country and no postal address because QuickBooks is never told either, so both scripts read the master and join to the manifest on `display_name`. `seed_sandbox.py` builds `VENDORS` from it; the loader is `src/ap_agent/vendor_master.py`. Countries were read off the tax identifiers already in the fixture (15-char GSTIN → IN, `NN-NNNNNNN` EIN → US), not chosen. **Adding a vendor means adding it there, and the order of the file numbers the POs.**
-4. **PARTLY DONE.** The two readings + confidence are wired into the loop on the INGESTED→EXTRACTED→VALIDATED path, routing to `NEEDS_HUMAN_EXTRACTION` when not `auto_ok`. No stub edges were removed — that path never had any; `INGESTED→EXTRACTED` and `EXTRACTED→VALIDATED` were always real edges. **Still to do:** `get_purchase_order` (QBO via client) and `get_receipts` (from `receipts.json`).
+4. **DONE except `compute_match`.** Re-tested live on 2026-09-12; both runs reach `CLOSED`. The two readings + confidence are wired on INGESTED→EXTRACTED→VALIDATED, and the three reads that feed the match are now real and wired too:
+   - **`lookup_vendor`** — the vendor master YAML. Tax id exact, then normalised name exact, then none. An ambiguous name is `none` with the candidates listed, not a ranking. Runs at `VALIDATED`; `none` routes to `NEW_VENDOR` and the run halts there, because no stub edge leaves that state.
+   - **`get_purchase_order`** — QuickBooks via the existing client, filtered by `DocNumber`. Explicit mapping, everything else dropped. Not found is `None`; a client error raises.
+   - **`get_receipts`** — `data/generated/receipts.json`, path from settings. Unknown PO is an **empty `ReceiptSet`**, never `None`.
+   - **`VALIDATED→VENDOR_RESOLVED` stub edge is gone**, and `STUB_HOOKS` is empty: the vendor-locale date rule moved from the stub step into the resolve-vendor step, which is where it belonged.
+   - At `DUPLICATE_CHECKED`: no PO reference → `NON_PO` (real); PO missing or belonging to another vendor → `EXCEPTION`; otherwise both snapshots land on the record and the invoice advances to `MATCHED` through the remaining stub edge. **`compute_match` and `find_duplicates` are still stubs — the owner writes those.**
    - Change of design from the original plan: an ambiguous slash date does **not** fail extraction. Both readings stay on the record and are settled later — by the receipt window at `VALIDATED`, then by the vendor's country at `VENDOR_RESOLVED`. Rationale in DECISIONS.md, 2026-09-10.
 5. `verify_vendor_external` web check for NEW_VENDOR (domain age, registry hit, lookalike distance) — the scoped "model decides when to call" tool.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
