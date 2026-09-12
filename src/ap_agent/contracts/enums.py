@@ -145,3 +145,12 @@ class AuditEventType(StrEnum):
     ERROR = "error"
     RETRY = "retry"
     NOTE = "note"
+
+    HALT = "halt"
+    """The run stopped because the next step's tool does not exist yet.
+
+    Distinct from ERROR on purpose. An invoice parked at NON_PO because GL coding
+    is unwritten is the pipeline behaving exactly as designed, and recording it
+    as an error trains a reader to skim past errors. A transition the table
+    refuses for any *other* reason stays an ERROR, because that one is a bug.
+    """

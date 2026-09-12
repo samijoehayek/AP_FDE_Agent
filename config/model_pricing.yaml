@@ -1,0 +1,37 @@
+# Token prices, in USD per million tokens.
+#
+# Versioned, and loaded rather than compiled in, for the same reason the
+# guardrails are: prices change on someone else's schedule, and an audit row
+# claiming a cost has to stay explainable after they do. Every model row records
+# the `version` below in its tool_result_summary, so "why does this invoice say
+# $0.027" is answerable a year later by reading the pricing file that was in
+# force - which is why a price change means a new `version` string here, and
+# never a quiet edit to a number.
+#
+# A model id that is not listed produces `cost_usd = null` and a logged warning.
+# Not a crash: an unpriced model is a gap in this file, and losing the whole
+# audit row over it would destroy the record of a call that really happened.
+#
+# Verified against platform.claude.com/docs/en/about-claude/pricing on
+# 2026-09-12. The first draft of this file said Sonnet was $3/$15, which was the
+# September increase Anthropic then cancelled - a figure recalled from an
+# announcement rather than read off the page, and wrong by 50%.
+
+version: "2026-09-12-verified"
+
+models:
+  claude-sonnet-5:
+    input_per_million: "2.00"
+    output_per_million: "10.00"
+
+  claude-haiku-4-5-20251001:
+    input_per_million: "1.00"
+    output_per_million: "5.00"
+
+  # The same model under the alias the settings default uses. Listed explicitly
+  # rather than resolved by prefix: a lookup that guessed which concrete model an
+  # alias meant would attach a cost to the wrong one the first time an alias
+  # moved, and an alias moving is the entire point of having one.
+  claude-haiku-4-5:
+    input_per_million: "1.00"
+    output_per_million: "5.00"

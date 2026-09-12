@@ -31,6 +31,8 @@ from ulid import ULID
 from ap_agent.contracts.common import StrictModel
 from ap_agent.contracts.enums import AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction
+from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
+from ap_agent.contracts.vendor import VendorMatch
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.compute_extraction_confidence import (
     DateResolutionReason,
@@ -70,6 +72,15 @@ class ActionKind(StrEnum):
 
     VALIDATE = "validate"
     """An in-process arithmetic and sanity check. Not a tool: it calls nothing."""
+
+    MATCH_PREP = "match_prep"
+    """Gathering what the matcher will need: the purchase order and its receipts.
+
+    Not a tool. It is the rule that decides *whether* to gather them at all - an
+    invoice with no PO reference is routed to NON_PO without a single call - and
+    then weighs what came back. Attributing that decision to ``get_purchase_order``
+    would name one of its inputs as the decider.
+    """
 
     STUB = "stub"
     """A step whose tool does not exist yet. Advances the state and records that."""
@@ -111,9 +122,28 @@ class ToolCallRecord(StrictModel):
     rule_id: str | None = Field(default=None, max_length=64)
     event_type: AuditEventType = AuditEventType.TOOL_CALL
     summary: str = Field(min_length=1, max_length=64, description="What happened, in one token.")
-    output_ref: str | None = Field(default=None, max_length=512)
+    output_ref: str | None = Field(
+        default=None,
+        max_length=512,
+        description="`sha256:<hex>` of what the call returned. A content address, not a "
+        "label: the trail points at payloads rather than inlining them, and a hash "
+        "lets a snapshot stored elsewhere be proved to be the one acted on.",
+    )
+    result_summary: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="The human-readable half, which used to be smuggled into output_ref. "
+        "`date=2024-03-09`, `pricing=2026-09-12`, `lines=2`.",
+    )
     basis: str | None = Field(
         default=None, max_length=1000, description="Why, for this call's own audit row."
+    )
+    error: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Set when this call raised. The row is still written, attributed to the "
+        "tool that failed - a step that called three things and died on the second "
+        "must not lose the first one's row, nor blame the step for the second.",
     )
 
     model_id: str | None = Field(default=None, max_length=128)
@@ -121,6 +151,12 @@ class ToolCallRecord(StrictModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int | None = Field(default=None, ge=0)
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        description="Attempts before this answer. Surfaced on the row so a retried call is "
+        "visible as one.",
+    )
 
 
 class StepResult(StrictModel):
@@ -137,6 +173,19 @@ class StepResult(StrictModel):
         description="Pointer to the full output. Payloads are not inlined into the trail.",
     )
     error: str | None = Field(default=None, max_length=2000)
+    error_class: str | None = Field(
+        default=None,
+        max_length=128,
+        description="The exception type, named rather than inferred. The audit row used to "
+        "record `type(APAgentError).__name__` - the metaclass of the base class - "
+        "for every failure, which named nothing that had happened.",
+    )
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        description="Attempts the client made before this answer. A call that took three "
+        "tries cost three tries, and a trail that hides that understates spend.",
+    )
 
     model_id: str | None = Field(default=None, max_length=128)
     prompt_version: str | None = Field(default=None, max_length=32)
@@ -155,6 +204,12 @@ class StepResult(StrictModel):
         max_length=1000,
         description="Why the step decided what it did, for the audit row. When a step has "
         "something better to say than a list of flags, it says it here.",
+    )
+    result_summary: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="A human-readable note for the row, kept out of output_ref so that "
+        "output_ref can stay a content address.",
     )
 
 
@@ -204,6 +259,35 @@ class InvoiceRecord(StrictModel):
         max_length=2,
         description="ISO-3166-1 alpha-2, from the vendor master - never read off the document. "
         "Unset until the vendor is resolved.",
+    )
+    vendor_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The resolved vendor's id in the ERP. The key the purchase-order identity "
+        "check compares - never the name the document printed.",
+    )
+    vendor_currency: str | None = Field(
+        default=None,
+        max_length=3,
+        description="The master's currency for this vendor, to be compared with the "
+        "document's rather than trusted from it.",
+    )
+    vendor_match: VendorMatch | None = Field(
+        default=None,
+        description="How the vendor was resolved, or why it was not. Carries the candidates "
+        "when the lookup refused to choose between them.",
+    )
+
+    purchase_order: PurchaseOrder | None = Field(
+        default=None,
+        description="The order this invoice cites, as the ERP holds it. None before the "
+        "duplicate check, and on an invoice that cites none.",
+    )
+    receipts: ReceiptSet | None = Field(
+        default=None,
+        description="What arrived against that order. None means the question was never "
+        "asked; an empty ReceiptSet means it was asked and nothing had arrived, "
+        "which is the answer that holds an invoice.",
     )
 
     @property

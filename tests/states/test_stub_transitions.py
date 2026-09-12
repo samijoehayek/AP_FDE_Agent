@@ -8,7 +8,7 @@ nobody has to read the loop to find out how much of the pipeline is real.
 
 from __future__ import annotations
 
-from ap_agent.loop.runner import STUB_HOOKS, VENDOR_LOCALE_DATE_HOOK
+from ap_agent.loop.runner import STUB_HOOKS
 from ap_agent.states.machine import (
     STUB_TRANSITIONS,
     TRANSITIONS,
@@ -18,9 +18,13 @@ from ap_agent.states.machine import (
 )
 
 EXPECTED_STUB_EDGES: set[tuple[str, str]] = {
-    ("VALIDATED", "VENDOR_RESOLVED"),
+    # VALIDATED -> VENDOR_RESOLVED is gone: lookup_vendor is real, and the
+    # invoice now travels that edge on resolve_vendor or not at all.
     ("VENDOR_RESOLVED", "DUPLICATE_CHECKED"),
     ("DUPLICATE_CHECKED", "MATCHED"),
+    # GL coding is unwritten, and without this edge the entire Kaggle corpus -
+    # which cites no purchase orders - stops dead at NON_PO.
+    ("NON_PO", "CODED"),
     ("MATCHED", "CODED"),
     ("CODED", "PENDING_APPROVAL"),
     ("PENDING_APPROVAL", "APPROVED"),
@@ -41,6 +45,17 @@ def test_the_stub_edges_are_exactly_these() -> None:
 def test_every_stub_edge_uses_the_stub_event() -> None:
     """A stub must be identifiable in the trail, not disguised as a real event."""
     assert all(event == InvoiceEvent.STUB_OK.value for (_src, event) in STUB_TRANSITIONS)
+
+
+def test_vendor_resolution_is_no_longer_scaffolding() -> None:
+    """lookup_vendor is real, so an invoice may not reach VENDOR_RESOLVED on a stub.
+
+    The edge it used to travel is gone. What replaces it is a real decision with
+    two outcomes, and one of them - NEW_VENDOR - is a state no stub can leave.
+    """
+    assert (InvoiceState.VALIDATED, InvoiceEvent.STUB_OK.value) not in STUB_TRANSITIONS
+    assert (InvoiceState.VALIDATED, InvoiceEvent.RESOLVE_VENDOR.value) in TRANSITIONS
+    assert (InvoiceState.VALIDATED, InvoiceEvent.VENDOR_NOT_FOUND.value) in TRANSITIONS
 
 
 def test_no_stub_walks_past_a_state_that_needs_a_human() -> None:
@@ -79,28 +94,32 @@ def test_no_stub_reaches_anywhere_the_real_table_cannot() -> None:
     assert stub_pairs <= real_pairs, sorted((s.value, d.value) for s, d in stub_pairs - real_pairs)
 
 
-EXPECTED_STUB_HOOKS: set[str] = {VENDOR_LOCALE_DATE_HOOK}
+EXPECTED_STUB_HOOKS: set[str] = set()
 """Behaviour a stub *step* performs, as opposed to an edge it travels.
 
-A stub is supposed to do nothing. Exactly one does something, because the tool
-that will own it does not exist and the alternative is worse - see
-``ap_agent.loop.runner.STUB_HOOKS``.
+Empty, and that is the point. A stub is supposed to do nothing, and this set
+exists so a stub that starts doing something has to be written down.
+
+It held one entry - the vendor-locale date resolution - for exactly as long as
+``lookup_vendor`` was a stub. The country is now put on the record by the tool
+that owns it, which is where it always belonged, and this went back to empty as
+the comment said it should.
 """
 
 
 def test_the_stub_hooks_are_exactly_these() -> None:
     """A stub edge is scaffolding; a stub *hook* is scaffolding that acts.
 
-    Listed for the same reason as the edges: so that deleting it when the real
-    tool lands is a deliberate act with a failing test to confirm it, and so
-    nobody has to read the loop to find out what the scaffolding does.
+    Listed for the same reason as the edges: so that adding one is a deliberate
+    act with a failing test to confirm it, and so nobody has to read the loop to
+    find out what the scaffolding does.
     """
     assert STUB_HOOKS == EXPECTED_STUB_HOOKS
 
 
-def test_the_only_stub_hook_belongs_to_an_unwritten_tool() -> None:
-    """When lookup_vendor is real it owns the vendor's country, and this goes."""
-    assert VENDOR_LOCALE_DATE_HOOK.startswith("vendor_")
+def test_no_stub_step_does_anything_at_all() -> None:
+    """The state the scaffolding should always be in, stated directly."""
+    assert not STUB_HOOKS
 
 
 def test_the_approval_gate_still_holds_with_stubs_present() -> None:

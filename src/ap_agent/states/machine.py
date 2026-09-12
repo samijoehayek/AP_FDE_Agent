@@ -176,12 +176,15 @@ TRANSITIONS.update({(state, _E.CANCEL): _S.CANCELLED for state in _CANCELLABLE})
 
 
 STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
-    # TEMP STUB: vendor resolution is not implemented (lookup_vendor is a stub).
-    (_S.VALIDATED, _E.STUB_OK): _S.VENDOR_RESOLVED,
     # TEMP STUB: duplicate detection is not implemented (find_duplicates).
     (_S.VENDOR_RESOLVED, _E.STUB_OK): _S.DUPLICATE_CHECKED,
     # TEMP STUB: three-way matching is not implemented (compute_match).
     (_S.DUPLICATE_CHECKED, _E.STUB_OK): _S.MATCHED,
+    # TEMP STUB: GL coding is not implemented, and a non-PO invoice needs it
+    # before anything else can happen to it. Without this edge every invoice
+    # with no purchase-order reference - which is the whole Kaggle corpus -
+    # stops dead at NON_PO and the rest of the pipeline is unexercisable.
+    (_S.NON_PO, _E.STUB_OK): _S.CODED,
     # TEMP STUB: GL coding is not implemented (propose_gl_coding).
     (_S.MATCHED, _E.STUB_OK): _S.CODED,
     # TEMP STUB: approval routing is not implemented (request_approval).

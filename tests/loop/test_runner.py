@@ -8,6 +8,7 @@ a database or a key.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -21,32 +22,48 @@ from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
 from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction
+from ap_agent.contracts.purchase_order import (
+    PurchaseOrder,
+    PurchaseOrderLine,
+    PurchaseOrderStatus,
+    ReceiptLine,
+    ReceiptSet,
+)
 from ap_agent.contracts.run import Action, ActionKind, InvoiceRecord, StepResult
+from ap_agent.contracts.vendor import VendorCandidate, VendorMatch, VendorMatchBasis
+from ap_agent.errors import ExtractionError
 from ap_agent.loop.runner import (
     DEFAULT_MAX_STEPS,
+    HALT_NO_TOOL,
     LOOP_ONLY_FLAGS,
     NO_SECOND_READ,
     STUB_HOOKS,
-    VENDOR_LOCALE_DATE_HOOK,
     RunContext,
+    StepTrail,
     actor_for,
-    apply,
     decide,
     run,
     validate_extraction,
 )
+from ap_agent.loop.runner import apply as _apply_step
+from ap_agent.pricing import cost_usd, pricing_version
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools import TOOL_MODULE_NAMES
 from ap_agent.tools.compute_extraction_confidence import DateResolutionReason, DateVerdict
-from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
+from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextInput, ExtractInvoiceTextOutput
 from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
+from ap_agent.tools.get_purchase_order import GetPurchaseOrderOutput
+from ap_agent.tools.get_receipts import GetReceiptsOutput
 from ap_agent.tools.ingest_document import IngestDocumentInput, IngestDocumentOutput
+from ap_agent.tools.lookup_vendor import LookupVendorOutput
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextInput
     from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionInput
+    from ap_agent.tools.get_purchase_order import GetPurchaseOrderInput
+    from ap_agent.tools.get_receipts import GetReceiptsInput
+    from ap_agent.tools.lookup_vendor import LookupVendorInput
 
 HAPPY_PATH_STEPS = 14
 """Loop iterations from RECEIVED to CLOSED. One per state change."""
@@ -60,8 +77,22 @@ HAPPY_PATH_EVENTS = [
     "auto_ok",
     "extract",
     "validate",
-    *["stub_ok"] * 11,
+    # Resolving the vendor: the lookup, then what the rule decided about it.
+    "tax_id_exact",
+    "resolve_vendor",
+    # find_duplicates is still a stub.
+    "stub_ok",
+    # Gathering what the matcher will compare: the order, what arrived, then
+    # the decision. compute_match is the owner's, so the move itself is a stub.
+    "found",
+    "received",
+    "stub_ok",
+    *["stub_ok"] * 8,
 ]
+
+PO_NUMBER = "AP-TEST-001"
+VENDOR_ERP_ID = "62"
+OTHER_VENDOR_ERP_ID = "63"
 
 
 def _fake_ingest(_payload: IngestDocumentInput) -> IngestDocumentOutput:
@@ -79,7 +110,9 @@ def _fake_ingest(_payload: IngestDocumentInput) -> IngestDocumentOutput:
 
 def _extraction(**overrides: object) -> InvoiceExtraction:
     payload: dict[str, object] = {
-        "vendor_name": "Acme",
+        "vendor_name": "Acme Ltd",
+        "vendor_tax_id": "99-1234567",
+        "po_references": [PO_NUMBER],
         "invoice_number": "INV-1",
         "invoice_date": date(2026, 1, 1),
         "currency": "USD",
@@ -167,19 +200,122 @@ def _fake_text_factory(
     return _read
 
 
-def _context(
+RESOLVED_VENDOR = VendorMatch(
+    vendor_id=VENDOR_ERP_ID,
+    vendor_name="Acme Limited",
+    country="US",
+    currency="USD",
+    match_basis=VendorMatchBasis.TAX_ID_EXACT,
+)
+
+UNRESOLVED_VENDOR = VendorMatch(match_basis=VendorMatchBasis.NONE)
+
+AMBIGUOUS_VENDOR = VendorMatch(
+    match_basis=VendorMatchBasis.NONE,
+    candidates=[
+        VendorCandidate(vendor_id="70", vendor_name="Acme Ltd", score=1.0),
+        VendorCandidate(vendor_id="71", vendor_name="Acme Inc", score=1.0),
+    ],
+)
+
+
+def _purchase_order(vendor_erp_id: str = VENDOR_ERP_ID) -> PurchaseOrder:
+    return PurchaseOrder(
+        po_number=PO_NUMBER,
+        erp_id="145",
+        vendor_erp_id=vendor_erp_id,
+        vendor_name="Acme Limited",
+        currency="USD",
+        po_date=date(2025, 12, 20),
+        status=PurchaseOrderStatus.OPEN,
+        lines=[
+            PurchaseOrderLine(
+                line_no=1,
+                item_ref="19",
+                description="Widget",
+                qty_ordered=Decimal(1),
+                unit_price=Decimal("100.00"),
+                extended=Decimal("100.00"),
+            )
+        ],
+    )
+
+
+def _receipt_set(qty: Decimal = Decimal(1)) -> ReceiptSet:
+    return ReceiptSet(
+        po_number=PO_NUMBER,
+        lines=[ReceiptLine(line_no=1, qty_received=qty, received_on=date(2025, 12, 22))],
+    )
+
+
+def _fake_lookup_factory(
+    match: VendorMatch = RESOLVED_VENDOR,
+) -> Callable[[LookupVendorInput], LookupVendorOutput]:
+    def _lookup(_payload: LookupVendorInput) -> LookupVendorOutput:
+        return LookupVendorOutput(match=match, latency_ms=1)
+
+    return _lookup
+
+
+def _fake_po_factory(
+    order: PurchaseOrder | None = None,
+    *,
+    found: bool = True,
+) -> Callable[[GetPurchaseOrderInput], GetPurchaseOrderOutput]:
+    def _get(_payload: GetPurchaseOrderInput) -> GetPurchaseOrderOutput:
+        return GetPurchaseOrderOutput(
+            purchase_order=(order or _purchase_order()) if found else None, latency_ms=2
+        )
+
+    return _get
+
+
+def _fake_receipts_factory(
+    receipts: ReceiptSet | None = None,
+) -> Callable[[GetReceiptsInput], GetReceiptsOutput]:
+    def _get(_payload: GetReceiptsInput) -> GetReceiptsOutput:
+        return GetReceiptsOutput(receipts=receipts or _receipt_set(), latency_ms=1)
+
+    return _get
+
+
+def _context(  # noqa: PLR0913 - one keyword per injected seam reads better here
     tmp_path: Path,
     extraction: InvoiceExtraction | None = None,
+    *,
+    vendor_match: VendorMatch = RESOLVED_VENDOR,
+    purchase_order: PurchaseOrder | None = None,
+    po_found: bool = True,
+    receipts: ReceiptSet | None = None,
     **text_options: object,
 ) -> RunContext:
-    """A run context whose two reading seats agree, with the real check between them."""
+    """A run context whose seats agree, with the real confidence check between them.
+
+    The three reads that feed the match are injected too. None of them touches a
+    network here: the vendor master is a file, the receipts are a file, and the
+    purchase order would be QuickBooks - so the one that could reach out is the
+    one most worth substituting.
+    """
     return RunContext(
         run_id="run-1",
         writer=JsonlAuditWriter(tmp_path / "audit"),
         ingest=_fake_ingest,
         extract=_fake_extract_factory(extraction),
         extract_text=_fake_text_factory(extraction, **text_options),  # type: ignore[arg-type]
+        lookup_vendor=_fake_lookup_factory(vendor_match),
+        get_purchase_order=_fake_po_factory(purchase_order, found=po_found),
+        get_receipts=_fake_receipts_factory(receipts),
     )
+
+
+def apply(action: Action, record: InvoiceRecord, ctx: RunContext):  # noqa: ANN201
+    """Run one step, with a trail that writes its calls as they happen.
+
+    The loop builds this per step; a direct caller has to as well, because the
+    rows a step emits are now written as each tool returns rather than collected
+    and written afterwards.
+    """
+    return _apply_step(action, record, ctx, StepTrail(ctx, record, record.state))
 
 
 @pytest.fixture
@@ -201,7 +337,8 @@ def ctx(tmp_path: Path) -> RunContext:
         (InvoiceState.RECEIVED, ActionKind.INGEST_DOCUMENT, "rule"),
         (InvoiceState.INGESTED, ActionKind.COMPUTE_EXTRACTION_CONFIDENCE, "rule"),
         (InvoiceState.EXTRACTED, ActionKind.VALIDATE, "rule"),
-        (InvoiceState.VALIDATED, ActionKind.STUB, "rule"),
+        (InvoiceState.VALIDATED, ActionKind.LOOKUP_VENDOR, "rule"),
+        (InvoiceState.DUPLICATE_CHECKED, ActionKind.MATCH_PREP, "rule"),
         (InvoiceState.PENDING_APPROVAL, ActionKind.STUB, "rule"),
     ],
 )
@@ -253,26 +390,23 @@ def test_apply_does_not_mutate_the_record_it_was_given(
 def test_the_extraction_step_records_each_call_separately(
     record: InvoiceRecord, ctx: RunContext
 ) -> None:
-    """Three calls, three sets of numbers. Folding them together loses both.
+    """Three calls, three rows, written as each call returned.
 
-    "What did the second reading cost" is a fair question of a system that pays
-    two models to read the same page, and a single row averaging them cannot
-    answer it.
+    Not collected and written at the end: a step that dies half way must still
+    leave the rows for what it got through, because those calls happened and
+    were paid for.
     """
-    ingested = record.model_copy(update={"state": InvoiceState.INGESTED})
-    _, result = apply(decide(ingested), ingested, ctx)
+    run(record, ctx)
 
-    vision, text, scored = result.calls
-    assert vision.kind is ActionKind.EXTRACT_INVOICE_VISION
-    assert (vision.model_id, vision.input_tokens, vision.latency_ms) == (
-        "claude-sonnet-5",
-        7000,
-        8000,
-    )
-    assert text.kind is ActionKind.EXTRACT_INVOICE_TEXT
-    assert (text.model_id, text.input_tokens) == ("claude-haiku-4-5-20251001", 1200)
-    assert scored.kind is ActionKind.COMPUTE_EXTRACTION_CONFIDENCE
-    assert scored.model_id is None, "the check is code; attributing tokens to it would be a lie"
+    calls = [event for event in ctx.events if event.to_state is None]
+    assert [event.tool_name for event in calls[:3]] == [
+        "extract_invoice_vision",
+        "extract_invoice_text",
+        "compute_extraction_confidence",
+    ]
+    assert [event.decision for event in calls[:3]] == ["read", "read", "auto_ok"]
+    assert calls[0].input_tokens == 7000
+    assert calls[0].output_tokens == 900
 
 
 def test_the_extraction_step_stores_the_verdict_on_the_record(
@@ -338,7 +472,8 @@ def test_only_the_last_row_of_a_step_moves_the_invoice(
         "ingest",
         "extract",
         "validate",
-        *["stub_ok"] * 11,
+        "resolve_vendor",
+        *["stub_ok"] * 10,
     ]
 
 
@@ -486,9 +621,12 @@ def test_a_human_gated_state_halts_the_run_rather_than_erroring(
     final = run(record, ctx)
     assert final.state is InvoiceState.NEEDS_HUMAN_EXTRACTION
     halt = ctx.events[-1]
-    assert halt.event_type is AuditEventType.NOTE
-    assert halt.error_message is not None
-    assert "no transition" in halt.error_message
+    assert halt.event_type is AuditEventType.HALT
+    assert halt.decision == HALT_NO_TOOL
+    # Not an error. The pipeline stopping where a tool is missing is the design
+    # working, and recording it as an error teaches a reader to skim past errors.
+    assert halt.error_message is None
+    assert halt.error_class is None
 
 
 def test_a_tool_that_raises_stops_the_run_without_raising(
@@ -599,15 +737,25 @@ def _51109305(invoice_date: date = SEPTEMBER) -> InvoiceExtraction:
     )
 
 
-def _ambiguous_context(tmp_path: Path) -> RunContext:
+def _ambiguous_context(tmp_path: Path, country: str | None = None) -> RunContext:
     """The two seats read the same digits and order them differently.
 
     Which is exactly what happened live: same file, same models, twenty minutes
     apart, two different ISO dates.
+
+    ``country`` is what the vendor master would return for this supplier, so a
+    test can say what the locale rule has to work with without patching a record
+    half-way through a run.
     """
+    match = (
+        RESOLVED_VENDOR.model_copy(update={"country": country})
+        if country is not None
+        else RESOLVED_VENDOR
+    )
     return _context(
         tmp_path,
         _51109305(SEPTEMBER),
+        vendor_match=match,
         second_read=_51109305(MARCH),
         date_rendering=AMBIGUOUS_RENDERING,
     )
@@ -696,28 +844,44 @@ def test_a_date_the_window_cannot_settle_stays_open_through_validation(
 def test_the_vendors_country_settles_what_the_window_could_not(
     record: InvoiceRecord, tmp_path: Path
 ) -> None:
-    """The stub hook. lookup_vendor will own this the moment it exists.
+    """One run now, not two. The lookup puts the country on the record itself.
 
-    Two phases because nothing puts a country on the record yet - in the
-    finished pipeline lookup_vendor does it on the way into VENDOR_RESOLVED.
+    This used to need resuming a half-finished run with a country patched in by
+    hand, because nothing in the pipeline could supply one. That was the whole
+    cost of the missing lookup_vendor, and it is gone.
     """
-    ctx = _ambiguous_context(tmp_path)
+    ctx = _ambiguous_context(tmp_path, country="IN")
     started = record.model_copy(update={"received_at": _received(date(2024, 10, 1))})
+
+    final = run(started, ctx)
+
+    assert final.state is InvoiceState.CLOSED
+    assert final.vendor_country == "IN"
+    assert final.invoice_date_resolved == MARCH
+    assert final.date_resolution_reason is DateResolutionReason.VENDOR_LOCALE
+
+
+def test_the_date_is_still_open_when_the_vendor_step_begins(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """The ordering the whole design rests on: open at VALIDATED, closed after.
+
+    If the receipt window could settle it there would be nothing for the locale
+    rule to do, and this test would pass for the wrong reason.
+    """
+    ctx = _ambiguous_context(tmp_path, country="IN")
+    started = record.model_copy(update={"received_at": _received(date(2024, 10, 1))})
+
     part_way = run(started, ctx, max_steps=3)
+
+    assert part_way.state is InvoiceState.VALIDATED
     assert part_way.date_is_open is True
-
-    resumed = run(part_way.model_copy(update={"vendor_country": "IN"}), ctx)
-
-    assert resumed.state is InvoiceState.CLOSED
-    assert resumed.invoice_date_resolved == MARCH
-    assert resumed.date_resolution_reason is DateResolutionReason.VENDOR_LOCALE
 
 
 def test_the_locale_resolution_is_its_own_audit_row(record: InvoiceRecord, tmp_path: Path) -> None:
-    ctx = _ambiguous_context(tmp_path)
+    ctx = _ambiguous_context(tmp_path, country="IN")
     started = record.model_copy(update={"received_at": _received(date(2024, 10, 1))})
-    part_way = run(started, ctx, max_steps=3)
-    run(part_way.model_copy(update={"vendor_country": "IN"}), ctx)
+    run(started, ctx)
 
     resolution = next(
         event for event in ctx.events if event.decision == DateResolutionReason.VENDOR_LOCALE.value
@@ -725,21 +889,24 @@ def test_the_locale_resolution_is_its_own_audit_row(record: InvoiceRecord, tmp_p
     basis = resolution.decision_basis or ""
     assert "vendor_country=IN" in basis
     assert "chose=2024-03-09" in basis
+    assert isinstance(resolution.actor, RuleActor)
+    assert resolution.actor.rule_id == "DATE-RESOLVE@v1"
 
 
-def test_an_open_date_with_no_country_anywhere_stays_open(
+def test_an_open_date_with_a_country_nobody_maps_stays_open(
     record: InvoiceRecord, tmp_path: Path
 ) -> None:
-    """It reaches the end unresolved rather than being guessed at.
+    """Resolved vendor, unmapped country: the date is reported open, not guessed.
 
-    Not a good outcome, and not one this session fixes: it is what the missing
-    lookup_vendor costs. Recorded so the gap is visible rather than inferred.
+    A consistent guess would be worse than an inconsistent one - it would be
+    silently and reproducibly wrong, and nothing downstream could tell.
     """
-    ctx = _ambiguous_context(tmp_path)
+    ctx = _ambiguous_context(tmp_path, country="ZZ")
     started = record.model_copy(update={"received_at": _received(date(2024, 10, 1))})
+
     final = run(started, ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.vendor_country == "ZZ"
     assert final.date_is_open is True
     assert final.invoice_date_resolved is None
 
@@ -868,20 +1035,400 @@ def test_the_chain_verifies_after_every_kind_of_run(
 # --- the stub hook is visible -----------------------------------------------
 
 
-def test_the_stub_hook_is_declared() -> None:
-    """A stub step is supposed to do nothing. This one does something.
+def test_no_stub_step_does_anything() -> None:
+    """A stub is supposed to do nothing, and now none of them does.
 
-    Listed so that deleting it when lookup_vendor becomes real is a deliberate
-    act with a failing test, exactly like the stub edges.
+    This set held the vendor-locale date resolution for exactly as long as
+    lookup_vendor was a stub. The tool owns it now.
     """
-    assert frozenset({VENDOR_LOCALE_DATE_HOOK}) == STUB_HOOKS
+    assert frozenset() == STUB_HOOKS
 
 
-def test_a_stub_step_does_nothing_anywhere_else(record: InvoiceRecord, ctx: RunContext) -> None:
-    """The hook fires in one state and only when a date is actually open."""
-    for state in (InvoiceState.VALIDATED, InvoiceState.MATCHED, InvoiceState.CODED):
+def test_a_stub_step_changes_nothing_on_the_record(record: InvoiceRecord, ctx: RunContext) -> None:
+    """Every remaining stub advances the state and touches nothing else."""
+    for state in (InvoiceState.MATCHED, InvoiceState.CODED, InvoiceState.POSTED):
         parked = record.model_copy(update={"state": state, "vendor_country": "IN"})
         updated, result = apply(decide(parked), parked, ctx)
         assert result.event == "stub_ok"
         assert result.calls == []
-        assert updated.invoice_date_resolved is None
+        assert updated == parked
+
+
+# --- the three reads that feed the match ------------------------------------
+#
+# Every test below drives the real loop with the three reads injected. None of
+# them touches a network: the vendor master is a committed file, the receipts
+# are a local file, and the purchase order - the one that would be QuickBooks -
+# is the one most worth substituting.
+
+
+def _events(ctx: RunContext) -> list[str | None]:
+    return [event.decision for event in ctx.events]
+
+
+def test_the_vendor_is_resolved_from_the_master_not_the_document(
+    record: InvoiceRecord, ctx: RunContext
+) -> None:
+    """The country, currency and id all come back from the master.
+
+    The document supplied a name and a tax id to search with, and nothing else
+    it said about the vendor is carried forward.
+    """
+    final = run(record, ctx)
+
+    assert final.vendor_id == VENDOR_ERP_ID
+    assert final.vendor_country == "US"
+    assert final.vendor_currency == "USD"
+    assert final.vendor_match is not None
+    assert final.vendor_match.match_basis is VendorMatchBasis.TAX_ID_EXACT
+
+
+def test_the_lookup_gets_its_own_audit_row(record: InvoiceRecord, ctx: RunContext) -> None:
+    """One row per thing that happened: the lookup, then what was decided."""
+    run(record, ctx)
+
+    lookup = next(event for event in ctx.events if event.decision == "tax_id_exact")
+    decision = next(event for event in ctx.events if event.decision == "resolve_vendor")
+
+    assert lookup.tool_name == "lookup_vendor"
+    assert lookup.to_state is None, "a call row never moves the invoice"
+    assert lookup.output_ref is not None
+    assert lookup.output_ref.startswith("sha256:")
+    assert decision.to_state is InvoiceState.VENDOR_RESOLVED
+    assert isinstance(decision.actor, RuleActor)
+    assert decision.actor.rule_id == "RESOLVE-VENDOR@v1"
+
+
+def test_an_unresolved_vendor_halts_at_new_vendor(record: InvoiceRecord, tmp_path: Path) -> None:
+    """Onboarding a supplier is a human process, so the machine stops.
+
+    No stub edge leaves NEW_VENDOR. The table refuses, the run records the
+    refusal, and that is the correct outcome rather than a failure.
+    """
+    ctx = _context(tmp_path, vendor_match=UNRESOLVED_VENDOR)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.NEW_VENDOR
+    assert final.vendor_id is None
+    assert final.vendor_country is None
+    halt = ctx.events[-1]
+    assert halt.to_state is None
+    assert halt.event_type is AuditEventType.HALT
+    assert halt.decision == HALT_NO_TOOL
+    assert "NEW_VENDOR" in (halt.decision_basis or "")
+
+
+def test_an_ambiguous_vendor_halts_with_the_candidates_recorded(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """A wrong vendor pays the wrong party; a human question costs one question."""
+    ctx = _context(tmp_path, vendor_match=AMBIGUOUS_VENDOR)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.NEW_VENDOR
+    decision = next(event for event in ctx.events if event.decision == "vendor_not_found")
+    basis = decision.decision_basis or ""
+    assert "70:Acme Ltd" in basis
+    assert "71:Acme Inc" in basis
+
+
+def test_the_purchase_order_and_receipts_land_on_the_record(
+    record: InvoiceRecord, ctx: RunContext
+) -> None:
+    """Both snapshots, so the matcher inherits facts rather than fetching them."""
+    final = run(record, ctx)
+
+    assert final.purchase_order is not None
+    assert final.purchase_order.po_number == PO_NUMBER
+    assert final.receipts is not None
+    assert final.receipts.quantity_for(1) == Decimal(1)
+
+
+def test_each_read_gets_its_own_audit_row(record: InvoiceRecord, ctx: RunContext) -> None:
+    run(record, ctx)
+
+    order_row = next(event for event in ctx.events if event.decision == "found")
+    receipt_row = next(event for event in ctx.events if event.decision == "received")
+
+    assert order_row.tool_name == "get_purchase_order"
+    assert receipt_row.tool_name == "get_receipts"
+    for row in (order_row, receipt_row):
+        assert row.to_state is None
+        assert row.output_ref is not None
+        assert row.output_ref.startswith("sha256:")
+        assert row.latency_ms is not None
+
+
+def test_the_audit_sequence_for_a_po_matched_invoice(
+    record: InvoiceRecord, ctx: RunContext
+) -> None:
+    """The trail, stated in full, because it is what a reviewer reads."""
+    run(record, ctx)
+
+    assert _events(ctx) == HAPPY_PATH_EVENTS
+
+
+def test_the_chain_still_verifies_after_the_new_steps(
+    record: InvoiceRecord, ctx: RunContext, tmp_path: Path
+) -> None:
+    final = run(record, ctx)
+    writer = JsonlAuditWriter(tmp_path / "audit")
+    assert writer.verify(str(final.invoice_id)) is True
+
+
+def test_an_invoice_with_no_po_reference_routes_to_non_po(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """A different pipeline, not a failed match - and nothing is fetched.
+
+    It passes *through* NON_PO rather than stopping there: GL coding is still a
+    stub, but a stub edge now carries it onward so the rest of the pipeline is
+    exercisable by the documents that actually have no purchase order.
+    """
+    ctx = _context(tmp_path, _extraction(po_references=[]))
+
+    final = run(record, ctx)
+
+    assert InvoiceState.NON_PO in [event.to_state for event in ctx.events]
+    assert final.purchase_order is None
+    assert final.receipts is None
+    assert "found" not in _events(ctx), "nothing to fetch, so nothing was fetched"
+    decision = next(event for event in ctx.events if event.decision == "no_po_reference")
+    assert decision.decision_basis == "po_references=none"
+
+
+def test_a_missing_purchase_order_routes_to_exception(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    ctx = _context(tmp_path, po_found=False)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.EXCEPTION
+    assert final.receipts is None, "no point asking what arrived against an order nobody has"
+    decision = next(event for event in ctx.events if event.decision == "match_exception")
+    assert "po_not_found" in (decision.decision_basis or "")
+
+
+def test_a_po_belonging_to_another_vendor_never_reaches_the_matcher(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """An identity check, not a tolerance.
+
+    An invoice quoting another supplier's purchase-order number is one of the
+    oldest frauds in accounts payable. There is no band inside which it is
+    acceptable, so it is refused before any number is compared.
+    """
+    ctx = _context(tmp_path, purchase_order=_purchase_order(OTHER_VENDOR_ERP_ID))
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.EXCEPTION
+    assert final.receipts is None
+    decision = next(event for event in ctx.events if event.decision == "match_exception")
+    basis = decision.decision_basis or ""
+    assert "vendor_mismatch" in basis
+    assert f"po_vendor={OTHER_VENDOR_ERP_ID}" in basis
+    assert f"invoice_vendor={VENDOR_ERP_ID}" in basis
+
+
+def test_the_identity_check_compares_ids_not_names(record: InvoiceRecord, tmp_path: Path) -> None:
+    """The name is what the document claimed, and the claim is under suspicion."""
+    impostor = _purchase_order(OTHER_VENDOR_ERP_ID).model_copy(
+        update={"vendor_name": "Acme Limited"}
+    )
+    ctx = _context(tmp_path, purchase_order=impostor)
+
+    assert run(record, ctx).state is InvoiceState.EXCEPTION
+
+
+def test_nothing_received_still_reaches_the_matcher(record: InvoiceRecord, tmp_path: Path) -> None:
+    """An empty receipt set is a fact to match against, not a reason to refuse.
+
+    Whether an invoice for goods that never arrived may pay is the matcher's
+    call to make with the reason codes to explain it - not this step's to
+    pre-empt by routing round it.
+    """
+    ctx = _context(tmp_path, receipts=ReceiptSet(po_number=PO_NUMBER))
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.CLOSED
+    assert final.receipts is not None
+    assert final.receipts.is_empty is True
+    row = next(event for event in ctx.events if event.decision == "nothing_received")
+    assert row.tool_name == "get_receipts"
+
+
+# --- the trail, after the 2026-09-12 live check ------------------------------
+#
+# Every test below pins something that run went wrong about. The run recorded
+# two rows for a step that had made two model calls and paid for one of them,
+# blamed a tool that had not run, and put labels where content addresses belong.
+
+
+def _failing_text(_payload: ExtractInvoiceTextInput) -> ExtractInvoiceTextOutput:
+    msg = "the second reading did not satisfy the InvoiceExtraction contract"
+    raise ExtractionError(msg)
+
+
+def test_a_failed_reading_leaves_the_rows_for_the_readings_that_worked(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """Four rows, not two. The vision call happened and was paid for.
+
+    The live run recorded only `ingest` and an error, losing any trace of a
+    model call that had already completed and been billed.
+    """
+    ctx = replace(_context(tmp_path), extract_text=_failing_text)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.INGESTED
+    assert [event.tool_name for event in ctx.events] == [
+        "ingest_document",
+        "extract_invoice_vision",
+        "extract_invoice_text",
+        "compute_extraction_confidence",
+    ]
+
+    vision = ctx.events[1]
+    assert vision.input_tokens == 7000
+    assert vision.output_tokens == 900
+    assert vision.error_message is None
+
+
+def test_the_failure_row_names_the_tool_that_failed(record: InvoiceRecord, tmp_path: Path) -> None:
+    """It used to name compute_extraction_confidence, which had not run."""
+    ctx = replace(_context(tmp_path), extract_text=_failing_text)
+
+    run(record, ctx)
+
+    failed = ctx.events[2]
+    assert failed.tool_name == "extract_invoice_text"
+    assert failed.event_type is AuditEventType.ERROR
+    assert "ExtractionError" in (failed.error_message or "")
+
+
+def test_the_chain_still_verifies_through_a_failure(record: InvoiceRecord, tmp_path: Path) -> None:
+    ctx = replace(_context(tmp_path), extract_text=_failing_text)
+    final = run(record, ctx)
+    assert JsonlAuditWriter(tmp_path / "audit").verify(str(final.invoice_id)) is True
+
+
+SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def test_every_output_ref_is_a_content_address(record: InvoiceRecord, ctx: RunContext) -> None:
+    """`invoice:51109301` and `date:2024-03-09` are labels, not addresses.
+
+    A human-readable note belongs in tool_result_summary, which exists for it.
+    """
+    run(record, ctx)
+
+    for event in ctx.events:
+        assert event.output_ref is None or SHA256_REF.match(event.output_ref), (
+            event.tool_name,
+            event.output_ref,
+        )
+
+
+def test_the_readable_half_moved_to_the_summary(record: InvoiceRecord, ctx: RunContext) -> None:
+    run(record, ctx)
+    extract = next(event for event in ctx.events if event.decision == "extract")
+    assert extract.tool_result_summary == "invoice=INV-1"
+
+
+def test_a_model_row_carries_what_the_call_cost(record: InvoiceRecord, ctx: RunContext) -> None:
+    """Priced from the versioned list, so the figure can be re-explained later."""
+    run(record, ctx)
+
+    vision = next(event for event in ctx.events if event.tool_name == "extract_invoice_vision")
+    expected = cost_usd("claude-sonnet-5", 7000, 900)
+
+    assert expected is not None
+    assert vision.cost_usd == expected
+    assert vision.tool_result_summary == f"pricing={pricing_version()}"
+
+
+def test_a_row_that_made_no_model_call_has_no_cost(record: InvoiceRecord, ctx: RunContext) -> None:
+    """None, not zero. Zero would claim the step was free."""
+    run(record, ctx)
+    ingest = ctx.events[0]
+    assert ingest.cost_usd is None
+
+
+def test_every_row_carries_its_retry_count(record: InvoiceRecord, ctx: RunContext) -> None:
+    run(record, ctx)
+    assert all(event.retry_count >= 0 for event in ctx.events)
+
+
+def test_an_open_date_prints_its_candidates_not_one_of_them(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """The trail said `date=2023-07-03, date_open`, which states a fact nobody had.
+
+    While two readings are live, naming one of them reads as a date that happens
+    to be flagged rather than as a choice nobody has made.
+    """
+    ctx = _ambiguous_context(tmp_path)
+
+    run(record, ctx, max_steps=3)
+
+    validated = next(event for event in ctx.events if event.decision == "validate")
+    basis = validated.decision_basis or ""
+    assert "candidates=2024-03-09|2024-09-03" in basis
+    assert "date=2024-" not in basis
+
+
+def test_a_settled_date_prints_the_date(record: InvoiceRecord, ctx: RunContext) -> None:
+    run(record, ctx, max_steps=3)
+    validated = next(event for event in ctx.events if event.decision == "validate")
+    assert "date=2026-01-01" in (validated.decision_basis or "")
+
+
+def test_an_invoice_far_older_than_its_arrival_fails_validation(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """Three years between both readings and the day it turned up.
+
+    Measured against arrival, not the clock: an invoice processed late is a
+    different fact from one that was already ancient when it arrived, and only
+    the second is a reason to stop.
+    """
+    ctx = _ambiguous_context(tmp_path)
+    arrived = record.model_copy(update={"received_at": _received(date(2027, 10, 1))})
+
+    final = run(arrived, ctx)
+
+    assert final.state is InvoiceState.NEEDS_HUMAN_EXTRACTION
+    assert "invoice_date_too_old" in final.validation_flags
+
+
+def test_an_invoice_within_the_window_does_not(record: InvoiceRecord, tmp_path: Path) -> None:
+    """Guards the test above: it must fail for staleness, not for everything."""
+    ctx = _ambiguous_context(tmp_path)
+    arrived = record.model_copy(update={"received_at": _received(date(2024, 10, 1))})
+
+    final = run(arrived, ctx)
+
+    assert "invoice_date_too_old" not in final.validation_flags
+
+
+def test_a_halt_for_a_missing_tool_is_not_an_error(record: InvoiceRecord, tmp_path: Path) -> None:
+    """An invoice parked where a tool is unwritten is the design, not a defect.
+
+    Recording it as an error teaches a reader to skim past errors, which is
+    exactly when a real one appears.
+    """
+    ctx = _context(tmp_path, vendor_match=UNRESOLVED_VENDOR)
+
+    run(record, ctx)
+
+    halt = ctx.events[-1]
+    assert halt.event_type is AuditEventType.HALT
+    assert halt.decision == HALT_NO_TOOL
+    assert halt.error_class is None
+    assert halt.error_message is None
