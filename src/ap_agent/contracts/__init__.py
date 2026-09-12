@@ -26,6 +26,7 @@ from ap_agent.contracts.audit import (
 )
 from ap_agent.contracts.common import (
     CURRENCY_ALLOWLIST,
+    AmbiguousNumber,
     Confidence,
     CostUsd,
     CurrencyCode,
@@ -36,6 +37,7 @@ from ap_agent.contracts.common import (
     TaxRate,
     UnitPrice,
     is_allowed_currency,
+    normalise_decimal_text,
 )
 from ap_agent.contracts.enums import (
     ActorKind,
@@ -65,21 +67,29 @@ from ap_agent.contracts.invoice import (
 )
 from ap_agent.contracts.matching import MatchLineResult, MatchResult
 from ap_agent.contracts.purchase_order import (
-    GoodsReceipt,
-    GoodsReceiptLine,
     PurchaseOrder,
     PurchaseOrderLine,
     PurchaseOrderStatus,
+    ReceiptLine,
+    ReceiptSet,
 )
-from ap_agent.contracts.vendor import VendorRef
+from ap_agent.contracts.vendor import (
+    MAX_VENDOR_CANDIDATES,
+    VendorCandidate,
+    VendorMatch,
+    VendorMatchBasis,
+    VendorRef,
+)
 
 __all__ = [
     "CURRENCY_ALLOWLIST",
     "EVIDENCE_FIELDS",
     "GENERATOR_VERSION",
     "GENESIS_HASH",
+    "MAX_VENDOR_CANDIDATES",
     "Actor",
     "ActorKind",
+    "AmbiguousNumber",
     "ArithmeticFlag",
     "AuditEvent",
     "AuditEventType",
@@ -94,8 +104,6 @@ __all__ = [
     "ExpectedMatch",
     "GeneratedInvoiceTruth",
     "GeneratedVariant",
-    "GoodsReceipt",
-    "GoodsReceiptLine",
     "HumanActor",
     "InvoiceExtraction",
     "LineItem",
@@ -110,6 +118,8 @@ __all__ = [
     "PurchaseOrderStatus",
     "Quantity",
     "ReasonCode",
+    "ReceiptLine",
+    "ReceiptSet",
     "RuleActor",
     "Sha256Hex",
     "StrictModel",
@@ -119,7 +129,11 @@ __all__ = [
     "TaxRate",
     "ToolActor",
     "UnitPrice",
+    "VendorCandidate",
+    "VendorMatch",
+    "VendorMatchBasis",
     "VendorRef",
     "is_allowed_currency",
+    "normalise_decimal_text",
     "utc_now",
 ]

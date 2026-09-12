@@ -1,0 +1,84 @@
+{
+  "QueryResponse": {
+    "PurchaseOrder": [
+      {
+        "EmailStatus": "NotSet",
+        "POStatus": "Open",
+        "domain": "QBO",
+        "sparse": false,
+        "Id": "145",
+        "SyncToken": "0",
+        "MetaData": {
+          "CreateTime": "2026-09-10T04:19:58-07:00",
+          "LastModifiedByRef": {
+            "value": "9341457877228896"
+          },
+          "LastUpdatedTime": "2026-09-10T04:19:58-07:00"
+        },
+        "CustomField": [],
+        "DocNumber": "AP-SEED-001",
+        "TxnDate": "2026-07-27",
+        "CurrencyRef": {
+          "value": "USD",
+          "name": "United States Dollar"
+        },
+        "LinkedTxn": [],
+        "Line": [
+          {
+            "Id": "1",
+            "LineNum": 1,
+            "Description": "Laser Printer Mono",
+            "Amount": 64200.0,
+            "DetailType": "ItemBasedExpenseLineDetail",
+            "ItemBasedExpenseLineDetail": {
+              "BillableStatus": "NotBillable",
+              "ItemRef": {
+                "value": "23",
+                "name": "Laser Printer Mono"
+              },
+              "UnitPrice": 21400,
+              "Qty": 3,
+              "TaxCodeRef": {
+                "value": "NON"
+              }
+            },
+            "CustomExtensions": []
+          },
+          {
+            "Id": "2",
+            "LineNum": 2,
+            "Description": "27in IPS Monitor",
+            "Amount": 207900.0,
+            "DetailType": "ItemBasedExpenseLineDetail",
+            "ItemBasedExpenseLineDetail": {
+              "BillableStatus": "NotBillable",
+              "ItemRef": {
+                "value": "20",
+                "name": "27in IPS Monitor"
+              },
+              "UnitPrice": 18900,
+              "Qty": 11,
+              "TaxCodeRef": {
+                "value": "NON"
+              }
+            },
+            "CustomExtensions": []
+          }
+        ],
+        "VendorRef": {
+          "value": "58",
+          "name": "TechVision Distributors Pvt Ltd"
+        },
+        "APAccountRef": {
+          "value": "33",
+          "name": "Accounts Payable (A/P)"
+        },
+        "TotalAmt": 272100.0
+      }
+    ],
+    "startPosition": 1,
+    "maxResults": 1,
+    "totalCount": 1
+  },
+  "time": "2026-09-11T16:53:42.264-07:00"
+}

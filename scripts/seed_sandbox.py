@@ -400,7 +400,7 @@ def build_receipts(manifest: dict[str, Any], rng: random.Random) -> dict[str, An
     receipts: list[dict[str, Any]] = []
     for order, plan in zip(manifest["purchase_orders"], RECEIPT_PLAN, strict=True):
         lines: list[dict[str, Any]] = []
-        for line in order["lines"]:
+        for index, line in enumerate(order["lines"], start=1):
             ordered = Decimal(str(line["qty"]))
             if plan == "full":
                 received = ordered
@@ -410,7 +410,16 @@ def build_receipts(manifest: dict[str, Any], rng: random.Random) -> dict[str, An
                 # Partial: short by 1 to 3 units, never below zero.
                 received = max(Decimal(0), ordered - Decimal(rng.randint(1, 3)))
             lines.append(
-                {"item": line["item"], "qty_ordered": str(ordered), "qty_received": str(received)}
+                {
+                    # 1-based, matching QuickBooks' own LineNum. The join key is
+                    # written down rather than implied by position: a reordered
+                    # purchase order must break loudly, not silently move every
+                    # quantity onto the wrong line.
+                    "line_no": index,
+                    "item": line["item"],
+                    "qty_ordered": str(ordered),
+                    "qty_received": str(received),
+                }
             )
 
         receipts.append(

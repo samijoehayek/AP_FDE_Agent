@@ -23,7 +23,7 @@ from pydantic import Field
 
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.matching import MatchResult
-from ap_agent.contracts.purchase_order import GoodsReceipt, PurchaseOrder
+from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
 from ap_agent.tools.base import SideEffect, ToolCaller, ToolInput, ToolOutput
 
 CALLER = ToolCaller.CODE
@@ -37,7 +37,11 @@ class ComputeMatchInput(ToolInput):
     invoice_id: str = Field(min_length=1, max_length=64)
     extraction: InvoiceExtraction
     purchase_orders: list[PurchaseOrder] = Field(default_factory=list[PurchaseOrder])
-    receipts: list[GoodsReceipt] = Field(default_factory=list[GoodsReceipt])
+    receipts: list[ReceiptSet] = Field(
+        default_factory=list[ReceiptSet],
+        description="One set per purchase order, parallel to `purchase_orders`. A PO with "
+        "nothing received is an empty set, never absent - see ReceiptSet.",
+    )
     config_version: str = Field(min_length=1, max_length=32)
 
 
