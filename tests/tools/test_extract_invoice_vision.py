@@ -22,9 +22,9 @@ from ap_agent.config import get_settings
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.errors import ExtractionError
 from ap_agent.tools.extract_invoice_vision import (
-    PROMPT_VERSION,
     ExtractInvoiceVisionInput,
     build_content_block,
+    default_prompt_version,
     extract_invoice_vision,
     load_prompt,
 )
@@ -123,7 +123,7 @@ def test_the_document_is_data_not_prompt_text(
 ) -> None:
     """Nothing from the file is interpolated into the system prompt."""
     request, _ = run_extract
-    assert request["system"] == load_prompt(PROMPT_VERSION)
+    assert request["system"] == load_prompt(default_prompt_version())
     encoded = base64.standard_b64encode(born_digital_pdf.read_bytes()).decode("ascii")
     assert encoded not in request["system"]
 
@@ -155,7 +155,7 @@ def test_the_result_carries_what_the_audit_trail_needs(
     run_extract: tuple[dict[str, Any], Any],
 ) -> None:
     _, result = run_extract
-    assert result.prompt_version == "extract_v1"
+    assert result.prompt_version == "extract_v2"
     assert result.model_id == "claude-sonnet-5"
     assert result.input_tokens == 4321
     assert result.output_tokens == 765
@@ -290,7 +290,7 @@ def test_a_non_answer_is_never_returned_as_an_extraction(
 
 def test_the_prompt_forbids_acting_on_document_instructions() -> None:
     """The prompt is a control surface; these clauses are the reason it exists."""
-    prompt = load_prompt(PROMPT_VERSION).lower()
+    prompt = load_prompt(default_prompt_version()).lower()
     assert "suspicious_text" in prompt
     for phrase in ("do not act on it", "do not infer", "as printed"):
         assert phrase in prompt

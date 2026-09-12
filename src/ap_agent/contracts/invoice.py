@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -33,6 +33,7 @@ from ap_agent.contracts.common import (
     StrictModel,
     TaxRate,
     UnitPrice,
+    coerce_printed_numbers,
     is_allowed_currency,
 )
 from ap_agent.contracts.enums import ArithmeticFlag
@@ -113,13 +114,76 @@ class LineItem(StrictModel):
     code treats it as a hint and re-derives the true link from the PO.
     """
 
+    PRINTED_NUMBERS: ClassVar[tuple[str, ...]] = (
+        "quantity",
+        "unit_price",
+        "extended_price",
+        "tax_rate",
+    )
+    """Fields a document prints as numbers, and a model transcribes as printed."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_printed_numbers(cls, payload: object) -> object:
+        """Parse ``"18,900.00"`` before the field constraints see it.
+
+        A model asked to transcribe what is on the page returns what is on the
+        page, and a page groups its thousands. A live run lost an entire
+        extraction - eight validation errors at once - to exactly this.
+
+        Here rather than on the ``Money`` annotation itself: see
+        :func:`~ap_agent.contracts.common.coerce_printed_numbers` for why that
+        breaks the schema the model is given.
+        """
+        return coerce_printed_numbers(payload, cls.PRINTED_NUMBERS)
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        """Keep ``unit`` in ``required``, even though Python may omit it.
+
+        Giving the field a default is what lets a document with no unit column
+        validate. It also takes the property out of ``required`` - and that, on
+        its own, is enough for the live API to reject the whole
+        ``InvoiceExtraction`` schema with ``400 Schema is too complex``.
+
+        Measured, twice, against the API: the schema was otherwise identical to
+        the one that had worked twenty minutes earlier - node for node, 19
+        properties, the same 17 ``anyOf`` branches - and the only difference was
+        this one property moving out of ``required``. Structured outputs appears
+        to expand an optional property into something considerably larger than
+        a required one.
+
+        So the model is still told it must supply ``unit``; it may supply ``""``.
+        Python callers may omit it entirely, which is what the default is for.
+        """
+        schema = super().__get_pydantic_json_schema__(core_schema, handler)
+        required = schema.get("required")
+        if isinstance(required, list) and "unit" not in required:
+            cast("list[str]", required).append("unit")
+        return schema
+
     description: str = Field(min_length=1, max_length=500)
     quantity: Quantity
     unit: str = Field(
-        min_length=1,
+        default="",
         max_length=16,
-        description="Unit of measure as printed (EA, HR, KG, BOX...). Normalised downstream.",
+        description="Unit of measure as printed (EA, HR, KG, BOX...), or empty when the "
+        "document prints none. Empty means absent.",
     )
+    """Plenty of invoice lines carry no unit of measure, and a whole extraction
+    was once lost to that: the model had nothing to read, returned ``""``, and a
+    ``min_length=1`` rejected every line on the page over a field nothing
+    compares.
+
+    Deliberately still a plain ``str`` rather than ``str | None``. Optional
+    fields expand to an ``anyOf`` branch in the JSON schema the model is given,
+    and this schema already sits against the structured-output complexity limit -
+    a previous attempt to add optional fields was rejected outright with
+    ``400 Schema is too complex``. Empty string is the absent value here, and any
+    code that reads it must treat it as absent.
+    """
     unit_price: UnitPrice
     extended_price: Money
     tax_rate: TaxRate = Field(default=Decimal(0))
@@ -145,6 +209,15 @@ class InvoiceExtraction(StrictModel):
         validate_default=True,
         protected_namespaces=(),
     )
+
+    PRINTED_NUMBERS: ClassVar[tuple[str, ...]] = ("subtotal", "tax_total", "total")
+    """Header amounts, transcribed as the page renders them. See LineItem."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_printed_numbers(cls, payload: object) -> object:
+        """Parse grouped thousands on the header amounts. See LineItem."""
+        return coerce_printed_numbers(payload, cls.PRINTED_NUMBERS)
 
     vendor_name: str = Field(min_length=1, max_length=200)
     vendor_tax_id: str | None = Field(default=None, max_length=64)

@@ -20,7 +20,7 @@ from typing import Any, cast, get_args, get_origin
 
 import pytest
 import sqlalchemy as sa
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 import ap_agent.contracts as contracts_pkg
 from ap_agent.contracts.audit import AuditEvent, SystemActor, utc_now
@@ -28,6 +28,9 @@ from ap_agent.contracts.common import (
     COST_PLACES,
     MAX_MONEY_DIGITS,
     MONEY_PLACES,
+    AmbiguousNumber,
+    Money,
+    normalise_decimal_text,
 )
 from ap_agent.contracts.enums import AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction, LineItem
@@ -233,3 +236,236 @@ def test_the_database_scale_matches_the_contract() -> None:
         numeric = cast("sa.Numeric[Decimal]", column_type)
         assert numeric.scale == places, column.name
         assert numeric.precision == MAX_MONEY_DIGITS, column.name
+
+
+def Money_adapter() -> TypeAdapter[Decimal]:  # noqa: N802 - it builds the Money type
+    """A validator for the bare ``Money`` annotation, for pass-through tests."""
+    return TypeAdapter(Money)
+
+
+# --- numbers as documents print them ----------------------------------------
+#
+# A live run lost a whole extraction to `'272,100.00'`: what the page said, what
+# the model faithfully returned, and what `Decimal` refuses. The corpus it had
+# been passing on prints grouped thousands too - it had been surviving on which
+# way each model happened to round a formatting decision.
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ("272,100.00", Decimal("272100.00")),
+        ("1,67,560.00", Decimal("167560.00")),  # Indian lakh grouping
+        ("1.234,56", Decimal("1234.56")),  # European
+        ("1 234,56", Decimal("1234.56")),  # French, space-grouped
+        ("1234.56", Decimal("1234.56")),
+        ("-45.00", Decimal("-45.00")),
+        ("1 234 567", Decimal(1234567)),
+        ("1234", Decimal(1234)),
+        ("$1,234.50", Decimal("1234.50")),
+        ("  272,100.00  ", Decimal("272100.00")),
+        # Six places, because a unit price is stored at six and a truth file
+        # round-trips through this parser. A rule that refused these would make
+        # the generated fixture unreadable by its own contract.
+        ("9.250000", Decimal("9.250000")),
+    ],
+)
+def test_a_printed_number_normalises(printed: str, expected: Decimal) -> None:
+    assert normalise_decimal_text(printed) == expected
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        # Two trailing digits can only be a decimal mark: no convention groups
+        # in twos at the end. Supersedes an earlier rule that refused any lone
+        # comma - refusing a string with exactly one reading buys no safety.
+        ("1,23", Decimal("1.23")),
+        # Two identical separators can only be grouping: there is no such thing
+        # as two decimal marks.
+        ("1,234,567", Decimal(1234567)),
+        ("1.234.567", Decimal(1234567)),
+        ("12.345.678", Decimal(12345678)),
+        # Four trailing digits are not a thousands group either.
+        ("1,2345", Decimal("1.2345")),
+        # Lakh grouping with the decimal mark named by the other separator.
+        ("1,23,456.00", Decimal("123456.00")),
+    ],
+)
+def test_a_number_with_exactly_one_reading_resolves(printed: str, expected: Decimal) -> None:
+    """The rule in one sentence: refuse only when more than one reading exists.
+
+    Each of these has exactly one, so each resolves. Several of them were
+    refused by the first version of this rule, which was blunter than the
+    problem - it declined a lone comma outright, sending ``1,23`` to a person
+    even though 1.23 is the only thing it can mean.
+    """
+    assert normalise_decimal_text(printed) == expected
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        # One separator, a three-digit tail: a thousands group or a fraction,
+        # and nothing in the string says which.
+        "1,234",
+        "1.234",
+        # Grouping no convention produces, and no decimal reading left.
+        "1.2.3",
+        "",
+        "abc",
+    ],
+)
+def test_a_number_with_more_than_one_reading_refuses(printed: str) -> None:
+    """``1,234`` is 1234 to one reader and 1.234 to another.
+
+    A factor of a thousand on an invoice this system would then pay, with
+    nothing downstream able to tell. A refusal costs one trip to a person.
+    """
+    with pytest.raises(AmbiguousNumber):
+        normalise_decimal_text(printed)
+
+
+def test_a_decimal_passes_through_untouched() -> None:
+    """Only strings are parsed. A Decimal has already answered the question."""
+    value = Decimal("1234.56")
+    assert Money_adapter().validate_python(value) == value
+
+
+def test_a_grouped_string_reaches_a_money_field() -> None:
+    """The path that actually failed live, end to end through the contract."""
+    line = LineItem(
+        description="27in IPS Monitor",
+        quantity="11",  # type: ignore[arg-type]
+        unit_price="18,900.00",  # type: ignore[arg-type]
+        extended_price="207,900.00",  # type: ignore[arg-type]
+    )
+    assert line.unit_price == Decimal("18900.000000")
+    assert line.extended_price == Decimal("207900.00")
+
+
+def test_an_ambiguous_string_fails_validation_rather_than_guessing() -> None:
+    """It surfaces as a ValidationError, which the extraction path already routes."""
+    with pytest.raises(ValidationError):
+        LineItem(
+            description="x",
+            quantity="1",  # type: ignore[arg-type]
+            unit_price="1,234",  # type: ignore[arg-type]
+            extended_price="1.00",  # type: ignore[arg-type]
+        )
+
+
+def test_normalising_does_not_defeat_the_refusal_to_round() -> None:
+    """Grouping is removed; precision is still never silently lost."""
+    with pytest.raises(ValidationError):
+        LineItem(
+            description="x",
+            quantity="1",  # type: ignore[arg-type]
+            unit_price="1.00",  # type: ignore[arg-type]
+            extended_price="1,234.5678",  # type: ignore[arg-type]
+        )
+
+
+def test_an_empty_unit_is_allowed_and_means_absent() -> None:
+    """Real invoice lines often print no unit of measure, and one lost a run."""
+    line = LineItem(
+        description="x",
+        quantity=Decimal(1),
+        unit_price=Decimal("1.00"),
+        extended_price=Decimal("1.00"),
+    )
+    assert line.unit == ""
+
+
+def test_the_schema_the_model_sees_keeps_unit_a_plain_string() -> None:
+    """`str | None` would add an anyOf branch, and this schema has no headroom.
+
+    A previous attempt to add optional fields was rejected outright by the API
+    with ``400 Schema is too complex``.
+    """
+    schema = InvoiceExtraction.model_json_schema()
+    unit = schema["$defs"]["LineItem"]["properties"]["unit"]
+    assert unit["type"] == "string"
+    assert "anyOf" not in unit
+
+
+# --- the schema the model is actually given ---------------------------------
+#
+# Structured outputs enforces a complexity budget that nothing local predicts.
+# A change that made this schema *smaller* by every count available here - 76
+# nodes against 104, 7204 bytes against 7223, the same 19 properties - was still
+# refused with `400 Schema is too complex`, and cost a live call to discover.
+# These pin the shape that is known to be accepted.
+
+SCHEMA = InvoiceExtraction.model_json_schema()
+
+JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "items",
+        "anyOf",
+        "allOf",
+        "oneOf",
+        "$ref",
+        "$defs",
+        "enum",
+        "const",
+        "default",
+        "description",
+        "title",
+        "format",
+        "pattern",
+        "additionalProperties",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "discriminator",
+    }
+)
+
+
+def _keys(node: object) -> set[str]:
+    """Every key appearing anywhere in the schema."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        mapping = cast("dict[str, Any]", node)
+        found |= set(mapping)
+        for value in mapping.values():
+            found |= _keys(value)
+    elif isinstance(node, list):
+        for item in cast("list[Any]", node):
+            found |= _keys(item)
+    return found
+
+
+def test_the_schema_declares_no_keyword_json_schema_does_not_have() -> None:
+    """`decimal_places` and `max_digits` are pydantic's, not JSON Schema's.
+
+    A `BeforeValidator` on a money annotation makes pydantic emit them as raw
+    keywords, and the API refuses the whole schema. This is the assertion that
+    would have caught it - the coercion belongs in a model-level validator,
+    where it changes no annotation and therefore no schema.
+    """
+    stray = _keys(SCHEMA) - JSON_SCHEMA_KEYWORDS - set(SCHEMA.get("properties", {}))
+    stray -= set(SCHEMA.get("$defs", {}))
+    for definition in SCHEMA.get("$defs", {}).values():
+        stray -= set(cast("dict[str, Any]", definition).get("properties", {}))
+    assert stray == set(), f"schema carries non-JSON-Schema keywords: {sorted(stray)}"
+
+
+def test_the_property_count_stays_inside_the_budget() -> None:
+    """19 is verified accepted. 20 was rejected at fewer bytes than 17 passed at.
+
+    The limit is a property count, not a byte count, and it is not documented.
+    Probe it against the live API before raising this.
+    """
+    assert len(SCHEMA["properties"]) <= 19

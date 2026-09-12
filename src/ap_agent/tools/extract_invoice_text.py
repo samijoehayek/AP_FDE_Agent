@@ -48,6 +48,19 @@ SIDE_EFFECTS: tuple[SideEffect, ...] = (SideEffect.MODEL_CALL, SideEffect.LOCAL_
 REQUIRES_IDEMPOTENCY_KEY = False
 
 PROMPT_VERSION: Final = "extract_text_v1"
+"""The version this tool shipped with. The floor, not the default.
+
+Which prompt runs comes from ``Settings.text_extraction_prompt_version``; every
+older file stays on disk so a past extraction stays explainable under the prompt
+that produced it.
+"""
+
+
+def default_prompt_version() -> str:
+    """The prompt version configured for this seat, resolved at call time."""
+    return get_settings().text_extraction_prompt_version
+
+
 """Distinct from the vision prompt, and recorded on every result."""
 
 DEFAULT_MAX_TOKENS: Final = 16000
@@ -63,7 +76,7 @@ class ExtractInvoiceTextInput(ToolInput):
         default=None,
         description="Overrides Settings.text_extraction_model. Recorded on the result either way.",
     )
-    prompt_version: str = Field(default=PROMPT_VERSION, min_length=1, max_length=32)
+    prompt_version: str = Field(default_factory=default_prompt_version, min_length=1, max_length=32)
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1024, le=64000)
 
 
@@ -91,6 +104,13 @@ class ExtractInvoiceTextOutput(ToolOutput):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int | None = Field(default=None, ge=0)
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many times the client retried before this answer. Surfaced on the "
+        "audit row: a call that took three attempts cost three attempts, and a "
+        "trail that hides that understates both latency and spend.",
+    )
 
 
 ExtractTextOutput = ExtractInvoiceTextOutput
@@ -219,6 +239,7 @@ __all__ = [
     "ExtractInvoiceTextOutput",
     "ExtractTextOutput",
     "UnsupportedDocumentError",
+    "default_prompt_version",
     "extract_invoice_text",
     "read_text_layer",
 ]

@@ -52,6 +52,22 @@ class Settings(BaseSettings):
         description="The second reading, from the PDF text layer. A different and cheaper model "
         "on purpose: two reads only disagree usefully if they can fail differently.",
     )
+    extraction_prompt_version: str = Field(
+        default="extract_v2",
+        description="Selects prompts/<version>.md for the vision seat, and is recorded on every "
+        "result and audit row. A prompt change is a new file and a new version, never an "
+        "edit in place - an extraction from last month has to stay explainable under the "
+        "prompt that produced it.",
+    )
+    text_extraction_prompt_version: str = Field(
+        default="extract_text_v2",
+        description="The same, for the text seat.",
+    )
+    model_pricing_path: Path = Field(
+        default=REPO_ROOT / "config" / "model_pricing.yaml",
+        description="Per-model token prices, versioned. What an audit row's cost_usd was "
+        "computed from, so a cost can be re-explained after list prices change.",
+    )
     reasoning_model: str = Field(
         default="claude-opus-5",
         description="Model id for the exception-explanation seat.",
@@ -71,6 +87,19 @@ class Settings(BaseSettings):
     data_dir: Path = Field(
         default=REPO_ROOT / "data",
         description="Root of the git-ignored corpus tree. Never committed.",
+    )
+    receipts_path: Path = Field(
+        default=REPO_ROOT / "data" / "generated" / "receipts.json",
+        description="Goods receipts, the third leg of the three-way match. Owned by ap-agent "
+        "because QuickBooks Online has no goods-receipt entity at all. A setting "
+        "rather than a literal so a run can be replayed against the receipts as "
+        "they stood at the time.",
+    )
+    vendor_master_path: Path = Field(
+        default=REPO_ROOT / "config" / "sandbox_vendor_master.yaml",
+        description="The one definition of a vendor. Committed and versioned, unlike the "
+        "corpus, because who a supplier is and what country they are in is a "
+        "reviewable decision.",
     )
 
     # --- ERP (QuickBooks Online sandbox) ---------------------------------

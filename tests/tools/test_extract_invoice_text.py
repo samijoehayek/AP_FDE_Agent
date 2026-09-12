@@ -20,8 +20,8 @@ import pytest
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.errors import ExtractionError
 from ap_agent.tools.extract_invoice_text import (
-    PROMPT_VERSION,
     ExtractInvoiceTextInput,
+    default_prompt_version,
     extract_invoice_text,
     read_text_layer,
 )
@@ -104,7 +104,7 @@ def test_the_document_text_is_the_user_turn_and_nothing_else(
 
 def test_only_the_prompt_instructs(run_extract: tuple[dict[str, Any], Any]) -> None:
     request, _ = run_extract
-    assert request["system"] == load_prompt(PROMPT_VERSION)
+    assert request["system"] == load_prompt(default_prompt_version())
 
 
 def test_the_response_is_constrained_to_the_contract(
@@ -124,12 +124,12 @@ def test_the_text_prompt_is_not_the_vision_prompt() -> None:
     A text layer has no reliable layout, so the vision prompt's advice about
     reading columns and totals blocks would be actively wrong here.
     """
-    assert load_prompt(PROMPT_VERSION) != load_prompt("extract_v1")
+    assert load_prompt(default_prompt_version()) != load_prompt("extract_v1")
 
 
 def test_the_prompt_forbids_resolving_an_ambiguous_date() -> None:
     """The model must not guess what the confidence check is built to decide."""
-    assert "ambiguous" in load_prompt(PROMPT_VERSION).lower()
+    assert "ambiguous" in load_prompt(default_prompt_version()).lower()
 
 
 # --- no text layer, no second reading ---------------------------------------
@@ -208,7 +208,7 @@ def test_the_run_records_what_read_it(run_extract: tuple[dict[str, Any], Any]) -
     """
     _, result = run_extract
     assert result.model_id == "claude-haiku-4-5-20251001"
-    assert result.prompt_version == PROMPT_VERSION
+    assert result.prompt_version == default_prompt_version()
     assert result.input_tokens == 1211
     assert result.output_tokens == 402
     assert result.latency_ms is not None

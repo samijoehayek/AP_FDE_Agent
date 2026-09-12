@@ -26,6 +26,7 @@ from ap_agent.tools.compute_extraction_confidence import (
     compute_extraction_confidence,
     find_raw_date,
     name_similarity,
+    parse_raw_date,
 )
 
 # --- fixtures ---------------------------------------------------------------
@@ -475,3 +476,60 @@ def test_an_iso_date_needs_no_locale_to_pass() -> None:
     raw = RAW_51109305.replace("09/03/2024", "2024-03-09")
     result = check(extraction(invoice_date=date(2024, 3, 9)), raw_text=raw, vendor_country=None)
     assert result.auto_ok is True
+
+
+# --- dates printed with a spelled-out month ---------------------------------
+#
+# Found by the generated fixture: every clean invoice it renders was escalated
+# for a date plainly printed on the page. A named month is the *unambiguous*
+# way to write a date, so a check that could not ground one was escalating the
+# documents it should have trusted most.
+
+
+@pytest.mark.parametrize(
+    ("rendering", "expected"),
+    [
+        ("09 Mar 2024", date(2024, 3, 9)),
+        ("30 Jul 2026", date(2026, 7, 30)),
+        ("1 September 2025", date(2025, 9, 1)),
+        ("09 Mar. 2024", date(2024, 3, 9)),
+        ("Mar 9, 2024", date(2024, 3, 9)),
+        ("March 9 2024", date(2024, 3, 9)),
+        ("Sept 1, 2025", date(2025, 9, 1)),
+    ],
+)
+def test_a_named_month_parses_in_either_order(rendering: str, expected: date) -> None:
+    parsed = parse_raw_date(rendering)
+    assert parsed is not None
+    assert parsed.resolve(day_first=True) == expected
+
+
+def test_a_named_month_is_never_ambiguous() -> None:
+    """No locale rule applies: "09 Mar 2024" reads the same in every country."""
+    parsed = parse_raw_date("09 Mar 2024")
+    assert parsed is not None
+    assert parsed.is_ambiguous is False
+
+
+def test_a_named_month_reads_the_same_whichever_locale_asks() -> None:
+    """The property that makes it unambiguous, asserted rather than assumed."""
+    parsed = parse_raw_date("09 Mar 2024")
+    assert parsed is not None
+    assert parsed.resolve(day_first=True) == parsed.resolve(day_first=False)
+
+
+def test_a_named_month_date_grounds() -> None:
+    """The regression this fix exists for."""
+    assert find_raw_date("Invoice Date: 30 Jul 2026", date(2026, 7, 30)) is not None
+
+
+def test_a_word_that_is_not_a_month_is_not_a_date() -> None:
+    """Otherwise "Suite 300, Denver 80216" would parse as something."""
+    assert parse_raw_date("Floor 6 Building 2026") is None
+
+
+def test_a_slash_date_is_still_ambiguous() -> None:
+    """The fix must not quietly settle the case the whole check exists for."""
+    parsed = parse_raw_date("09/03/2024")
+    assert parsed is not None
+    assert parsed.is_ambiguous is True

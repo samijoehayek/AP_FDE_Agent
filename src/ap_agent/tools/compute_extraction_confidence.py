@@ -33,14 +33,19 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Final
 
 from pydantic import Field
 
-from ap_agent.contracts.common import Confidence, StrictModel
+from ap_agent.contracts.common import (
+    AmbiguousNumber,
+    Confidence,
+    StrictModel,
+    normalise_decimal_text,
+)
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.tools.base import SideEffect, ToolCaller, ToolInput, ToolOutput
 
@@ -163,10 +168,41 @@ _YEAR_FIRST_PATTERN: Final = re.compile(r"\b(\d{4})([/.\-])(\d{1,2})\2(\d{1,2})\
 Text layers are full of these and the day-month pattern does not match one, so
 without this every ISO date would come back ungrounded and be escalated.
 """
-_THOUSANDS = re.compile("(?<=\\d)[,\\s\\u00a0\\u202f](?=\\d)")
-"""Digit-group separators: comma, any space, and the two the typography of
-invoices actually uses - non-breaking and narrow no-break space."""
 
+MONTH_NAMES: Final[dict[str, int]] = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+"""Month names and the abbreviations invoices actually print."""
+
+_DAY_MONTH_NAME_PATTERN: Final = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})\b")
+"""``09 Mar 2024`` - a named month, so nothing can be reordered."""
+
+_MONTH_NAME_DAY_PATTERN: Final = re.compile(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})\b")
+"""``Mar 9, 2024`` - the same date the other way round, equally unambiguous.
+
+Both patterns exist because a named month is the *unambiguous* way to print a
+date, which is exactly why a generated fixture uses one - and a check that could
+not ground the unambiguous rendering would escalate every clean document for a
+date that is plainly on the page.
+"""
 _NAME_NOISE = re.compile(r"[^a-z0-9 ]+")
 
 MAX_MONTH: Final = 12
@@ -278,15 +314,41 @@ class ComputeExtractionConfidenceOutput(ToolOutput):
 
 
 def _as_number(value: object) -> Decimal | None:
-    """Parse a value as a number, ignoring separators. None if it is not one."""
+    """Parse a value as a number, whatever grouping it was printed with.
+
+    Delegates to the contract's own normaliser rather than keeping a second copy
+    of the rule. Two implementations of "what does this comma mean" would agree
+    until one was edited, and then they would disagree about money.
+
+    Returns None where the contract refuses, because this is a *scoring*
+    function: an unreadable value scores as ungrounded and the field goes to a
+    person, which is the same destination the contract's refusal reaches by a
+    different road.
+    """
     if isinstance(value, Decimal):
         return value
     if not isinstance(value, str):
         return None
     try:
-        return Decimal(_THOUSANDS.sub("", value.strip()))
-    except InvalidOperation:
+        return normalise_decimal_text(value)
+    except AmbiguousNumber:
         return None
+
+
+_DIGIT_GROUPING = re.compile(r"(?<=\d)[,\u0020\u00a0\u202f\u2009](?=\d)")
+"""Separators *between digits*, for searching text rather than parsing a value.
+
+Distinct from :func:`normalise_decimal_text`, and deliberately so: that function
+refuses when a rendering is ambiguous, which is right when the answer becomes a
+number someone pays. This one only has to make two strings comparable, so it
+strips and moves on. Note it leaves ``.`` alone - removing it would make
+``1.234`` and ``1234`` look alike in a body of text.
+"""
+
+
+def _degrouped(text: str) -> str:
+    """Text with digit-group separators removed, for substring comparison."""
+    return _DIGIT_GROUPING.sub("", text)
 
 
 def _normalise_name(value: str) -> str:
@@ -317,8 +379,8 @@ def _grounded_number(value: Decimal, raw_text: str) -> bool:
     removed. Stripping them handles Western and Indian grouping alike without
     the check having to know which one the document used.
     """
-    stripped_text = _THOUSANDS.sub("", raw_text)
-    plain = _THOUSANDS.sub("", str(value))
+    stripped_text = _degrouped(raw_text)
+    plain = _degrouped(str(value))
     renderings = {plain, str(value)}
 
     normalised = value.normalize()
@@ -353,10 +415,17 @@ class RawDate(StrictModel):
     year_first: bool = False
     """True for ``2024-03-09``, where the leading year fixes the rest of the order."""
 
+    month_named: bool = False
+    """True for ``09 Mar 2024``. ``first`` is the day and ``second`` the month.
+
+    A spelled-out month cannot be read two ways, so no locale rule applies and
+    ``day_first`` is ignored when resolving.
+    """
+
     @property
     def is_ambiguous(self) -> bool:
         """True when either component could be the month and nothing settles which."""
-        if self.year_first:
+        if self.year_first or self.month_named:
             return False
         return (
             self.separator in AMBIGUOUS_SEPARATORS
@@ -368,6 +437,8 @@ class RawDate(StrictModel):
         """Return the date under the chosen reading order, or None if impossible."""
         if self.year_first:
             month, day = self.first, self.second
+        elif self.month_named:
+            day, month = self.first, self.second
         else:
             day, month = (self.first, self.second) if day_first else (self.second, self.first)
         year = self.year + 2000 if self.year < 100 else self.year  # noqa: PLR2004
@@ -392,9 +463,46 @@ def find_raw_date(raw_text: str, extracted: date) -> RawDate | None:
     return None
 
 
+def _named_month_candidates(raw_text: str) -> list[RawDate]:
+    """Every date printed with a spelled-out month, in either order."""
+    found: list[RawDate] = []
+    for match in _DAY_MONTH_NAME_PATTERN.finditer(raw_text):
+        month = MONTH_NAMES.get(match.group(2).casefold())
+        if month is not None:
+            found.append(
+                RawDate(
+                    text=match.group(0),
+                    first=int(match.group(1)),
+                    second=month,
+                    year=int(match.group(3)),
+                    # Empty rather than a space: StrictModel strips whitespace,
+                    # and is_ambiguous never reads it on a named-month date.
+                    separator="",
+                    month_named=True,
+                )
+            )
+    for match in _MONTH_NAME_DAY_PATTERN.finditer(raw_text):
+        month = MONTH_NAMES.get(match.group(1).casefold())
+        if month is not None:
+            found.append(
+                RawDate(
+                    text=match.group(0),
+                    first=int(match.group(2)),
+                    second=month,
+                    year=int(match.group(3)),
+                    # Empty rather than a space: StrictModel strips whitespace,
+                    # and is_ambiguous never reads it on a named-month date.
+                    separator="",
+                    month_named=True,
+                )
+            )
+    return found
+
+
 def _candidates(raw_text: str) -> list[RawDate]:
-    """Every date-shaped run in the text, in both renderings."""
-    found = [
+    """Every date-shaped run in the text, in every rendering."""
+    found = _named_month_candidates(raw_text)
+    found.extend(
         RawDate(
             text=match.group(0),
             first=int(match.group(3)),
@@ -404,7 +512,7 @@ def _candidates(raw_text: str) -> list[RawDate]:
             year_first=True,
         )
         for match in _YEAR_FIRST_PATTERN.finditer(raw_text)
-    ]
+    )
     consumed = {candidate.text for candidate in found}
     found.extend(
         RawDate(
@@ -716,6 +824,7 @@ __all__ = [
     "DAY_FIRST_COUNTRIES",
     "LOAD_BEARING_FIELDS",
     "MIN_SHARPNESS",
+    "MONTH_NAMES",
     "NAME_SIMILARITY_THRESHOLD",
     "RESOLVED_DATE_REASON",
     "ComputeExtractionConfidenceInput",

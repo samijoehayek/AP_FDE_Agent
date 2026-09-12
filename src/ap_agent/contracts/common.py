@@ -14,6 +14,7 @@ a vendor problem rather than a type problem.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Annotated, Any, Final, cast
 
@@ -122,6 +123,250 @@ _PRICE_EXPONENT: Final = Decimal("0.000001")
 _RATE_EXPONENT: Final = Decimal("0.00001")
 
 
+# ---------------------------------------------------------------------------
+# reading a number off a document
+# ---------------------------------------------------------------------------
+
+_CURRENCY_SYMBOLS: Final = "$€£₹¥₩₪₫₦₱฿"
+"""Symbols a document may print against an amount. Stripped, never interpreted.
+
+The currency a number is *in* is a separate field with its own allowlist. A
+symbol next to the digits is typography.
+"""
+
+_GROUPING_SPACES: Final = "\u0020\u00a0\u202f\u2009\t"
+"""Space characters invoice typography uses to group digits: ordinary,
+non-breaking, narrow no-break, thin, and tab."""
+
+_STRIPPABLE: Final = re.compile(f"[{re.escape(_CURRENCY_SYMBOLS + _GROUPING_SPACES)}]")
+
+_DECIMAL_SHAPED: Final = re.compile(r"^[+-]?\d+(\.\d+)?$")
+
+GROUP_DIGITS: Final = 3
+"""Digits in a thousands group."""
+
+LAKH_DIGITS: Final = 2
+"""Digits in an Indian lakh group: ``1,67,560`` is one hundred and sixty-seven thousand."""
+
+_BOTH_SEPARATORS: Final = 2
+"""Both ``,`` and ``.`` present, which fixes which one is the decimal mark."""
+
+
+class AmbiguousNumber(ValueError):  # noqa: N818 - it is a ValueError, not an app error
+    """A printed number that could be read two ways, and nothing settles which.
+
+    Raised rather than guessed at. ``1,234`` is one thousand two hundred and
+    thirty-four to a US reader and one point two three four to a German one, and
+    a system that picks silently is wrong by a factor of a thousand on an
+    invoice it will then pay. A refusal routes to a person; a guess does not.
+    """
+
+
+def normalise_decimal_text(text: str) -> Decimal:
+    """Read a number as a document printed it, or refuse to.
+
+    **The rule, in one sentence: refuse only when the string has more than one
+    possible reading.**
+
+    Documents group digits and place the decimal mark by local convention, and a
+    model transcribing "what is printed" reports exactly that. This is the one
+    place that turns those renderings into a number - the grounding check in
+    ``compute_extraction_confidence`` calls it too, because two implementations
+    would disagree the first time either was edited, and they would disagree
+    about money.
+
+    Everything follows from counting readings:
+
+    * **Both ``,`` and ``.`` appear.** Whichever comes last is the decimal mark
+      and the other is grouping; nothing else is possible. ``272,100.00`` and
+      ``1.234,56`` are each one reading.
+    * **One separator kind, appearing more than once.** There cannot be two
+      decimal marks, so every one of them is grouping. ``1,234,567`` and
+      ``1.234.567`` are each one reading, and both resolve.
+    * **One separator, once.** Now it depends on the tail. A three-digit tail
+      could be a thousands group *or* a fraction, so ``1,234`` and ``1.234`` are
+      two readings and refuse. Any other tail cannot be a group, so ``1,23``
+      (1.23) and ``9.250000`` are one reading and resolve.
+    * **Grouping that is not well formed is not a reading at all.** ``1.2.3``
+      has no valid group shape and no decimal interpretation left, so it
+      refuses as malformed rather than as ambiguous.
+
+    This supersedes an earlier, blunter rule that refused a lone comma outright
+    - which sent ``1,23`` to a person even though 1.23 is the only thing it can
+    mean. Refusing a string that has exactly one reading buys no safety and
+    costs a review.
+
+    The refusals that remain are the ones worth having. ``1,234`` is one
+    thousand two hundred and thirty-four to one reader and one point two three
+    four to another: a factor of a thousand on an invoice this system would then
+    pay, with nothing downstream able to tell. A refusal costs one trip to a
+    person.
+
+    Args:
+        text: The number as printed.
+
+    Returns:
+        The value, with grouping removed and ``.`` as the decimal mark.
+
+    Raises:
+        AmbiguousNumber: The rendering has more than one reading, has none, or
+            is not a number at all.
+    """
+    had_grouping_space = any(char in _GROUPING_SPACES for char in text.strip())
+    cleaned = _STRIPPABLE.sub("", text).strip()
+    if not cleaned:
+        msg = f"not a number: {text!r}"
+        raise AmbiguousNumber(msg)
+
+    kinds = {char for char in cleaned if char in ",."}
+
+    if len(kinds) == _BOTH_SEPARATORS:
+        cleaned = _resolve_both_separators(text, cleaned)
+    elif len(kinds) == 1:
+        cleaned = _resolve_single_separator(text, cleaned, kinds.pop(), spaced=had_grouping_space)
+
+    if not _DECIMAL_SHAPED.match(cleaned):
+        msg = f"not a number: {text!r}"
+        raise AmbiguousNumber(msg)
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation as exc:  # pragma: no cover - shape check already passed
+        msg = f"not a number: {text!r}"
+        raise AmbiguousNumber(msg) from exc
+
+
+def is_well_formed_grouping(digits: str, mark: str) -> bool:
+    """Whether ``digits`` is a plausible grouped integer under ``mark``.
+
+    Two conventions are accepted, because invoices in this corpus use both:
+
+    * **Western.** Every group after the first is exactly three digits, and the
+      first is one to three. ``1,234,567``.
+    * **Indian lakh.** The last group is three digits and every group before it
+      except the first is two. ``1,67,560``.
+
+    Anything else is not grouping - which does not by itself mean the string is
+    wrong, only that this reading of it is unavailable.
+    """
+    groups = digits.split(mark)
+    if len(groups) < _BOTH_SEPARATORS or not all(group.isdigit() for group in groups):
+        return False
+    first, rest = groups[0], groups[1:]
+    if not 1 <= len(first) <= GROUP_DIGITS:
+        return False
+    if all(len(group) == GROUP_DIGITS for group in rest):
+        return True
+    # Lakh: the final group is a thousand, everything between is a pair.
+    return (
+        len(first) <= LAKH_DIGITS
+        and len(rest[-1]) == GROUP_DIGITS
+        and all(len(group) == LAKH_DIGITS for group in rest[:-1])
+    )
+
+
+def _resolve_both_separators(original: str, cleaned: str) -> str:
+    """One reading by construction: the later mark is the decimal point.
+
+    The grouping is still checked. ``1,23,4.56`` names a decimal mark
+    unambiguously and then groups the rest in a way no convention produces,
+    which makes it malformed rather than ambiguous - and a malformed number is
+    not one to guess at either.
+    """
+    decimal_mark = max(",.", key=cleaned.rfind)
+    grouping = "." if decimal_mark == "," else ","
+    integer_part = cleaned.rsplit(decimal_mark, maxsplit=1)[0].lstrip("+-")
+
+    if not is_well_formed_grouping(integer_part, grouping):
+        msg = f"{original!r} groups its digits in a way no convention produces"
+        raise AmbiguousNumber(msg)
+    return cleaned.replace(grouping, "").replace(decimal_mark, ".")
+
+
+def _resolve_single_separator(original: str, cleaned: str, mark: str, *, spaced: bool) -> str:
+    """Decide what one kind of separator means, by counting the readings.
+
+    Split out because this is the whole of the judgement and deserves to be read
+    on its own.
+    """
+    occurrences = cleaned.count(mark)
+    body = cleaned.lstrip("+-")
+
+    # Spaces did the grouping, so whatever is left marks the decimal.
+    if spaced:
+        if occurrences == 1:
+            return cleaned.replace(mark, ".")
+        msg = f"grouped with spaces and {occurrences} {mark!r} separators: {original!r}"
+        raise AmbiguousNumber(msg)
+
+    # More than one of a kind: there cannot be two decimal marks, so every one
+    # of them is grouping. One reading - if the grouping is well formed.
+    if occurrences > 1:
+        if is_well_formed_grouping(body, mark):
+            return cleaned.replace(mark, "")
+        msg = f"{original!r} groups its digits in a way no convention produces"
+        raise AmbiguousNumber(msg)
+
+    # Exactly one. A three-digit tail is both a thousands group and a fraction;
+    # any other tail can only be a fraction.
+    if is_well_formed_grouping(body, mark):
+        msg = (
+            f"{original!r} could be grouping or a decimal mark. "
+            f"Print it as a plain decimal, or send it to a person."
+        )
+        raise AmbiguousNumber(msg)
+    # A comma here is the decimal mark, so it has to become a point before
+    # Decimal sees it. Forgetting that turned every resolvable European number
+    # into a parse failure that looked like a refusal.
+    return cleaned.replace(mark, ".")
+
+
+def coerce_printed_numbers(payload: object, fields: tuple[str, ...]) -> object:
+    """Normalise the named fields of a raw payload, before any of it validates.
+
+    Called from a ``mode="before"`` model validator on the contracts that read
+    document content, and **deliberately not** attached to the ``Money``,
+    ``UnitPrice`` or ``Quantity`` annotations themselves.
+
+    Attaching it to the annotations is the obvious design and it breaks the
+    system. A ``BeforeValidator`` makes pydantic widen the field's JSON schema
+    and emit ``decimal_places`` and ``max_digits`` as raw keywords - which are
+    not JSON Schema - and the live API rejects the resulting
+    ``InvoiceExtraction`` schema outright with ``400 Schema is too complex``.
+    That was measured, not guessed: the schema came out *smaller* by every count
+    available here (76 nodes against 104, 7204 bytes against 7223, the same 19
+    properties) and was still refused. Anything that changes the schema the
+    model is given has to be probed against the API, because nothing local
+    predicts it.
+
+    Scoping it here is also the more honest boundary. A grouped thousands
+    separator is a thing a *document* does. An internal contract assembling a
+    ``Money`` from code has no business accepting ``"1,234.56"``, and now it
+    does not.
+
+    Args:
+        payload: Whatever was handed to the model. Anything that is not a
+            mapping is returned untouched, so pydantic reports the real error.
+        fields: The keys to normalise, if present and if they are strings.
+
+    Returns:
+        The payload, with those keys parsed into ``Decimal``.
+
+    Raises:
+        AmbiguousNumber: A value has more than one reading. Surfaces as a
+            validation error, which the extraction path already turns into
+            ``ExtractionError`` and routes to a person.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    data = cast("dict[str, Any]", payload)
+    updated = {
+        key: normalise_decimal_text(value)
+        for key, value in data.items()
+        if key in fields and isinstance(value, str)
+    }
+    return {**data, **updated} if updated else data
+
+
 def _canonicalise(value: Decimal, exponent: Decimal, places: int) -> Decimal:
     """Return ``value`` at exactly the scale of ``exponent``, never rounding.
 
@@ -189,6 +434,13 @@ Money = Annotated[
 
 Always exactly two decimal places once validated, whatever the document printed,
 so that equal amounts serialise identically.
+
+A string arriving here goes through :func:`normalise_decimal_text` first, because
+a model asked to transcribe what is printed returns ``"272,100.00"`` - which is
+what the page says and which ``Decimal`` will not parse. A live run lost a whole
+extraction to exactly that, and the corpus it had been passing on prints grouped
+thousands too: it had been surviving on which way each model happened to round a
+formatting decision.
 """
 
 CostUsd = Annotated[
