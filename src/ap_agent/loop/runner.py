@@ -50,12 +50,9 @@ from ap_agent.contracts.run import (
     ToolCallRecord,
 )
 from ap_agent.errors import APAgentError, IllegalTransition
+from ap_agent.guardrails.config import load_guardrails
 from ap_agent.logging import get_logger
-from ap_agent.loop.dates import (
-    MAX_INVOICE_AGE_DAYS,
-    resolve_date_by_locale,
-    resolve_date_by_receipt_window,
-)
+from ap_agent.loop.dates import resolve_date_by_locale, resolve_date_by_receipt_window
 from ap_agent.pricing import UNKNOWN_PRICING_VERSION, cost_usd, pricing_version
 from ap_agent.states.machine import InvoiceEvent, InvoiceState, is_terminal, transition
 from ap_agent.tools.compute_extraction_confidence import (
@@ -316,6 +313,16 @@ class StepTrail:
         )
 
 
+def invoice_max_age_days() -> int:
+    """How old an invoice may be, from the versioned guardrails config.
+
+    Read here rather than held as a constant, so the number a run applied is the
+    one named by the ``config_version`` its audit rows carry. A module constant
+    would be a policy value that no trail could account for.
+    """
+    return load_guardrails().tolerances.invoice_max_age_days
+
+
 def _pricing_version() -> str:
     """The price list's version, or a marker when it cannot be read.
 
@@ -456,7 +463,7 @@ def validate_extraction(record: InvoiceRecord, now: datetime) -> tuple[list[str]
     # it evidence.
     if record.received_at is not None:
         received = record.received_at.astimezone(UTC).date()
-        earliest = received - timedelta(days=MAX_INVOICE_AGE_DAYS)
+        earliest = received - timedelta(days=invoice_max_age_days())
         # Every candidate has to fail. While the date is open nobody has chosen
         # between the readings, so one impossible reading proves nothing - it may
         # simply be the reading that is wrong.
@@ -698,7 +705,7 @@ def _settle_by_receipt_window(record: InvoiceRecord, trail: StepTrail) -> Invoic
 
     received = record.received_at.astimezone(UTC).date()
     candidates = record.date_candidates
-    chosen = resolve_date_by_receipt_window(candidates, received)
+    chosen = resolve_date_by_receipt_window(candidates, received, invoice_max_age_days())
     if chosen is None:
         return record
 

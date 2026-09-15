@@ -215,6 +215,29 @@ whole document going through the loop could reveal.
 | **Staleness is measured against `received_at`, not the clock** | Against `now`; not checking at all | An invoice being processed late is a different fact from one that was already ancient when it arrived, and only the second is a reason to stop. Skipped entirely when no arrival date was supplied, because inventing one is the loop reading its own clock and calling it evidence. While the date is open every candidate must fail, since nobody has chosen between the readings yet |
 | **A `# TEMP STUB` edge `NON_PO → CODED`** | Leaving non-PO invoices stopped dead | Every Kaggle invoice cites no purchase order, so without it the entire real corpus stops at `NON_PO` and nothing downstream is exercisable. Listed in the stub test like every other piece of scaffolding, so removing it when GL coding lands is deliberate |
 
+## 2026-09-15 — guardrails as config
+
+| Decision | Rejected | Because |
+| --- | --- | --- |
+| **Tolerances and the approval matrix in versioned YAML, with no defaults anywhere in code** | Constants in Python; a loader that fills in a sensible value for anything the file omits | A default is the failure nobody sees. A run would name `guardrails_v1` in its audit trail while applying a number that appears nowhere in `guardrails.v1.yaml`, which makes the trail's own claim about which rules applied untrue - and that claim is the entire point of stamping a version on a `MatchResult`. Every field is required, so a gap is a startup error |
+| `config_version` must match the filename, checked mechanically | Trusting the string in the file | `config_version` is how a past decision is looked up. A file whose contents disagree with its own name turns that lookup into a guess, and renaming without editing - or editing without renaming - now fails loudly instead |
+| **`extra="forbid"` on every guardrail model** | Ignoring unknown keys | It catches the more dangerous half of a typo. `price_variance_pcnt` would otherwise leave the real field at whatever it was and be silently ignored, which is the failure mode where a tolerance is wider than anyone believes |
+| **The fixture and the config are tested against each other** | Testing each alone | `truth.json` says a 3% overcharge is an exception; the config says the band is 2%. Those are two halves of one claim, and either can be edited without reading the other. The test fails if the band moves to 5%, in the same run, rather than at whatever later point somebody notices the golden set stopped meaning anything. The freight pair does the same for the $50 rule from both sides |
+| **The prohibition list lives in code, and the YAML is asserted to agree with it** | Loading `FORBIDDEN_TOOL_NAMES` from the config file | A prohibition that could be lifted by editing a YAML file is not a prohibition. The file documents the rule so a reviewer can read it; `tests/tools/test_tool_contracts.py` is what enforces it |
+| **Percentages are percent, not fractions** (`2.0` is 2%) | Fractions, matching `TaxRate` | These are the numbers a controller reads and edits, and the report they came from writes them as percentages. A file that silently meant 200% would be an expensive way to discover a convention |
+| **`invoice_max_age_days` moves out of `loop/dates.py` into the config** | Leaving `MAX_INVOICE_AGE_DAYS` as a module constant | It is a policy value - how old an invoice may be before a person looks - and a policy value held in code appears in no audit row's `config_version`. `resolve_date_by_receipt_window` now takes it as a required argument rather than defaulting, because a window a pure function chose for itself is a decision nothing can account for |
+| **The guardrail models move to `contracts/`** | Leaving them in `guardrails/config.py` | `CLAUDE.md` says contracts live in one package and nowhere else. They were in the wrong place; `guardrails/` is now just the loader |
+| **One `FilterAction` member, `route_to_human`** | Adding `redact` | The tempting second member is the wrong one. Stripping an IBAN out of a model response destroys the evidence that somebody put one there, which is the fact a reviewer most needs |
+| **`just probe-schema`** | Trusting local measurements of schema complexity | Nothing on this side predicts the structured-output budget. On 2026-09-12 a strictly smaller schema was refused because one property left `required`, and two live runs went to finding out. This asks the only thing that can answer, for fractions of a cent |
+
+### Where this file diverges from the architecture report, and why
+
+| Value | Report | Here | Because |
+| --- | --- | --- | --- |
+| `auto_approve_max_amount` | $1,000 | **0** | Straight-through processing stays off until the golden set says what the exception rate is. Turning it on is a reviewed change with a number attached, not a threshold somebody inherited. Recorded 2026-09-09 |
+| `invoice_max_age_days` | 180 | **365** | The failure modes are not symmetric: too wide and the date rule declines and something later settles it, too narrow and it silently eliminates a candidate that was correct. Six months resolved a real `09/03/2024` to the wrong month. Recorded 2026-09-10 |
+| `rounding_tolerance_abs` | $10 total variance from PO | **$1.00** | The report's figure covers total variance after line checks; this one is only rounding, and is deliberately tight because anything larger should already have been caught on a line |
+
 ### Things that bit during the scaffold
 
 Recorded because the next person to hit them should not have to re-derive the cause.

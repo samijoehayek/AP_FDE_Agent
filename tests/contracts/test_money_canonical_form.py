@@ -16,7 +16,7 @@ import inspect
 import pkgutil
 from datetime import date
 from decimal import Decimal
-from typing import Any, cast, get_args, get_origin
+from typing import Annotated, Any, cast, get_args, get_origin
 
 import pytest
 import sqlalchemy as sa
@@ -211,16 +211,32 @@ def _contract_models() -> list[type[BaseModel]]:
     return sorted(models.values(), key=lambda m: m.__qualname__)
 
 
+def _underlying_types(annotation: Any) -> set[Any]:
+    """Every concrete type an annotation can hold, past Optional and Annotated.
+
+    A money field is allowed to be optional - an unbounded approval tier has no
+    `max_amount`, and a match that found no purchase order has no `po_total`.
+    What is not allowed is for the thing underneath to stop being a constrained
+    Decimal, so the wrappers are peeled off and the answer checked underneath.
+    """
+    origin = get_origin(annotation)
+    if origin is None:
+        return {annotation}
+    args = get_args(annotation)
+    if origin is Annotated:
+        return _underlying_types(args[0])
+    return {found for arg in args if arg is not type(None) for found in _underlying_types(arg)}
+
+
 @pytest.mark.parametrize("model", _contract_models(), ids=lambda m: m.__qualname__)
 def test_every_money_field_is_decimal_and_constrained(model: type[BaseModel]) -> None:
     """A money field that slipped in as float or bare Decimal would not canonicalise."""
     for name, field in model.model_fields.items():
         if name not in MONEY_FIELD_NAMES:
             continue
-        annotation: Any = field.annotation
-        candidates = get_args(annotation) if get_origin(annotation) else (annotation,)
+        candidates = _underlying_types(field.annotation)
         assert float not in candidates, f"{model.__qualname__}.{name} is a float"
-        assert Decimal in candidates, f"{model.__qualname__}.{name} is not a Decimal"
+        assert candidates == {Decimal}, f"{model.__qualname__}.{name} is not a Decimal"
         assert field.metadata, f"{model.__qualname__}.{name} carries no constraints"
 
 

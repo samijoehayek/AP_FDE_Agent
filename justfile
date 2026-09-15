@@ -122,6 +122,20 @@ ingest *ARGS:
 generate *ARGS:
     uv run python scripts/generate_invoices.py {{ARGS}}
 
+# Ask the API whether it still accepts the schemas a model has to fill in.
+# Spends tokens (a few hundred per schema, fractions of a cent). Run it after
+# ANY change to InvoiceExtraction or ExceptionClassification: the complexity
+# budget is undocumented and nothing measurable locally predicts it. On
+# 2026-09-12 a strictly smaller schema was refused because one property left the
+# `required` array, and two live runs went to finding that out.
+#
+#   just probe-schema
+#   just probe-schema --schema invoice
+
+# Ask the API whether it still accepts the schemas a model fills in. Spends tokens.
+probe-schema *ARGS:
+    uv run python scripts/probe_schema.py {{ARGS}}
+
 # --- docs ------------------------------------------------------------------
 
 # Regenerate the state diagram in docs/ARCHITECTURE.md from the transition table.

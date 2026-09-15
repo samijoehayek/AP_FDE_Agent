@@ -14,18 +14,12 @@ import pytest
 from ap_agent.audit.chain import ChainVerification, compute_event_hash, verify_chain
 from ap_agent.audit.writer import PostgresAuditWriter
 from ap_agent.evals.golden import GoldenCase, load_golden_set, score_extraction
-from ap_agent.guardrails.config import load_guardrails
 from ap_agent.loop.agent import run_invoice
 
 
 def test_agent_loop_is_stubbed() -> None:
     with pytest.raises(NotImplementedError):
         run_invoice("inv-1", run_id="run-1")
-
-
-def test_guardrails_loader_is_stubbed() -> None:
-    with pytest.raises(NotImplementedError):
-        load_guardrails(Path("config/guardrails.v1.yaml"))
 
 
 def test_audit_chain_is_stubbed() -> None:

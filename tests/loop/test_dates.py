@@ -13,10 +13,17 @@ from datetime import date, timedelta
 import pytest
 
 from ap_agent.loop.dates import (
-    MAX_INVOICE_AGE_DAYS,
     resolve_date_by_locale,
     resolve_date_by_receipt_window,
 )
+
+A_YEAR = 365
+"""The window these cases were written against.
+
+Passed explicitly now: the value moved into ``config/guardrails.v1.yaml``,
+because a window a pure function chose for itself would be a policy decision
+that no audit row's ``config_version`` could account for.
+"""
 
 MARCH = date(2024, 3, 9)
 SEPTEMBER = date(2024, 9, 3)
@@ -29,7 +36,7 @@ BOTH = [MARCH, SEPTEMBER]
 
 def test_a_candidate_after_the_document_arrived_is_impossible() -> None:
     """An invoice cannot be issued after it was received. That is the whole rule."""
-    assert resolve_date_by_receipt_window(BOTH, date(2024, 3, 12)) == MARCH
+    assert resolve_date_by_receipt_window(BOTH, date(2024, 3, 12), A_YEAR) == MARCH
 
 
 def test_both_candidates_can_survive() -> None:
@@ -38,26 +45,26 @@ def test_both_candidates_can_survive() -> None:
     This is the case a six-month window got wrong: it dropped March as too old
     and resolved to September, which is a date the document may well not carry.
     """
-    assert resolve_date_by_receipt_window(BOTH, date(2024, 10, 1)) is None
+    assert resolve_date_by_receipt_window(BOTH, date(2024, 10, 1), A_YEAR) is None
 
 
 def test_neither_candidate_can_survive() -> None:
     """Received before either reading. Something else is wrong; not this rule's call."""
-    assert resolve_date_by_receipt_window(BOTH, date(2024, 1, 1)) is None
+    assert resolve_date_by_receipt_window(BOTH, date(2024, 1, 1), A_YEAR) is None
 
 
 def test_an_unambiguous_date_passes_through() -> None:
-    assert resolve_date_by_receipt_window([MARCH], date(2024, 3, 12)) == MARCH
+    assert resolve_date_by_receipt_window([MARCH], date(2024, 3, 12), A_YEAR) == MARCH
 
 
 def test_no_candidates_resolves_to_nothing() -> None:
-    assert resolve_date_by_receipt_window([], date(2024, 3, 12)) is None
+    assert resolve_date_by_receipt_window([], date(2024, 3, 12), A_YEAR) is None
 
 
 def test_a_candidate_older_than_the_window_is_dropped() -> None:
     """A supplier does not invoice for work from three years ago."""
     stale = date(2021, 3, 9)
-    assert resolve_date_by_receipt_window([stale, MARCH], date(2024, 3, 12)) == MARCH
+    assert resolve_date_by_receipt_window([stale, MARCH], date(2024, 3, 12), A_YEAR) == MARCH
 
 
 def test_the_window_is_a_parameter_not_a_constant() -> None:
@@ -72,17 +79,17 @@ def test_the_window_is_a_parameter_not_a_constant() -> None:
 def test_a_candidate_exactly_on_the_boundary_survives() -> None:
     """Inclusive at both ends: an invoice issued the day it arrived is ordinary."""
     received = date(2024, 3, 12)
-    oldest = received - timedelta(days=MAX_INVOICE_AGE_DAYS)
-    assert resolve_date_by_receipt_window([received], received) == received
-    assert resolve_date_by_receipt_window([oldest], received) == oldest
-    assert resolve_date_by_receipt_window([oldest - timedelta(days=1)], received) is None
+    oldest = received - timedelta(days=A_YEAR)
+    assert resolve_date_by_receipt_window([received], received, A_YEAR) == received
+    assert resolve_date_by_receipt_window([oldest], received, A_YEAR) == oldest
+    assert resolve_date_by_receipt_window([oldest - timedelta(days=1)], received, A_YEAR) is None
 
 
 @pytest.mark.parametrize("received", [date(2024, 3, 12), date(2025, 1, 1), date(2024, 9, 4)])
 def test_the_answer_depends_only_on_the_arguments(received: date) -> None:
     """Called twice with the same inputs, twice the same answer. Replay depends on it."""
-    first = resolve_date_by_receipt_window(BOTH, received)
-    assert first == resolve_date_by_receipt_window(BOTH, received)
+    first = resolve_date_by_receipt_window(BOTH, received, A_YEAR)
+    assert first == resolve_date_by_receipt_window(BOTH, received, A_YEAR)
 
 
 # --- the vendor's locale -----------------------------------------------------

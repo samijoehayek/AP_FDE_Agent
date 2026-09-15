@@ -1,68 +1,183 @@
 # ap-agent guardrails, version 1.
 #
-# Every tolerance and every approval threshold lives here rather than in code,
-# and every MatchResult and AuditEvent records the `version` below. That is what
-# makes it possible to re-explain a decision under the rules that were actually
-# in force when it was made - so this file is never edited in place. A change
-# means a new file (guardrails.v2.yaml) and a new version string.
+# Every tolerance and every approval threshold lives here rather than in code.
+# The audit question this exists to answer is "why was this auto-approved", and
+# the answer has to be "rule set guardrails_v1, as it read on that date" - so
+# this file is never edited in place. A change means a new file
+# (guardrails.v2.yaml), a new `config_version`, and both remaining resolvable,
+# because a decision made last quarter must stay re-explainable under last
+# quarter's rules.
 #
-# PLACEHOLDER VALUES. These are shaped correctly but not calibrated. Calibration
-# comes from the golden set, not from a guess in a scaffold.
+# `compute_match` takes this as an argument and stamps `config_version` on every
+# `MatchResult`. Nothing here is a default: the loader has no fallbacks, so a
+# value missing from this file is a startup error rather than a silently
+# different answer.
+#
+# Values come from the guardrail section of the architecture report unless noted.
+# Three deliberately diverge, each with a recorded decision in DECISIONS.md:
+# auto_approve_max_amount, invoice_max_age_days, and rounding_tolerance_abs.
 
-version: "v1"
+config_version: "guardrails_v1"
 base_currency: "USD"
 
-# --- Three-way match tolerances -------------------------------------------
-# Each band passes if the variance is inside EITHER the relative or the absolute
-# bound. Neither works alone: 2% of a $12 line is noise, and $5 on a $200,000
-# line is a rounding error.
+# --- Match tolerances ------------------------------------------------------
+# Percentages are percent, not fractions: 2.0 means 2%.
 
-price_tolerance:
-  relative: 0.02        # 2% over the PO unit price
-  absolute: "5.00"      # or $5 on the line, whichever is more forgiving
+tolerances:
+  # Unit price: within ±2% AND within $50 on the line. Both must hold, so the
+  # tighter one binds - 2% of a $12 line is noise, and $50 on a $200,000 line is
+  # a rounding error. Either alone lets one of those through.
+  price_variance_pct: "2.0"
+  price_variance_abs: "50.00"
 
-quantity_tolerance:
-  relative: 0.00        # over-delivery is never silently accepted
-  absolute: "0.00"
+  # Never pay for more than arrived. Zero, and not a band: over-billing is not a
+  # measurement error, it is a claim about goods that do not exist.
+  qty_over_billing_pct: "0"
 
-totals_tolerance:
-  relative: 0.01
-  absolute: "10.00"
+  # Billing for less than arrived is the vendor's loss and nobody's exception.
+  # 100 means any shortfall passes; a partial invoice against a partial delivery
+  # is the ordinary case, not a defect.
+  qty_under_billing_pct: "100"
 
-tax_tolerance:
-  relative: 0.005
-  absolute: "1.00"
+  # Freight, handling and anything else no purchase-order line covers. Under
+  # this, it rides along; over it, a human looks. The generated fixture asserts
+  # both sides of this number: a $25 freight line passes and a $120 one does not.
+  unmatched_charge_abs: "50.00"
 
-# --- Extraction quality ----------------------------------------------------
-# Below these, an invoice goes to a human before any rule reads its numbers.
+  # A year. DIVERGES from the report's 180 days, deliberately - see DECISIONS.md
+  # 2026-09-10. The two failure modes are not symmetric: too wide and the date
+  # rule declines to choose and something later settles it, too narrow and it
+  # *silently eliminates a candidate that was correct*. Six months was the first
+  # value and it resolved a real 09/03/2024 to the wrong month.
+  invoice_max_age_days: 365
 
-min_extraction_confidence: 0.85
-min_page_sharpness: 120.0   # Laplacian variance; calibrate against data/index.csv
+  # Tax computed against the line rates, absolute only: a percentage band on tax
+  # is a percentage of a percentage and stops meaning anything.
+  tax_variance_abs: "1.00"
 
-# --- Duplicate detection ---------------------------------------------------
-duplicate_score_threshold: 0.90
-duplicate_date_window_days: 90
+  # What is left after every line-level check has passed - rounding, and nothing
+  # else. DIVERGES from the report's $10 total-variance figure, which was doing
+  # a different job: this one is deliberately tight because anything larger than
+  # rounding should already have been caught on a line.
+  rounding_tolerance_abs: "1.00"
 
-# --- Approval --------------------------------------------------------------
-# Straight-through processing is OFF. Turning it on is a deliberate, reviewed
-# change with a golden-set number attached to it - not a default.
-auto_approve_max_amount: "0.00"
+# --- Approval matrix -------------------------------------------------------
 
 approval_matrix:
-  - max_amount: "1000.00"
-    approver_role: "ap_clerk"
-    requires_second_approver: false
-    applies_to_reason_codes: []
-  - max_amount: "25000.00"
-    approver_role: "controller"
-    requires_second_approver: false
-    applies_to_reason_codes: []
-  - max_amount: null            # unbounded
-    approver_role: "cfo"
-    requires_second_approver: true
-    applies_to_reason_codes: []
+  # Straight-through processing is OFF. The report suggests $1,000 as an
+  # auto-approve floor; this is 0 until the golden set says what the exception
+  # rate actually is. Turning it on is a reviewed change with a number attached,
+  # not a default somebody inherited. See DECISIONS.md 2026-09-09.
+  auto_approve_max_amount: "0.00"
 
-# --- Hard stops ------------------------------------------------------------
-# Not tolerances. These do not have a band, and a model cannot argue with them.
-new_vendor_requires_external_verification: true
-block_on_bank_details_mismatch: true
+  # Bands by invoice total, smallest first. `max_amount: null` is the unbounded
+  # top band. These apply when nothing in `rules` below overrides them.
+  tiers:
+    - max_amount: "1000.00"
+      approver_role: "ap_clerk"
+      approvers_required: 1
+    - max_amount: "10000.00"
+      approver_role: "controller"
+      approvers_required: 1
+    - max_amount: null
+      approver_role: "owner"
+      approvers_required: 2
+
+  # Conditions that decide approval regardless of amount. `overrides_tiers: true`
+  # means the amount band does not get to lower the requirement - a $40 invoice
+  # from a vendor nobody has onboarded still needs two people.
+  rules:
+    - name: "new_vendor"
+      when: "the vendor did not resolve against the vendor master"
+      approvers_required: 2
+      overrides_tiers: true
+      hold_for_callback: false
+
+    - name: "first_invoice_from_vendor"
+      when: "the vendor resolved, but this is the first invoice ever seen from it"
+      approvers_required: 2
+      overrides_tiers: true
+      hold_for_callback: false
+
+    - name: "remit_to_mismatch"
+      when: "the remit-to block on the document disagrees with the vendor master"
+      approvers_required: 2
+      overrides_tiers: true
+      # The number-one AP fraud vector is a "vendor" asking to change bank
+      # details. Verification is a phone call to a number already on file,
+      # never one printed on the document.
+      hold_for_callback: true
+
+    - name: "match_exception"
+      when: "the three-way match produced any reason code"
+      approvers_required: 1
+      overrides_tiers: false
+      hold_for_callback: false
+
+# --- Input validation ------------------------------------------------------
+# Applied before any model call, so a hostile file is rejected without ever
+# being read by anything that could act on it.
+
+input_validation:
+  # A 20-page "invoice" is a statement, a contract, or an attack.
+  max_pages: 20
+  max_file_bytes: 26214400 # 25 MiB
+  allowed_mime_types:
+    - "application/pdf"
+    - "image/png"
+    - "image/jpeg"
+    - "image/tiff"
+  # Matches the contracts' own caps, so a document cannot inflate a payload
+  # past what InvoiceExtraction will hold anyway.
+  max_line_items: 500
+  max_field_length: 500
+
+# --- Output filter ---------------------------------------------------------
+# Checked on model output *before* anything downstream reads it. These are not
+# corrections: a match sends the run to a person, and nothing is rewritten.
+# Silently stripping an IBAN out of a field would destroy the evidence that
+# somebody tried.
+
+output_filter:
+  action: "route_to_human"
+  never_auto_fix: true
+  patterns:
+    - name: "iban"
+      pattern: "\\b[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}\\b"
+      why: "A payment destination has one source, the vendor master, and it is not the document."
+
+    - name: "account_number_like"
+      pattern: "\\b[0-9]{8,17}\\b"
+      why: "Bare digit runs of account length. Noisy on purpose - a false positive costs a review."
+
+    - name: "update_bank"
+      pattern: "(?i)\\b(updat|chang|amend|new)\\w*\\b[^.]{0,30}\\bbank\\b"
+      why: "The single most common AP fraud is a request to change where money goes."
+
+    - name: "change_remittance"
+      pattern: "(?i)\\b(updat|chang|amend|new)\\w*\\b[^.]{0,30}\\bremit"
+      why: "The same request in the vocabulary an invoice template would use."
+
+# --- Hard prohibitions -----------------------------------------------------
+# Not thresholds. These tools do not exist, and this section is the written
+# statement of that - `tests/tools/test_tool_contracts.py` walks the package and
+# fails if one appears.
+#
+# The authority stays `FORBIDDEN_TOOL_NAMES` in code, and this file is asserted
+# to agree with it. That direction is deliberate: a prohibition that could be
+# lifted by editing a YAML file is not a prohibition.
+
+hard_prohibitions:
+  forbidden_tool_names:
+    - "pay_bill"
+    - "update_vendor"
+    - "update_bank_details"
+    - "delete_invoice"
+    - "delete_vendor"
+  forbidden_tool_prefixes:
+    - "delete_"
+    - "pay_"
+    - "update_vendor"
+    - "update_bank"
+    - "transfer_"
+    - "wire_"

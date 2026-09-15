@@ -43,7 +43,7 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - `src/ap_agent/vendor_master.py` + `config/sandbox_vendor_master.yaml` — the vendors, in one file, read by both `seed_sandbox.py` and `generate_invoices.py`. Carries the country and the postal address, which the seed manifest does not because QuickBooks is never told them. Fails loudly on a missing vendor or a missing field. 21 tests.
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
-- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [...]`, `just ingest`, `just seed [--dry-run]`, `just generate [--only <po>] [--variants a,b,c] [--dry-run]`, `just vendor "<name>" [--tax-id X]`, `just receipts <po>`, `just po <po>`.
+- CLI: `just extract <path>`, `just run <path> [--received-at YYYY-MM-DD]`, `just confidence <path> [...]`, `just ingest`, `just seed [--dry-run]`, `just generate [--only <po>] [--variants a,b,c] [--dry-run]`, `just vendor "<name>" [--tax-id X]`, `just receipts <po>`, `just po <po>`, `just probe-schema`.
   - `just vendor` and `just receipts` read committed/local files and call nothing. **`just po` is the only one that makes a live QuickBooks call**, and it spends no tokens.
   - `--from-extraction` replays saved readings and makes **no** model calls — use it whenever the question is about the check rather than the models. `--out` writes the readings alongside the verdict so any run is replayable.
   - `run` reports `steps` (state moves) and `audit rows` separately: the extraction step is one step and four rows.
@@ -235,9 +235,28 @@ Both were found by reading the files rather than by a test failing later.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
 7. Off-keyboard: book the customer interview.
 
-## After Day 2 (report mapping)
+## Day 3 — in progress
 
-- Day 3: guardrails as versioned YAML (tolerances, approval matrix, input validation, output filter, hard prohibitions), five adversarial invoices must land in human review.
+1. **DONE.** Guardrails as versioned YAML with a typed loader.
+   - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`.
+   - `GuardrailConfig` in `contracts/guardrails.py`, frozen and `extra="forbid"`, Decimal for money. `load_guardrails(path=None)` in `guardrails/config.py`, cached per path, **no defaults anywhere** - a missing value is a startup error, and the version must match the filename.
+   - `MAX_INVOICE_AGE_DAYS` is gone from `loop/dates.py`. `resolve_date_by_receipt_window` takes the window as a required argument and the loop reads it from config, so the number a run applied is the one its `config_version` names.
+   - The config and the generated fixture are tested **against each other**: a 3% overcharge breaching a 2% band, two units over a 0% band, and $25/$120 straddling the $50 unmatched-charge rule. Neither can drift alone.
+   - `just probe-schema` added (not run): sends each exported schema with a dummy document and reports accepted or refused.
+2. **NEXT, and the owner's to write:** `compute_match`. It takes a `GuardrailConfig` and stamps `config_version` on the `MatchResult`. Everything it compares is already on the record by `DUPLICATE_CHECKED` - extraction, purchase order, receipts.
+3. Then: the five adversarial invoices must land in human review. Four of the five already exist in the generated fixture (hidden text, remit-to mismatch is the gap). Nothing evaluates the output filter yet - the patterns are configured, and the code that applies them is Day 3 step 3.
+
+### What is configured but not yet applied
+
+Worth being explicit, because a config file reads like a working control:
+
+- **`output_filter`** - patterns are declared and unit-tested against samples, but nothing in the loop runs them over model output yet.
+- **`input_validation`** - `ingest_document` enforces none of these limits; `max_pages`, `max_file_bytes` and the MIME allowlist are declared and unread.
+- **`approval_matrix`** - `request_approval` is still a stub, so no tier or rule is consulted. `PENDING_APPROVAL → APPROVED` is still the dangerous stub edge.
+- Of the tolerances, only `invoice_max_age_days` is read by anything today.
+
+## After Day 3 (report mapping)
+
 - Day 4: Postgres for state/extractions/vendor profiles/dedup/config; approval pause + resume (Pydantic AI + DBOS or LangGraph checkpointer); kill-and-resume test with exactly one bill.
 - Day 5: append-only audit table with hash chain in Postgres; OTel spans → self-hosted Langfuse; trace_id on every audit event.
 - Day 6: real invoice stream; golden set grows from human corrections.

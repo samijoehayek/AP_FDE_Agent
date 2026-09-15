@@ -5,7 +5,8 @@ confidence check refuses to guess and carries both readings forward; this module
 holds the rules that can close the question, in the order the pipeline learns
 enough to apply them.
 
-The receipt window is the first and needs nothing external. A document cannot be
+The receipt window is the first and needs nothing external except the age
+limit, which the caller passes in from the versioned guardrails config. A document cannot be
 issued after it arrived, and a supplier does not invoice for work half a decade
 old, so one candidate is often simply impossible. On the Kaggle corpus that
 settles most ambiguous dates before the vendor is even resolved.
@@ -34,30 +35,11 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import date
 
-MAX_INVOICE_AGE_DAYS = 365
-"""How far before its arrival an invoice may plausibly have been issued.
-
-A year, and deliberately generous. A narrower window resolves more dates, which
-is tempting - but the two failure modes are not symmetric. Too wide and the rule
-declines to choose, the date stays open, and the vendor's locale settles it two
-states later. Too narrow and the rule *silently picks the wrong date* by
-eliminating a candidate that was in fact correct, and nothing downstream can
-tell. Given that asymmetry the window should sit at the edge of plausibility,
-not at the middle of it.
-
-Six months was the first value here and it was wrong for exactly this reason: it
-resolved 09/03/2024 to September for anything received after early October,
-which is a real date on a real invoice and not a candidate to eliminate.
-
-A starting value either way. It belongs in the versioned guardrails config once
-that exists, not baked into a module constant.
-"""
-
 
 def resolve_date_by_receipt_window(
     candidates: Sequence[date],
     received_at: date,
-    max_age_days: int = MAX_INVOICE_AGE_DAYS,
+    max_age_days: int,
 ) -> date | None:
     """Return the only candidate that could have been received on ``received_at``.
 
@@ -69,7 +51,17 @@ def resolve_date_by_receipt_window(
             case and passes straight through when it is plausible.
         received_at: The day the document arrived, supplied by the caller. Never
             read from a clock inside this function.
-        max_age_days: How far back an invoice may plausibly be dated.
+        max_age_days: How far back an invoice may plausibly be dated. Supplied
+            by the caller from ``guardrails.tolerances.invoice_max_age_days``,
+            never defaulted here - a window this module chose for itself would
+            be a policy decision hidden in a pure function, and the value would
+            appear in no audit row's ``config_version``.
+
+            The asymmetry worth knowing before changing it: too wide and the
+            rule declines and something later settles the date; too narrow and
+            it *silently eliminates a candidate that was correct*. Six months
+            was the first value and it resolved a real 09/03/2024 to the wrong
+            month.
 
     Returns:
         The single surviving candidate, or ``None`` when none or several
@@ -109,7 +101,6 @@ def resolve_date_by_locale(raw_date_text: str | None, vendor_country: str | None
 
 
 __all__ = [
-    "MAX_INVOICE_AGE_DAYS",
     "resolve_date_by_locale",
     "resolve_date_by_receipt_window",
 ]

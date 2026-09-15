@@ -23,7 +23,7 @@ from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.errors import APAgentError
 from ap_agent.loop.dates import resolve_date_by_receipt_window
-from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext
+from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext, invoice_max_age_days
 from ap_agent.loop.runner import run as loop_run
 from ap_agent.states.machine import (
     TERMINAL_STATES,
@@ -328,7 +328,9 @@ def _print_date_note(
         )
         return
 
-    chosen = resolve_date_by_receipt_window(verdict.date_candidates, received_at)
+    chosen = resolve_date_by_receipt_window(
+        verdict.date_candidates, received_at, invoice_max_age_days()
+    )
     if chosen is None:
         typer.secho(
             f"  both readings survive a {received_at} receipt date; still open.",
