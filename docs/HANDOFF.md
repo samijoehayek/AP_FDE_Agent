@@ -51,7 +51,7 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 
 **Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`, `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order` and `get_receipts`; guardrail config loader; evals fixtures. `scripts/generate_invoices.py` is real.
 
-**Stub edges remaining (10, down from 11):** `VENDOR_RESOLVED→DUPLICATE_CHECKED` (find_duplicates), `DUPLICATE_CHECKED→MATCHED` (compute_match), `MATCHED→CODED`, `CODED→PENDING_APPROVAL`, **`PENDING_APPROVAL→APPROVED` (the dangerous one — delete it the moment `request_approval` exists)**, `APPROVED→POSTED`, `POSTED→SCHEDULED`, `SCHEDULED→PAID`, `PAID→RECONCILED`, `RECONCILED→CLOSED`. `STUB_HOOKS` is now empty: no stub step does anything.
+**Stub edges remaining (11):** `VENDOR_RESOLVED→DUPLICATE_CHECKED` (find_duplicates), `DUPLICATE_CHECKED→MATCHED` (compute_match), `NON_PO→CODED` (propose_gl_coding), `MATCHED→CODED`, `CODED→PENDING_APPROVAL`, **`PENDING_APPROVAL→APPROVED` (the dangerous one — delete it the moment `request_approval` exists)**, `APPROVED→POSTED`, `POSTED→SCHEDULED`, `SCHEDULED→PAID`, `PAID→RECONCILED`, `RECONCILED→CLOSED`. `STUB_HOOKS` is now empty: no stub step does anything.
 
 **Stub hooks: none.** `STUB_HOOKS` is an empty frozenset and a test asserts it. It held the vendor-locale date resolution for exactly as long as `lookup_vendor` was a stub; the tool owns the country now, so the hook is gone and the date is settled in the resolve-vendor step.
 
@@ -164,7 +164,7 @@ Both were found by reading the files rather than by a test failing later.
 
 1. **Kaggle invoice 51109301's vendor IS in the vendor master, so it does not reach `NEW_VENDOR`.** Every invoice in the Kaggle corpus carries `TechVision Distributors Pvt Ltd` / GSTIN `27AABCT1234F1Z5`, which is the *first record* in `config/sandbox_vendor_master.yaml` - the sandbox was seeded with names taken from that corpus. So 51109301 resolves on the tax-id tier and routes to **`NON_PO`** instead, because the Kaggle documents carry no purchase-order reference at all. `tests/loop/test_vendor_routing.py` asserts what actually happens, and a separate synthetic vendor covers the `NEW_VENDOR` path.
 
-2. **A non-PO invoice now stops at `NON_PO` rather than reaching `CLOSED`.** `propose_gl_coding` is a stub and there is no `NON_PO→CODED` stub edge, and the brief said not to add edges. This is a behaviour change for any Kaggle invoice: the run stops where the missing tool is, which is the honest place for it. Add the stub edge if you want the old end-to-end sweep back.
+2. **A non-PO invoice routes to `NON_PO`, which is a different pipeline.** It briefly stopped dead there, because `propose_gl_coding` is a stub and nothing left that state. A `# TEMP STUB` `NON_PO→CODED` edge was added on 2026-09-12 so the Kaggle corpus - which cites no purchase orders at all - can exercise the rest of the pipeline. Listed in the stub test like the rest of the scaffolding.
 
 ### One fix outside the brief's scope
 
