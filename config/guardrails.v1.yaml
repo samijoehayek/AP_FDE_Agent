@@ -14,8 +14,9 @@
 # different answer.
 #
 # Values come from the guardrail section of the architecture report unless noted.
-# Three deliberately diverge, each with a recorded decision in DECISIONS.md:
-# auto_approve_max_amount, invoice_max_age_days, and rounding_tolerance_abs.
+# Four deliberately diverge, each with a recorded decision in DECISIONS.md:
+# auto_approve_max_amount, invoice_max_age_days, rounding_tolerance_abs, and the
+# unmatched-charge rule, which is an AND here where the report writes an OR.
 
 config_version: "guardrails_v1"
 base_currency: "USD"
@@ -39,10 +40,23 @@ tolerances:
   # is the ordinary case, not a defect.
   qty_under_billing_pct: "100"
 
-  # Freight, handling and anything else no purchase-order line covers. Under
-  # this, it rides along; over it, a human looks. The generated fixture asserts
-  # both sides of this number: a $25 freight line passes and a $120 one does not.
+  # Freight, handling and anything else no purchase-order line covers. Both
+  # halves must hold, exactly like the price band: a charge rides along only if
+  # it is within $50 AND within 2% of the order's value, so the tighter one
+  # binds.
+  #
+  # DIVERGES from the report, which writes this as "≤ $50 *or* ≤ 2% of PO
+  # value". An OR is the looser reading and it is the wrong way round here: on a
+  # $650,000 order the 2% arm alone would wave through $13,000 of unexplained
+  # freight, which is precisely the charge a person should see. AND means the
+  # percentage only ever tightens the rule on small orders.
+  #
+  # The generated fixture asserts both sides: a $25 freight line passes, and a
+  # $120 one does not. Worth knowing that $120 fails on the *absolute* half on
+  # every seeded order - the percentage arm alone would pass it everywhere,
+  # which is the AND earning its place.
   unmatched_charge_abs: "50.00"
+  unmatched_charge_pct: "2.0"
 
   # A year. DIVERGES from the report's 180 days, deliberately - see DECISIONS.md
   # 2026-09-10. The two failure modes are not symmetric: too wide and the date

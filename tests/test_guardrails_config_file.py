@@ -224,6 +224,7 @@ def test_an_unknown_top_level_section_is_refused(tmp_path: Path) -> None:
         "price_variance_abs",
         "qty_over_billing_pct",
         "unmatched_charge_abs",
+        "unmatched_charge_pct",
         "invoice_max_age_days",
         "tax_variance_abs",
         "rounding_tolerance_abs",

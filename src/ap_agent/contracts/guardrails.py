@@ -65,7 +65,13 @@ class FilterAction(StrEnum):
 
 
 class Tolerances(StrictModel):
-    """How far an invoice may differ from its purchase order before a person looks."""
+    """How far an invoice may differ from its purchase order before a person looks.
+
+    Two of these come in pairs - price and unmatched charges - and in both cases
+    **both halves must hold**. Either alone lets something through: a percentage
+    band is noise on a small line and a licence on a large one, and an absolute
+    cap is the reverse.
+    """
 
     price_variance_pct: Percentage = Field(
         description="Unit price band. Holds together with price_variance_abs - both must "
@@ -84,8 +90,13 @@ class Tolerances(StrictModel):
     )
     unmatched_charge_abs: Money = Field(
         ge=0,
-        description="Freight, handling, anything no purchase-order line covers. Under this "
-        "it rides along; over it, a human looks.",
+        description="Freight, handling, anything no purchase-order line covers. Holds "
+        "together with unmatched_charge_pct - both must pass.",
+    )
+    unmatched_charge_pct: Percentage = Field(
+        description="The same charge as a share of the order's value. Both halves must "
+        "hold, so the tighter one binds: on a large order the absolute cap does the "
+        "work, and on a small one the percentage does."
     )
     invoice_max_age_days: int = Field(
         ge=1,

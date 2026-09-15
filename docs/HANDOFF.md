@@ -238,10 +238,10 @@ Both were found by reading the files rather than by a test failing later.
 ## Day 3 — in progress
 
 1. **DONE.** Guardrails as versioned YAML with a typed loader.
-   - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`.
+   - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`. The price band and the unmatched-charge rule are each a **pair that must both hold** - an absolute cap alone is a licence on a small order, a percentage alone is one on a large order.
    - `GuardrailConfig` in `contracts/guardrails.py`, frozen and `extra="forbid"`, Decimal for money. `load_guardrails(path=None)` in `guardrails/config.py`, cached per path, **no defaults anywhere** - a missing value is a startup error, and the version must match the filename.
    - `MAX_INVOICE_AGE_DAYS` is gone from `loop/dates.py`. `resolve_date_by_receipt_window` takes the window as a required argument and the loop reads it from config, so the number a run applied is the one its `config_version` names.
-   - The config and the generated fixture are tested **against each other**: a 3% overcharge breaching a 2% band, two units over a 0% band, and $25/$120 straddling the $50 unmatched-charge rule. Neither can drift alone.
+   - The config and the generated fixture are tested **against each other**: a 3% overcharge breaching a 2% band, two units over a 0% band, and $25/$120 against the $50-and-2% unmatched-charge rule. Neither can drift alone. One test records *which* half is doing the work today: $120 is caught by the absolute cap on every seeded order, and the percentage arm alone would pass it - so if a smaller order is ever seeded, that test flips and says so.
    - `just probe-schema` added (not run): sends each exported schema with a dummy document and reports accepted or refused.
 2. **NEXT, and the owner's to write:** `compute_match`. It takes a `GuardrailConfig` and stamps `config_version` on the `MatchResult`. Everything it compares is already on the record by `DUPLICATE_CHECKED` - extraction, purchase order, receipts.
 3. Then: the five adversarial invoices must land in human review. Four of the five already exist in the generated fixture (hidden text, remit-to mismatch is the gap). Nothing evaluates the output filter yet - the patterns are configured, and the code that applies them is Day 3 step 3.
