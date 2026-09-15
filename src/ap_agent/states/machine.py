@@ -178,8 +178,6 @@ TRANSITIONS.update({(state, _E.CANCEL): _S.CANCELLED for state in _CANCELLABLE})
 STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     # TEMP STUB: duplicate detection is not implemented (find_duplicates).
     (_S.VENDOR_RESOLVED, _E.STUB_OK): _S.DUPLICATE_CHECKED,
-    # TEMP STUB: three-way matching is not implemented (compute_match).
-    (_S.DUPLICATE_CHECKED, _E.STUB_OK): _S.MATCHED,
     # TEMP STUB: GL coding is not implemented, and a non-PO invoice needs it
     # before anything else can happen to it. Without this edge every invoice
     # with no purchase-order reference - which is the whole Kaggle corpus -
@@ -213,6 +211,12 @@ real" and "what is scaffolding" can be told apart at a glance, and so a test can
 enumerate them. ``tests/states/test_stub_transitions.py`` lists every one, which
 means deleting a stub is a deliberate act with a failing test to confirm it -
 not something that happens by accident while editing nearby lines.
+
+DUPLICATE_CHECKED is no longer on this list. ``compute_match`` is real, so an
+invoice leaves that state on MATCH or MATCH_EXCEPTION or not at all - and the
+difference matters more than it sounds: the stub edge sent every invoice to
+MATCHED regardless of what its numbers said, which is the shape of a system that
+pays whatever it is sent.
 
 Note what is deliberately absent: no stub edge leaves NEEDS_HUMAN_EXTRACTION,
 ON_HOLD_DUPLICATE, EXCEPTION or NEW_VENDOR. Those states exist because a human

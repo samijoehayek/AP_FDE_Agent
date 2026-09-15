@@ -21,7 +21,8 @@ EXPECTED_STUB_EDGES: set[tuple[str, str]] = {
     # VALIDATED -> VENDOR_RESOLVED is gone: lookup_vendor is real, and the
     # invoice now travels that edge on resolve_vendor or not at all.
     ("VENDOR_RESOLVED", "DUPLICATE_CHECKED"),
-    ("DUPLICATE_CHECKED", "MATCHED"),
+    # DUPLICATE_CHECKED -> MATCHED is gone: compute_match is real, and an invoice
+    # now leaves that state on what its numbers say or does not leave it at all.
     # GL coding is unwritten, and without this edge the entire Kaggle corpus -
     # which cites no purchase orders - stops dead at NON_PO.
     ("NON_PO", "CODED"),

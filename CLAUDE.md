@@ -80,10 +80,18 @@ Rules are not honour-system. Most of them fail a test if broken:
 
 ## What is stubbed, and why
 
-`guardrails/config.py`, `audit/chain.py`, `evals/golden.py`,
-`PostgresAuditWriter`, and every tool except `ingest_document` and
-`extract_invoice_vision` raise `NotImplementedError` under a docstring
+`audit/chain.py`, `evals/golden.py`, `PostgresAuditWriter`, and every tool
+except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
+`compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`,
+`get_receipts` and `compute_match` raise `NotImplementedError` under a docstring
 describing the responsibility and the constraints.
+
+`guardrails/config.py` and `src/ap_agent/matching/` are real. The matcher is
+pure - no I/O, no clock, no model - and it never raises: an invoice it cannot
+make sense of is a `MatchResult` carrying reason codes, because that is a
+routing decision rather than an error. It compares billed quantities to what was
+**received**, never to `qty_ordered`; two fixtures exist to fail it if anyone
+changes that.
 
 `scripts/generate_invoices.py` is real. It renders the labelled fixture into
 `data/generated/invoices/` and writes a `GeneratedInvoiceTruth` beside each PDF.
@@ -92,7 +100,7 @@ that does not exist yet*, declared per variant — never computed by evaluating 
 tolerance. Do not make the generator grade its own output.
 
 The agent loop (`loop/runner.py`) and the JSONL audit writer are now real. The
-states between `VALIDATED` and `CLOSED` are crossed by `STUB_TRANSITIONS` -
+states after `MATCHED` are crossed by `STUB_TRANSITIONS` -
 enumerated in `states/machine.py` and asserted in
 `tests/states/test_stub_transitions.py`. One of them lets a machine approve an
 invoice; delete it the moment `request_approval` exists. That is deliberate: the owner is writing

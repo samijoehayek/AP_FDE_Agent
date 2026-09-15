@@ -20,7 +20,7 @@ import pytest
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
-from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType
+from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType, ReasonCode
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.purchase_order import (
     PurchaseOrder,
@@ -82,11 +82,13 @@ HAPPY_PATH_EVENTS = [
     "resolve_vendor",
     # find_duplicates is still a stub.
     "stub_ok",
-    # Gathering what the matcher will compare: the order, what arrived, then
-    # the decision. compute_match is the owner's, so the move itself is a stub.
+    # The match: the order, what arrived, the matcher itself, then the decision.
+    # Four rows for one step, and the last is the only one that moves the
+    # invoice - on `match`, a real event, not a stub.
     "found",
     "received",
-    "stub_ok",
+    "matched",
+    "match",
     *["stub_ok"] * 8,
 ]
 
@@ -126,6 +128,11 @@ def _extraction(**overrides: object) -> InvoiceExtraction:
                 "unit": "EA",
                 "unit_price": Decimal("100.00"),
                 "extended_price": Decimal("100.00"),
+                # 20% of 100.00 is the 20.00 the header claims. It used to be
+                # absent, which was harmless while nothing checked - and stopped
+                # being harmless the moment compute_match started comparing the
+                # header tax to what the lines imply.
+                "tax_rate": Decimal("0.20"),
             }
         ],
     }
@@ -219,13 +226,13 @@ AMBIGUOUS_VENDOR = VendorMatch(
 )
 
 
-def _purchase_order(vendor_erp_id: str = VENDOR_ERP_ID) -> PurchaseOrder:
+def _purchase_order(vendor_erp_id: str = VENDOR_ERP_ID, currency: str = "USD") -> PurchaseOrder:
     return PurchaseOrder(
         po_number=PO_NUMBER,
         erp_id="145",
         vendor_erp_id=vendor_erp_id,
         vendor_name="Acme Limited",
-        currency="USD",
+        currency=currency,
         po_date=date(2025, 12, 20),
         status=PurchaseOrderStatus.OPEN,
         lines=[
@@ -473,7 +480,10 @@ def test_only_the_last_row_of_a_step_moves_the_invoice(
         "extract",
         "validate",
         "resolve_vendor",
-        *["stub_ok"] * 10,
+        # find_duplicates is still a stub; the match that follows it is not.
+        "stub_ok",
+        "match",
+        *["stub_ok"] * 8,
     ]
 
 
@@ -732,7 +742,39 @@ def _51109305(invoice_date: date = SEPTEMBER) -> InvoiceExtraction:
                 "unit": "EA",
                 "unit_price": Decimal("2023625.00"),
                 "extended_price": Decimal("2023625.00"),
+                # 10% of the line, which is the 202,362.50 the header claims.
+                "tax_rate": Decimal("0.10"),
             }
+        ],
+    )
+
+
+def _monitor_order() -> PurchaseOrder:
+    """The order 51109305 is billing against: same currency, same line, same price.
+
+    It exists because these tests are about *dates*, and a matcher that held the
+    invoice for a currency mismatch would stop the run before the date rule had
+    been given a chance to be wrong. The order agrees with the document on
+    everything, so what reaches CLOSED reaches it on the strength of the date
+    decision alone.
+    """
+    return PurchaseOrder(
+        po_number=PO_NUMBER,
+        erp_id="146",
+        vendor_erp_id=VENDOR_ERP_ID,
+        vendor_name="TechVision Distributors Pvt Ltd",
+        currency="INR",
+        po_date=date(2024, 3, 1),
+        status=PurchaseOrderStatus.OPEN,
+        lines=[
+            PurchaseOrderLine(
+                line_no=1,
+                item_ref="20",
+                description="27in IPS Monitor",
+                qty_ordered=Decimal(1),
+                unit_price=Decimal("2023625.00"),
+                extended=Decimal("2023625.00"),
+            )
         ],
     )
 
@@ -756,6 +798,7 @@ def _ambiguous_context(tmp_path: Path, country: str | None = None) -> RunContext
         tmp_path,
         _51109305(SEPTEMBER),
         vendor_match=match,
+        purchase_order=_monitor_order(),
         second_read=_51109305(MARCH),
         date_rendering=AMBIGUOUS_RENDERING,
     )
@@ -921,7 +964,9 @@ def test_an_unambiguous_invoice_needs_no_resolution_at_all(
         invoice_date=date(2023, 7, 3),
         currency="INR",
     )
-    ctx = _context(tmp_path, extraction)
+    # The order is in INR because the invoice is. This test is about the date;
+    # a currency mismatch would hold the invoice before the date rule ran.
+    ctx = _context(tmp_path, extraction, purchase_order=_purchase_order(currency="INR"))
     final = run(record.model_copy(update={"received_at": _received(date(2023, 7, 10))}), ctx)
 
     assert final.state is InvoiceState.CLOSED
@@ -1226,12 +1271,16 @@ def test_a_po_belonging_to_another_vendor_never_reaches_the_matcher(
     final = run(record, ctx)
 
     assert final.state is InvoiceState.EXCEPTION
-    assert final.receipts is None
+    assert final.receipts is None, "nothing was even fetched"
+
+    assert final.match_result is not None
+    assert final.match_result.reason_codes == [ReasonCode.PO_VENDOR_MISMATCH]
+    assert final.match_result.lines == [], "nothing was compared, so no rows imply it was"
+
     decision = next(event for event in ctx.events if event.decision == "match_exception")
     basis = decision.decision_basis or ""
-    assert "vendor_mismatch" in basis
-    assert f"po_vendor={OTHER_VENDOR_ERP_ID}" in basis
-    assert f"invoice_vendor={VENDOR_ERP_ID}" in basis
+    assert ReasonCode.PO_VENDOR_MISMATCH.value in basis
+    assert "config_version=guardrails_v1" in basis
 
 
 def test_the_identity_check_compares_ids_not_names(record: InvoiceRecord, tmp_path: Path) -> None:
@@ -1249,15 +1298,23 @@ def test_nothing_received_still_reaches_the_matcher(record: InvoiceRecord, tmp_p
 
     Whether an invoice for goods that never arrived may pay is the matcher's
     call to make with the reason codes to explain it - not this step's to
-    pre-empt by routing round it.
+    pre-empt by routing round it. It duly holds the invoice, and says both of
+    the things that are true about it: nothing arrived, and it was billed for
+    anyway.
     """
     ctx = _context(tmp_path, receipts=ReceiptSet(po_number=PO_NUMBER))
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.EXCEPTION
     assert final.receipts is not None
     assert final.receipts.is_empty is True
+    assert final.match_result is not None
+    assert set(final.match_result.reason_codes) == {
+        ReasonCode.RECEIPT_MISSING,
+        ReasonCode.QUANTITY_OVER_TOLERANCE,
+    }
+
     row = next(event for event in ctx.events if event.decision == "nothing_received")
     assert row.tool_name == "get_receipts"
 

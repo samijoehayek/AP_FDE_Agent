@@ -41,7 +41,8 @@ from ap_agent.contracts.audit import (
     ToolActor,
     utc_now,
 )
-from ap_agent.contracts.enums import AuditEventType
+from ap_agent.contracts.enums import AuditEventType, ReasonCode
+from ap_agent.contracts.matching import MatchResult
 from ap_agent.contracts.run import (
     Action,
     ActionKind,
@@ -62,6 +63,11 @@ from ap_agent.tools.compute_extraction_confidence import (
     DateResolutionReason,
     ExtractionConfidence,
     compute_extraction_confidence,
+)
+from ap_agent.tools.compute_match import (
+    ComputeMatchInput,
+    ComputeMatchOutput,
+    compute_match,
 )
 from ap_agent.tools.extract_invoice_text import (
     ExtractInvoiceTextInput,
@@ -194,6 +200,17 @@ def _default_get_receipts(payload: GetReceiptsInput) -> GetReceiptsOutput:
     return get_receipts(payload)
 
 
+def _default_compute_match(payload: ComputeMatchInput) -> ComputeMatchOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`.
+
+    Injected like every other tool even though the matcher is pure, because the
+    wrapper is not: it loads the guardrails file and refuses if the version it
+    finds is not the one the run asked for. That is a read of the outside world,
+    and this is where the outside world is substitutable.
+    """
+    return compute_match(payload)
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Everything the loop needs from the outside world.
@@ -218,6 +235,7 @@ class RunContext:
         _default_get_purchase_order
     )
     get_receipts: Callable[[GetReceiptsInput], GetReceiptsOutput] = _default_get_receipts
+    compute_match: Callable[[ComputeMatchInput], ComputeMatchOutput] = _default_compute_match
     now: Callable[[], datetime] = utc_now
     events: list[AuditEvent] = field(default_factory=list[AuditEvent])
     """Every event written this run, in order. Convenience for callers and tests."""
@@ -321,6 +339,17 @@ def invoice_max_age_days() -> int:
     would be a policy value that no trail could account for.
     """
     return load_guardrails().tolerances.invoice_max_age_days
+
+
+def guardrails_version() -> str:
+    """The ruleset this run is deciding under.
+
+    Asked of the config rather than passed in, so the string stamped on a
+    ``MatchResult`` is the one the loaded file declares. A version supplied by
+    the caller could name a file that was not the one consulted, which is the
+    single thing a ``config_version`` exists to make impossible.
+    """
+    return load_guardrails().config_version
 
 
 def _pricing_version() -> str:
@@ -910,9 +939,9 @@ def _settle_by_vendor_locale(record: InvoiceRecord, trail: StepTrail) -> Invoice
 def _match_prep_step(
     record: InvoiceRecord, ctx: RunContext, trail: StepTrail
 ) -> tuple[InvoiceRecord, StepResult]:
-    """Gather what the matcher will compare, and refuse to hand it anything unsafe.
+    """Gather what the matcher compares, refuse it anything unsafe, then match.
 
-    Three outcomes and no fourth:
+    Four outcomes and no fifth:
 
     * **No PO reference on the document** - the invoice goes down the NON_PO
       path, which is a different pipeline with its own coding and approval, not
@@ -922,20 +951,24 @@ def _match_prep_step(
       than a tolerance: an invoice quoting another supplier's PO number is a
       fraud signal, and a signal that gets compared against a band is a signal
       that can be argued into passing.
-    * **The order is this vendor's** - fetch what arrived against it and advance
-      with both snapshots on the record.
+    * **The order is this vendor's and the match is clean** - MATCHED.
+    * **The order is this vendor's and the match is not** - EXCEPTION, with the
+      reason codes and the config version in the decision's own audit row.
 
-    ``compute_match`` is not called here and is still a stub. This step's job is
-    to put the right facts in front of it, which includes deciding when there is
-    no safe match to attempt.
+    The identity checks stay *here* rather than moving into ``compute_match``,
+    and that boundary is the point of this step. Whether this order belongs to
+    this vendor is a comparison of ERP ids, which the matcher is deliberately
+    not given - it gets the numbers and nothing that would let it decide who
+    anyone is. So the loop answers "may these two be compared at all" and the
+    matcher answers "and do they agree".
     """
     extraction = record.extraction
-    references = list(extraction.po_references) if extraction else []
-    if not references:
+    if extraction is None or not extraction.po_references:
         return record, StepResult(
             event=InvoiceEvent.NO_PO_REFERENCE.value,
             decision_basis="po_references=none",
         )
+    references = list(extraction.po_references)
 
     # One order per invoice today. A document citing several is a real case and
     # a different shape of match; it is not this step's to invent.
@@ -971,12 +1004,12 @@ def _match_prep_step(
     mismatch = _vendor_mismatch(record, order)
     if mismatch is not None:
         return (
-            record.model_copy(update={"purchase_order": order}),
+            record.model_copy(update={"purchase_order": order, "match_result": mismatch}),
             StepResult(
                 event=InvoiceEvent.MATCH_EXCEPTION.value,
-                output_ref=content_ref(order),
+                output_ref=content_ref(mismatch),
                 result_summary=f"po_number={po_number}",
-                decision_basis=mismatch,
+                decision_basis=_match_basis(mismatch, order, None),
             ),
         )
 
@@ -996,23 +1029,47 @@ def _match_prep_step(
         )
     )
 
+    matched = _call(trail, ActionKind.COMPUTE_MATCH, "rule", ctx.compute_match)(
+        ComputeMatchInput(
+            invoice_id=str(record.invoice_id),
+            extraction=extraction,
+            purchase_orders=[order],
+            receipts=[received.receipts],
+            config_version=guardrails_version(),
+        )
+    )
+    result = matched.result
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.COMPUTE_MATCH,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="matched" if result.matched else "exception",
+            output_ref=content_ref(result),
+            result_summary=f"po_number={po_number}, lines={len(result.lines)}",
+            basis=_match_prep_basis(order, received.receipts),
+        )
+    )
+
     return (
-        record.model_copy(update={"purchase_order": order, "receipts": received.receipts}),
+        record.model_copy(
+            update={
+                "purchase_order": order,
+                "receipts": received.receipts,
+                "match_result": result,
+            }
+        ),
         StepResult(
-            # compute_match is the owner's to write. Until it exists the invoice
-            # advances through the stub edge with the real facts in context,
-            # which is what makes the next session's work a matcher and not a
-            # data-plumbing exercise.
-            event=InvoiceEvent.STUB_OK.value,
-            output_ref=content_ref(order),
+            event=(InvoiceEvent.MATCH if result.matched else InvoiceEvent.MATCH_EXCEPTION).value,
+            output_ref=content_ref(result),
             result_summary=f"po_number={po_number}",
-            decision_basis=_match_prep_basis(order, received.receipts),
+            decision_basis=_match_basis(result, order, received.receipts),
         ),
     )
 
 
-def _vendor_mismatch(record: InvoiceRecord, order: PurchaseOrder) -> str | None:
-    """Return why this order is not this invoice's to bill against, or None.
+def _vendor_mismatch(record: InvoiceRecord, order: PurchaseOrder) -> MatchResult | None:
+    """Return a result refusing this order as another supplier's, or None.
 
     An identity check, not a tolerance. A tolerance answers "is this close
     enough", and there is no close enough to belonging to a different supplier -
@@ -1022,21 +1079,55 @@ def _vendor_mismatch(record: InvoiceRecord, order: PurchaseOrder) -> str | None:
 
     Compares ERP ids, never names. The name is what the document claimed, and
     the claim is the thing under suspicion.
+
+    It returns a ``MatchResult`` rather than the sentence it used to return, so
+    that an invoice held for identity carries the same shape of evidence as one
+    held for a price: a code from the closed vocabulary, on the record, that a
+    downstream reader can branch on. A prose basis was readable and unmatchable -
+    the explanation seat would have had to parse English to find out what
+    happened, which is the sort of thing that works until somebody rewords it.
+
+    No lines on it. Nothing was compared, and rows implying otherwise would be a
+    line-by-line breakdown of an order this invoice has no claim on.
     """
     if record.vendor_id is None or order.vendor_erp_id == record.vendor_id:
         return None
-    return (
-        f"po_number={order.po_number}, po_vendor={order.vendor_erp_id}, "
-        f"invoice_vendor={record.vendor_id}, vendor_mismatch"
+    return MatchResult(
+        matched=False,
+        reason_codes=[ReasonCode.PO_VENDOR_MISMATCH],
+        config_version=guardrails_version(),
+        po_number=order.po_number,
     )
 
 
 def _match_prep_basis(order: PurchaseOrder, receipts: ReceiptSet) -> str:
-    """One line saying what was gathered, for the decision's audit row."""
+    """One line saying what was gathered, for the matcher's own audit row."""
     return (
         f"po_number={order.po_number}, po_lines={len(order.lines)}, "
         f"receipt_lines={len(receipts.lines)}, status={order.status.value}"
     )[:MAX_BASIS_CHARS]
+
+
+def _match_basis(result: MatchResult, order: PurchaseOrder, receipts: ReceiptSet | None) -> str:
+    """Why this invoice matched or did not, in one line of the audit trail.
+
+    The reason codes and the config version are both on it, and both have to be:
+    a code without the ruleset that raised it cannot be re-checked next quarter,
+    because the tolerance behind it may have moved. Naming the version is what
+    makes "why was this held" answerable from the row rather than from a guess
+    about which file was in force.
+    """
+    parts = [
+        f"po_number={order.po_number}",
+        f"po_lines={len(order.lines)}",
+        f"receipt_lines={len(receipts.lines) if receipts is not None else 0}",
+        f"status={order.status.value}",
+        f"config_version={result.config_version}",
+        "matched=" + ("yes" if result.matched else "no"),
+    ]
+    if result.reason_codes:
+        parts.append("reasons=" + "|".join(code.value for code in result.reason_codes))
+    return ", ".join(parts)[:MAX_BASIS_CHARS]
 
 
 def _stub_step(record: InvoiceRecord) -> tuple[InvoiceRecord, StepResult]:

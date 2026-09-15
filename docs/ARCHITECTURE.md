@@ -117,7 +117,6 @@ stateDiagram-v2
     DUPLICATE_CHECKED --> MATCHED: match
     DUPLICATE_CHECKED --> EXCEPTION: match_exception
     DUPLICATE_CHECKED --> NON_PO: no_po_reference
-    DUPLICATE_CHECKED --> MATCHED: stub_ok
     EXCEPTION --> CANCELLED: cancel
     EXCEPTION --> MATCHED: exception_resolved
     EXCEPTION --> REJECTED: reject

@@ -31,6 +31,7 @@ from ulid import ULID
 from ap_agent.contracts.common import StrictModel
 from ap_agent.contracts.enums import AuditEventType
 from ap_agent.contracts.invoice import InvoiceExtraction
+from ap_agent.contracts.matching import MatchResult
 from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
 from ap_agent.contracts.vendor import VendorMatch
 from ap_agent.states.machine import InvoiceState
@@ -288,6 +289,14 @@ class InvoiceRecord(StrictModel):
         description="What arrived against that order. None means the question was never "
         "asked; an empty ReceiptSet means it was asked and nothing had arrived, "
         "which is the answer that holds an invoice.",
+    )
+    match_result: MatchResult | None = Field(
+        default=None,
+        description="What the three-way match decided, and the numbers behind it. None "
+        "until the match runs, and on every invoice that never reaches it - one "
+        "citing no purchase order, or citing one that belongs to another vendor. "
+        "The reason codes here are the matcher's alone; a later stage's codes do "
+        "not join them.",
     )
 
     @property

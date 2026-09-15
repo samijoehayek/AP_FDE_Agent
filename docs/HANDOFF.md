@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-09-11, Day 2 in progress. Update this file at the end of every working day._
+_Last updated: 2026-09-16, Day 3. Update this file at the end of every working day._
 
 ## Purpose (three sentences)
 
@@ -10,7 +10,7 @@ _Last updated: 2026-09-11, Day 2 in progress. Update this file at the end of eve
 
 - The full design rationale is in `ap-invoice-agent-architecture-and-stack.md` (attached separately). Treat it as established; do not re-derive.
 - Non-negotiables live in `CLAUDE.md` (seven rules: extraction model has no tools; bank details never from the invoice; no pay/update-vendor/delete tools; every transition logged; idempotency keys on ERP writes; never commit `data/`; don't implement loop/matching/guardrails/audit-chain logic unless explicitly asked).
-- The owner writes the loop, guardrails, matching, and audit chain by hand (with review). Claude Code is used for scaffolding, tool boilerplate, and reviews — and only with tightly scoped prompts.
+- The owner reviews and can explain every line of the loop, matching, guardrails and audit chain. Claude Code is used for scaffolding, tool boilerplate, reviews, and — when the owner asks for it in that session, as CLAUDE.md rule 7 requires — the implementation itself, always through tightly scoped prompts and always reviewed piece by piece.
 - The owner has ~$5 of Anthropic API credit. Do not propose batch runs over the corpus; 5–6 live calls per test round.
 - Never ask the owner to paste `.env`, tokens, or secrets. If a secret is pasted, tell them to rotate it.
 
@@ -38,6 +38,8 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - `tools/lookup_vendor.py` — real: two tiers (tax id, normalised name), ambiguity is `none` with candidates. `normalise_vendor_name` is its own pure function with its own tests. `bank_details_match_on_file` is `None` because the master holds no remittance details — a comparison that did not happen, which is a different answer from one that failed. 29 tests.
 - `tools/get_purchase_order.py` — real: `client.query` on `PurchaseOrder` by `DocNumber`, explicit field mapping, subtotal/discount rows discarded, amounts as `Decimal`. 15 tests against a captured-shape response at `tests/tools/qbo_purchase_order_response.json`.
 - `tools/get_receipts.py` — real: reads `receipts_path` from settings, flattens every receipt document for one order into per-line quantities. 13 tests.
+- `src/ap_agent/matching/` + `tools/compute_match.py` — **real**, and the thing the rest of this exists to protect. `pairing.py` decides which invoice line bills which ordered line (printed ref first, normalised description second, ambiguity pairs nothing); `engine.py` decides whether they agree. Pure: no I/O, no clock, no model, and it never raises - an invoice it cannot make sense of is a `MatchResult` with reasons on it. **Quantities are compared to what was *received*, never `qty_ordered`**; every two-legged tolerance requires both legs; no free-text field is read or written. 245 tests, including a sweep of all 60 generated invoices against their truth files.
+- `src/ap_agent/text.py` — `normalise_vendor_name`, moved out of `tools/lookup_vendor.py`. One normaliser, shared by vendor resolution and line pairing: two would agree until one was edited, and then they would disagree about which line was being billed.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
 - `scripts/generate_invoices.py` — real: 60 labelled invoice PDFs from the seeded POs, six variants each, into `data/generated/invoices/`. `Canvas(invariant=1)` and no clock anywhere, so two runs are byte-identical - a hash that moves means the generator changed, not that a document arrived. Truth files are `GeneratedInvoiceTruth` (`contracts/generated.py`), and a test asserts `InvoiceExtraction(**truth.expected.model_dump())` passes the arithmetic validator with no flags. 43 tests, all against real rendered files in `tmp_path`.
 - `src/ap_agent/vendor_master.py` + `config/sandbox_vendor_master.yaml` — the vendors, in one file, read by both `seed_sandbox.py` and `generate_invoices.py`. Carries the country and the postal address, which the seed manifest does not because QuickBooks is never told them. Fails loudly on a missing vendor or a missing field. 21 tests.
@@ -49,9 +51,11 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
   - `run` reports `steps` (state moves) and `audit rows` separately: the extraction step is one step and four rows.
 - Docs: README, ARCHITECTURE.md (state + trust-boundary diagrams), DECISIONS.md, CLAUDE.md.
 
-**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`, `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order` and `get_receipts`; guardrail config loader; evals fixtures. `scripts/generate_invoices.py` is real.
+**Stubs:** all tools except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`, `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`, `get_receipts` and `compute_match`; evals fixtures. `scripts/generate_invoices.py` and the guardrail config loader are real.
 
-**Stub edges remaining (11):** `VENDOR_RESOLVED→DUPLICATE_CHECKED` (find_duplicates), `DUPLICATE_CHECKED→MATCHED` (compute_match), `NON_PO→CODED` (propose_gl_coding), `MATCHED→CODED`, `CODED→PENDING_APPROVAL`, **`PENDING_APPROVAL→APPROVED` (the dangerous one — delete it the moment `request_approval` exists)**, `APPROVED→POSTED`, `POSTED→SCHEDULED`, `SCHEDULED→PAID`, `PAID→RECONCILED`, `RECONCILED→CLOSED`. `STUB_HOOKS` is now empty: no stub step does anything.
+**Stub edges remaining (10):** `VENDOR_RESOLVED→DUPLICATE_CHECKED` (find_duplicates), `NON_PO→CODED` (propose_gl_coding), `MATCHED→CODED`, `CODED→PENDING_APPROVAL`, **`PENDING_APPROVAL→APPROVED` (the dangerous one — delete it the moment `request_approval` exists)**, `APPROVED→POSTED`, `POSTED→SCHEDULED`, `SCHEDULED→PAID`, `PAID→RECONCILED`, `RECONCILED→CLOSED`. `STUB_HOOKS` is now empty: no stub step does anything.
+
+**`DUPLICATE_CHECKED→MATCHED` is gone.** `compute_match` is real, so an invoice leaves that state on `match` or `match_exception` or does not leave it. The edge it used to travel advanced every invoice to MATCHED regardless of what its numbers said.
 
 **Stub hooks: none.** `STUB_HOOKS` is an empty frozenset and a test asserts it. It held the vendor-locale date resolution for exactly as long as `lookup_vendor` was a stub; the tool owns the country now, so the hook is gone and the date is settled in the resolve-vendor step.
 
@@ -229,7 +233,7 @@ Both were found by reading the files rather than by a test failing later.
    - **`get_purchase_order`** — QuickBooks via the existing client, filtered by `DocNumber`. Explicit mapping, everything else dropped. Not found is `None`; a client error raises.
    - **`get_receipts`** — `data/generated/receipts.json`, path from settings. Unknown PO is an **empty `ReceiptSet`**, never `None`.
    - **`VALIDATED→VENDOR_RESOLVED` stub edge is gone**, and `STUB_HOOKS` is empty: the vendor-locale date rule moved from the stub step into the resolve-vendor step, which is where it belonged.
-   - At `DUPLICATE_CHECKED`: no PO reference → `NON_PO` (real); PO missing or belonging to another vendor → `EXCEPTION`; otherwise both snapshots land on the record and the invoice advances to `MATCHED` through the remaining stub edge. **`compute_match` and `find_duplicates` are still stubs — the owner writes those.**
+   - At `DUPLICATE_CHECKED`: no PO reference → `NON_PO` (real); PO missing or belonging to another vendor → `EXCEPTION` carrying `PO_NOT_FOUND` or `PO_VENDOR_MISMATCH`; otherwise both snapshots land on the record, `compute_match` runs, and the invoice moves to `MATCHED` on `match` or `EXCEPTION` on `match_exception`. **`find_duplicates` is still a stub — the owner writes that one.**
    - Change of design from the original plan: an ambiguous slash date does **not** fail extraction. Both readings stay on the record and are settled later — by the receipt window at `VALIDATED`, then by the vendor's country at `VENDOR_RESOLVED`. Rationale in DECISIONS.md, 2026-09-10.
 5. `verify_vendor_external` web check for NEW_VENDOR (domain age, registry hit, lookalike distance) — the scoped "model decides when to call" tool.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
@@ -252,7 +256,7 @@ Worth being explicit, because a config file reads like a working control:
 
 - **`output_filter`** - patterns are declared and unit-tested against samples, but nothing in the loop runs them over model output yet.
 - **`input_validation`** - `ingest_document` enforces none of these limits; `max_pages`, `max_file_bytes` and the MIME allowlist are declared and unread.
-- **`approval_matrix`** - `request_approval` is still a stub, so no tier or rule is consulted. `PENDING_APPROVAL → APPROVED` is still the dangerous stub edge.
+- **`approval_matrix`** - `request_approval` is still a stub, so no tier or rule is consulted. `PENDING_APPROVAL → APPROVED` is still the dangerous stub edge. Note that the matrix's `match_exception` rule now has something to fire on: `compute_match` produces the reason codes it keys off.
 - Of the tolerances, only `invoice_max_age_days` is read by anything today.
 
 ## After Day 3 (report mapping)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,6 +26,7 @@ import pytest
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import utc_now
+from ap_agent.contracts.enums import MatchLineOutcome, ReasonCode
 from ap_agent.contracts.generated import GeneratedInvoiceTruth, GeneratedVariant
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.purchase_order import (
@@ -49,6 +51,28 @@ if TYPE_CHECKING:
     from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextInput
     from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionInput
     from ap_agent.tools.get_purchase_order import GetPurchaseOrderInput
+
+MATCHER_CODES: frozenset[ReasonCode] = frozenset(
+    {
+        ReasonCode.PO_NOT_FOUND,
+        ReasonCode.PO_CLOSED,
+        ReasonCode.LINE_NOT_ON_PO,
+        ReasonCode.PRICE_OVER_TOLERANCE,
+        ReasonCode.QUANTITY_OVER_TOLERANCE,
+        ReasonCode.RECEIPT_MISSING,
+        ReasonCode.TOTALS_OVER_TOLERANCE,
+        ReasonCode.TAX_MISMATCH,
+        ReasonCode.CURRENCY_MISMATCH,
+        ReasonCode.ARITHMETIC_INCONSISTENT,
+    }
+)
+"""The codes the matcher owns. See ``tests/matching/test_generated_fixture.py``.
+
+The truth files carry codes from the whole vocabulary because they describe what
+should happen to a document, not what one function decides.
+``suspicious_document_content`` is the output filter's, and the matcher is given
+no free-text field to find it in.
+"""
 
 PO_NUMBER = "AP-TEST-001"
 VENDOR = "Northwind Peripherals Inc"
@@ -313,10 +337,14 @@ def test_the_audit_sequence_for_a_generated_invoice(
         "validate",
         "name_exact",
         "resolve_vendor",
+        # find_duplicates is still a stub.
         "stub_ok",
+        # The match: the order, what arrived, the matcher, then the decision -
+        # `match`, a real event, on a document the generator declared clean.
         "found",
         "received",
-        "stub_ok",
+        "matched",
+        "match",
         "stub_ok",
         "stub_ok",
         "stub_ok",
@@ -386,3 +414,120 @@ def test_the_hidden_text_variant_reaches_the_same_place_on_the_numbers(
     assert final.state is InvoiceState.CLOSED, "no guardrail reads suspicious_text yet"
     assert truth.hidden_text is not None
     assert truth.hidden_text in _page_text(_pdf(fixture_root, GeneratedVariant.HIDDEN_TEXT))
+
+
+# --- the match, now that it is real ------------------------------------------
+
+
+def test_a_clean_invoice_reaches_matched_on_the_numbers(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """Not on a stub edge. The event is `match`, and the reasons are empty.
+
+    The edge this used to travel - DUPLICATE_CHECKED to MATCHED on `stub_ok` -
+    is deleted. It advanced every invoice regardless of what its numbers said,
+    which is the shape of a system that pays whatever it is sent, and this is
+    what replaces it.
+    """
+    truth = _truth(fixture_root)
+    assert truth.expected_match is gen.ExpectedMatch.MATCHED
+
+    final = run(record, _context(fixture_root, truth))
+
+    assert final.match_result is not None
+    assert final.match_result.matched is True
+    assert final.match_result.reason_codes == []
+    assert final.match_result.po_number == PO_NUMBER
+    assert final.match_result.config_version == "guardrails_v1"
+
+
+def test_the_price_variant_reaches_exception_with_the_price_code(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """3% over on a $1,500 line: outside 2% and outside $50, so outside both legs.
+
+    The truth file declared ``price_over_tolerance`` before the matcher existed.
+    This is the loop agreeing with it end to end - through the renderer, the
+    confidence check, the real vendor master and the real receipts file.
+    """
+    truth = _truth(fixture_root, GeneratedVariant.PRICE_PLUS_3PCT)
+    assert truth.expected_reason_codes == [ReasonCode.PRICE_OVER_TOLERANCE]
+
+    ctx = _context(fixture_root, truth, variant=GeneratedVariant.PRICE_PLUS_3PCT)
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.EXCEPTION
+    assert final.match_result is not None
+    assert ReasonCode.PRICE_OVER_TOLERANCE in final.match_result.reason_codes
+
+    over = next(
+        line for line in final.match_result.lines if line.outcome is MatchLineOutcome.PRICE_OVER
+    )
+    assert over.po_unit_price == Decimal("1500.000000")
+    assert over.invoice_unit_price == Decimal("1545.000000")
+    assert over.price_variance_pct == Decimal("3.0000")
+
+
+def test_the_exception_run_stops_at_exception_and_says_why(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """EXCEPTION is a state no stub may leave, so the run halts there.
+
+    That is the correct outcome and not a gap: the invoice is waiting for a
+    person, and the row it stopped on carries what they need to see - the code,
+    and the ruleset that raised it.
+    """
+    truth = _truth(fixture_root, GeneratedVariant.PRICE_PLUS_3PCT)
+    ctx = _context(fixture_root, truth, variant=GeneratedVariant.PRICE_PLUS_3PCT)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.EXCEPTION
+    decision = next(event for event in ctx.events if event.decision == "match_exception")
+    basis = decision.decision_basis or ""
+    assert ReasonCode.PRICE_OVER_TOLERANCE.value in basis
+    assert "config_version=guardrails_v1" in basis
+    assert decision.to_state is InvoiceState.EXCEPTION
+
+
+def test_the_matcher_gets_its_own_audit_row_with_a_content_address(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """One row per thing that happened, and the match is a thing that happened.
+
+    ``output_ref`` is the sha256 of the result rather than the result itself, so
+    the trail points at what was decided without carrying a payload - and a
+    stored MatchResult can be proved to be the one this run acted on.
+    """
+    ctx = _context(fixture_root, _truth(fixture_root))
+
+    run(record, ctx)
+
+    row = next(event for event in ctx.events if event.decision == "matched")
+    assert row.tool_name == "compute_match"
+    assert row.to_state is None, "a tool row never moves the invoice"
+    assert row.output_ref is not None
+    assert row.output_ref.startswith("sha256:")
+
+
+def test_the_variants_land_where_their_truth_files_say(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """Every variant the generator produces, through the whole loop.
+
+    ``hidden_text`` is the one to read carefully: its truth file declares
+    MATCHED *and* a reason code, because the numbers are perfect and the
+    document still must not post. The matcher is right to pass it - the code
+    that holds it belongs to a guardrail nobody has written yet.
+    """
+    for variant in GeneratedVariant:
+        truth = _truth(fixture_root, variant)
+        ctx = _context(fixture_root, truth, variant=variant)
+        final = run(record, ctx)
+
+        assert final.match_result is not None, variant.value
+        expected_clean = truth.expected_match is gen.ExpectedMatch.MATCHED
+        assert final.match_result.matched is expected_clean, variant.value
+
+        declared = set(truth.expected_reason_codes) & MATCHER_CODES
+        assert declared <= set(final.match_result.reason_codes), variant.value
