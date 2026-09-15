@@ -43,8 +43,7 @@ from ap_agent.contracts.enums import (
     ActorKind,
     ArithmeticFlag,
     AuditEventType,
-    MatchLineStatus,
-    MatchTotalsStatus,
+    MatchLineOutcome,
     ReasonCode,
     SuggestedAction,
     SuggestedResolver,
@@ -78,7 +77,7 @@ from ap_agent.contracts.invoice import (
     InvoiceExtraction,
     LineItem,
 )
-from ap_agent.contracts.matching import MatchLineResult, MatchResult
+from ap_agent.contracts.matching import MatchLine, MatchResult, SignedPercentage
 from ap_agent.contracts.purchase_order import (
     PurchaseOrder,
     PurchaseOrderLine,
@@ -127,10 +126,9 @@ __all__ = [
     "InputValidation",
     "InvoiceExtraction",
     "LineItem",
-    "MatchLineResult",
-    "MatchLineStatus",
+    "MatchLine",
+    "MatchLineOutcome",
     "MatchResult",
-    "MatchTotalsStatus",
     "ModelActor",
     "Money",
     "OutputFilter",
@@ -145,6 +143,7 @@ __all__ = [
     "ReceiptSet",
     "RuleActor",
     "Sha256Hex",
+    "SignedPercentage",
     "StrictModel",
     "SuggestedAction",
     "SuggestedResolver",

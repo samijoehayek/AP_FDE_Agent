@@ -28,24 +28,26 @@ class ArithmeticFlag(StrEnum):
     NO_LINE_ITEMS = "no_line_items"
 
 
-class MatchLineStatus(StrEnum):
-    """Outcome of matching one invoice line against a PO line and its receipts."""
+class MatchLineOutcome(StrEnum):
+    """What the matcher decided about one line.
+
+    Five outcomes, and the last two are about lines that have no counterpart
+    rather than lines that disagree:
+
+    * ``UNMATCHED`` - on the invoice, on no purchase-order line. Freight is the
+      ordinary case and is judged against the unmatched-charge tolerance rather
+      than rejected outright.
+    * ``UNBILLED`` - on the purchase order, on no invoice line. **Not an
+      exception.** A vendor invoicing part of an order is the normal shape of a
+      partial delivery; it is recorded so a reviewer can see what is still
+      outstanding, and it holds nothing up.
+    """
 
     OK = "ok"
-    PRICE_VARIANCE = "price_variance"
-    QTY_VARIANCE = "qty_variance"
-    NOT_ON_PO = "not_on_po"
-    MISSING_RECEIPT = "missing_receipt"
-
-
-class MatchTotalsStatus(StrEnum):
-    """Outcome of matching invoice totals against the PO and tolerance config."""
-
-    OK = "ok"
-    OVER_TOLERANCE = "over_tolerance"
-    UNDER_PO = "under_po"
-    CURRENCY_MISMATCH = "currency_mismatch"
-    PO_NOT_FOUND = "po_not_found"
+    QTY_OVER = "qty_over"
+    PRICE_OVER = "price_over"
+    UNMATCHED = "unmatched"
+    UNBILLED = "unbilled"
 
 
 class ReasonCode(StrEnum):
@@ -55,6 +57,21 @@ class ReasonCode(StrEnum):
     and :class:`~ap_agent.contracts.exceptions.ExceptionClassification` so that a
     deterministic rule and a model-written explanation can never disagree about
     *what* went wrong - only about how to describe it.
+
+    Two members are worth knowing about before reading the matcher.
+
+    ``PO_VENDOR_MISMATCH`` is an *identity* failure, not a variance: the invoice
+    quotes a purchase-order number belonging to a different supplier. There is no
+    band inside which that is acceptable, which is why it is a reason code rather
+    than a tolerance - a signal compared against a band is a signal that can be
+    argued into passing.
+
+    ``UOM_MISMATCH`` **can never fire against a QuickBooks purchase order.**
+    QuickBooks does not put a unit of measure on a purchase-order line, so
+    ``PurchaseOrderLine`` carries none and there is nothing to compare an
+    invoice's ``unit`` against. It stays in the vocabulary because the concept is
+    real and an ERP that does carry a unit would raise it; it is simply
+    unreachable on the ERP this system talks to today.
     """
 
     # Document / extraction
@@ -76,6 +93,7 @@ class ReasonCode(StrEnum):
     # Purchase order / receipt
     PO_NOT_FOUND = "po_not_found"
     PO_CLOSED = "po_closed"
+    PO_VENDOR_MISMATCH = "po_vendor_mismatch"
     LINE_NOT_ON_PO = "line_not_on_po"
     PRICE_OVER_TOLERANCE = "price_over_tolerance"
     QUANTITY_OVER_TOLERANCE = "quantity_over_tolerance"
