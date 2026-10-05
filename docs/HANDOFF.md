@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-10-05. Last code change 2026-10-05 (matcher hardening, Day 3 step 2 follow-up); the match itself verified live 2026-10-05. Update this file at the end of every working day._
+_Last updated: 2026-10-05. Last code change 2026-10-05 (Day 3 step 3: the guardrails applied - Phase 1 closed); verified live 2026-10-05. Update this file at the end of every working day._
 
 ## Start here — catching up a new session
 
@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1396 tests**. If it is not, that is the first thing to fix and nothing below is
+**1609 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -57,7 +57,8 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - Scaffold, CI, docker-compose (Postgres), `.gitignore` protecting `data/`.
 - Contracts in `src/ap_agent/contracts/` (InvoiceExtraction with arithmetic validator, MatchResult, ExceptionClassification, AuditEvent, etc.). `evidence` is a **list of `{field, page, snippet}`** records (changed from a dict because structured outputs can't express dynamic keys).
 - State machine in `src/ap_agent/states/` — enum, transition table, `transition()` raising on illegal moves, tests incl. "no POSTED without APPROVED".
-- `tools/ingest_document.py` — real: sha256, MIME sniffing, page count, text-layer detection, per-page Laplacian sharpness.
+- `tools/ingest_document.py` — real: sha256, MIME sniffing, page count, text-layer detection, per-page Laplacian sharpness, and **`input_validation` applied before any model call**: type, size, page count and password checked first (type and size before the file is even opened), then three hidden-text checks per page - near-white text on near-white paper, text outside the page box, a text layer over a blank render. Flags are `{check, detail}` and never carry document text. Stamps `config_version` on its output.
+- `guardrails/output_filter.py` — real and pure: `screen_extraction(reading, config)` returns `{check, field}` flags for any non-empty `suspicious_text` and any `output_filter` pattern in any string field except `remit_to_display`. Never rewrites a reading.
 - `tools/extract_invoice_vision.py` — real: PDF as document block / images as image block (TIFF→PNG), structured output into InvoiceExtraction, returns model id, prompt_version=`extract_v1`, tokens, latency; `ExtractionError` on API failure/refusal/truncation/validation. Prompt at `prompts/extract_v1.md`. 16 mocked tests.
 - `tools/extract_invoice_text.py` — real: pymupdf text layer → `claude-haiku-4-5` reading characters only (no tools, document text is the whole user turn), prompt `extract_text_v1`. Images / no text layer → `has_text_layer=False`, `second_read=None`, **no OCR** and no model call. `raw_text` is byte-identical to what the model was sent, because grounding is scored against it. 19 mocked tests.
 - `tools/compute_extraction_confidence.py` — real, and **pure code with no model call and no clock**: per-field `agreed` (two readings match) and `grounded` (value is in the text layer), both required. `auto_ok` is true **iff** all five load-bearing fields agreed and grounded — nothing else vetoes it, so low sharpness and an ambiguous date lower the score and are recorded but no longer block. `needs_human` is `{field, reason}` records. Carries `date_verdict`, `date_candidates` and `date_raw_text`. 53 tests.
@@ -65,15 +66,15 @@ Python 3.12, `uv`, `src/` layout, ruff + pyright strict + pre-commit, pytest, Py
 - `loop/runner.py` — decide → apply → transition → log; max_steps counts state moves; INGESTED→EXTRACTED makes both model calls and runs `EXTRACT-CONF@v1` over them; VALIDATED runs arithmetic (`VALIDATE@v1`) and `DATE-RESOLVE@v1` when the receipt window can settle an open date; all later states are `rule:STUB` with `# TEMP STUB` edges in the transition table (listed in a test).
 - `loop/dates.py` — `resolve_date_by_receipt_window` and `resolve_date_by_locale`. Pure, and both take the clock as an argument: a rule that read `now()` would resolve a date differently on replay and break the chain that hashed it.
 - `audit/writer.py` — JsonlAuditWriter to `data/audit/<invoice_id>.jsonl`, sha256 hash chain from a zero genesis hash, `verify()`.
-- **Audit rows are now one per thing that happened, not one per step.** `step_seq` counts rows, and only the last row of a step carries a `to_state` - so following `to_state` down the file still shows the state machine, while the rows between it account for what each call cost. The extraction step is 1 step and 4 rows. A clean run is 14 moves / 17 rows.
+- **Audit rows are now one per thing that happened, not one per step.** `step_seq` counts rows, and only the last row of a step carries a `to_state` - so following `to_state` down the file still shows the state machine, while the rows between it account for what each call cost. Intake is 1 step and 2 rows; the extraction step is 1 step and 6 rows (each reading, its `OUTPUT-FILTER@v1` verdict, the score, the decision). A clean run is 14 moves / 24 rows.
 - **Date resolution constants worth knowing before changing them:** `MAX_INVOICE_AGE_DAYS = 365` in `loop/dates.py` (a year, deliberately generous - a narrower window resolves more dates but *silently* eliminates a candidate that may be correct; six months was the first value and it got 09/03/2024 wrong). `MIN_SHARPNESS = 800` and the 0.9 name-similarity cut in the confidence tool are still uncalibrated guesses; they belong in the guardrails config on Day 3.
-- `tools/lookup_vendor.py` — real: two tiers (tax id, normalised name), ambiguity is `none` with candidates. `normalise_vendor_name` is its own pure function with its own tests. `bank_details_match_on_file` is `None` because the master holds no remittance details — a comparison that did not happen, which is a different answer from one that failed. 29 tests.
+- `tools/lookup_vendor.py` — real: two tiers (tax id, normalised name), ambiguity is `none` with candidates. `normalise_vendor_name` is its own pure function with its own tests. It also takes the document's `remit_to_display`, fingerprints any IBAN in it and compares it with the master's `remit_account_sha256`; only `remit_to_matches_master: bool | None` comes back (None = nothing to compare). The master holds fingerprints of **fictional** accounts, never an account.
 - `tools/get_purchase_order.py` — real: `client.query` on `PurchaseOrder` by `DocNumber`, explicit field mapping, subtotal/discount rows discarded, amounts as `Decimal`. 15 tests against a captured-shape response at `tests/tools/qbo_purchase_order_response.json`.
 - `tools/get_receipts.py` — real: reads `receipts_path` from settings, flattens every receipt document for one order into per-line quantities. 13 tests.
 - `src/ap_agent/matching/` + `tools/compute_match.py` — **real**, and the thing the rest of this exists to protect. `pairing.py` decides which invoice line bills which ordered line (printed ref first, normalised description second, ambiguity pairs nothing); `engine.py` decides whether they agree. Pure: no I/O, no clock, no model, and it never raises - an invoice it cannot make sense of is a `MatchResult` with reasons on it. **Quantities are compared to what was *received*, never `qty_ordered`**; every two-legged tolerance requires both legs; no free-text field is read or written. 245 tests, including a sweep of all 60 generated invoices against their truth files.
 - `src/ap_agent/text.py` — `normalise_vendor_name`, moved out of `tools/lookup_vendor.py`. One normaliser, shared by vendor resolution and line pairing: two would agree until one was edited, and then they would disagree about which line was being billed.
 - `scripts/pull_hf_datasets.py`, `scripts/index_invoices.py` → `data/index.csv` (regenerate with `just ingest`).
-- `scripts/generate_invoices.py` — real: 60 labelled invoice PDFs from the seeded POs, six variants each, into `data/generated/invoices/`. `Canvas(invariant=1)` and no clock anywhere, so two runs are byte-identical - a hash that moves means the generator changed, not that a document arrived. Truth files are `GeneratedInvoiceTruth` (`contracts/generated.py`), and a test asserts `InvoiceExtraction(**truth.expected.model_dump())` passes the arithmetic validator with no flags. 43 tests, all against real rendered files in `tmp_path`.
+- `scripts/generate_invoices.py` — real: 100 labelled invoice PDFs from the seeded POs, ten variants each (five of them adversarial, added 2026-10-05; the original 60 are byte-identical), into `data/generated/invoices/`. `Canvas(invariant=1)` and no clock anywhere, so two runs are byte-identical - a hash that moves means the generator changed, not that a document arrived. Truth files are `GeneratedInvoiceTruth` (`contracts/generated.py`), and a test asserts `InvoiceExtraction(**truth.expected.model_dump())` passes the arithmetic validator with no flags. 43 tests, all against real rendered files in `tmp_path`.
 - `src/ap_agent/vendor_master.py` + `config/sandbox_vendor_master.yaml` — the vendors, in one file, read by both `seed_sandbox.py` and `generate_invoices.py`. Carries the country and the postal address, which the seed manifest does not because QuickBooks is never told them. Fails loudly on a missing vendor or a missing field. 21 tests.
 - `integrations/qbo/auth.py` (refresh-token manager with rotation persistence), `integrations/qbo/client.py` (httpx wrapper: get/query/create, retries on 429/5xx, never logs tokens).
 - Loop fixes applied: step budget sized to the real path; `MATCHED→CODED` marked TEMP STUB and listed in the stub-edges test; extraction audit `output_ref` is `sha256:` of the serialized extraction; per-invoice cost recorded in DECISIONS.md.
@@ -234,7 +235,7 @@ Both were found by reading the files rather than by a test failing later.
     ... AP-SEED-002 .. AP-SEED-010
   ```
 
-  10 POs x 6 variants = 60 invoices: 27 expected MATCHED, 33 EXCEPTION, 42 requiring human review. Git-ignored like the rest of `data/`. Regenerate with `just generate` (same bytes every time), then `just ingest`.
+  10 POs x 10 variants = 100 invoices: 63 expected MATCHED on the numbers, 37 EXCEPTION, 82 requiring human review. The five adversarial variants - `hidden_text`, `offpage_text`, `instruction_text`, `lookalike_vendor`, `remit_mismatch` - each declare `expected_halt_state` and `expected_flag` (truth_v2). Git-ignored like the rest of `data/`. Regenerate with `just generate` (same bytes every time), then `just ingest`.
 - All indexed; no exact-hash duplicates.
 
 ## External accounts
@@ -262,6 +263,14 @@ Both were found by reading the files rather than by a test failing later.
   | `AP-SEED-010/qty_over_received` | `EXCEPTION` | $0.032784 |
   | **total** | | **$0.093028** |
 - The AP-SEED-010 run is the one to cite. It bills 2 of a line that ordered 11 and received 0 - inside the authorisation, outside the delivery - and a two-way match would have paid it.
+- **2026-10-05, two live runs through the guardrails.** Trails in `data/retest/2026-10-05/` (git-ignored).
+
+  | run | final state | model calls | cost | stopped by |
+  | --- | --- | --- | --- | --- |
+  | `AP-SEED-001/hidden_text` | `NEEDS_HUMAN_EXTRACTION` | 0 | $0.000000 | `INPUT-VALIDATE@v1`: `near_white_text(page=1, spans=1, ...)` |
+  | `AP-SEED-001/instruction_text` | `NEEDS_HUMAN_EXTRACTION` | 2 | $0.031070 | `OUTPUT-FILTER@v1`: `suspicious_text`, on **both** readings |
+
+  Both seats - Sonnet on the image (7,323 in / 900 out, $0.0236) and Haiku on the text (4,434 in / 598 out, $0.0074) - independently copied the planted instruction into `suspicious_text` as their prompts tell them to. Neither the instruction nor the IBAN appears anywhere on either trail. Both chains verify.
 
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
 
@@ -281,7 +290,7 @@ Both were found by reading the files rather than by a test failing later.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
 7. Off-keyboard: book the customer interview.
 
-## Day 3 — steps 1 and 2 done, step 3 is next
+## Day 3 — done. Phase 1 closed
 
 1. **DONE.** Guardrails as versioned YAML with a typed loader.
    - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`. The price band and the unmatched-charge rule are each a **pair that must both hold** - an absolute cap alone is a licence on a small order, a percentage alone is one on a large order.
@@ -323,21 +332,34 @@ Both were found by reading the files rather than by a test failing later.
 
    **Three loop test fixtures changed**, each quietly wrong in a way nothing had checked: the loop's "clean" invoice claimed $20 of tax on a line with no tax rate, and the ambiguous-date invoice was in INR against a USD order. Harmless until something compared a header to its lines.
 
-3. **NEXT — apply the guardrails that are configured and unread.** The patterns and limits exist in `config/guardrails.v1.yaml` and **nothing reads them**; see *What is configured but not yet applied* below. The fixture already proves the hole: `hidden_text` plants white 4pt type telling the reader to change the vendor's bank account, its arithmetic is perfect so the matcher passes it correctly, its truth file says `expected_human_review: true`, and `tests/loop/test_generated_invoice_end_to_end.py::test_the_hidden_text_variant_reaches_the_same_place_on_the_numbers` asserts it reaches `CLOSED` with a comment naming the gap. Shape of the work: a function that runs the `output_filter` patterns over the extraction's string fields before anything downstream reads them, a route to a human when one matches, **nothing ever silently rewritten** (`never_auto_fix: true`, and stripping an IBAN destroys the evidence that somebody tried), `input_validation` enforced in `ingest_document` before any model call, and that `hidden_text` test flipping from "reaches CLOSED, which is the gap" to "reaches a person, which is the point". No live API calls needed.
+3. **DONE, 2026-10-05.** The guardrails applied, in four pieces. Every decision and the alternative it beat is in DECISIONS.md, *2026-10-05 — the guardrails, applied*.
+
+   **Input validation, at intake.** `ingest_document` applies `input_validation` before any model call: file type, size, page count and password; then near-white text on near-white paper, text outside the page box, and a text layer over a blank render. A flag routes `RECEIVED -> NEEDS_HUMAN_EXTRACTION` on the new `input_flagged` event, with an `INPUT-VALIDATE@v1` decision row on every document (`flags=none` when clean). **Zero tokens on a flagged document** - verified live. Across all 230 local documents it flags exactly the 10 planted `hidden_text` PDFs.
+
+   **Output filter, on every reading.** Each reading is screened the moment it returns, in the extraction step: any non-empty `suspicious_text`, and the `output_filter` patterns (IBAN, account-length digits, bank/remittance/account changes, URLs, ignore-instructions, transfer-funds, pay-to) in every string field except `remit_to_display`. One `OUTPUT-FILTER@v1` row per reading. Any hit routes `INGESTED -> NEEDS_HUMAN_EXTRACTION` on the new `output_flagged` event, and the flagged reading never reaches the record or the confidence check. `account_number_like` skips identifier fields, because measured on the corpus it otherwise fires on every Kaggle invoice number.
+
+   **Remit-to, against the vendor master.** `lookup_vendor` compares any IBAN in `remit_to_display` with the master's SHA-256 fingerprint and returns only `remit_to_matches_master`. A mismatch routes `VALIDATED -> NEW_VENDOR` on the new `remit_to_mismatch` event. The fingerprints are of fictional `XX00APAGENT...` accounts.
+
+   **The fixture and the proof.** Four new generator variants (`instruction_text`, `offpage_text`, `lookalike_vendor`, `remit_mismatch`) beside `hidden_text`. `tests/loop/test_generated_invoice_end_to_end.py::test_every_adversarial_document_stops_for_a_person_with_its_flag_on_the_trail` runs all five through real intake, the real output filter and the real `lookup_vendor`, with both seats faked, and asserts each stops in its declared state with its declared flag on the row that moved it - and that neither the planted text nor the IBAN is anywhere on the trail. The old test that asserted `hidden_text` reached `CLOSED` is gone.
+
+   **Config changed in place.** `guardrails.v1.yaml` gained `allow_password_protected`, `hidden_text` thresholds, `unscreened_fields`, per-pattern `skip_fields` and five patterns. Edited in place rather than as v2 because v1 had governed no payment; see DECISIONS.md.
+
+   **Audit rows per clean run went from 21 to 24**: intake is now two rows, and each reading gets a filter row.
 
 ### What is configured but not yet applied
 
 Worth being explicit, because a config file reads like a working control:
 
-- **`output_filter`** - patterns are declared and unit-tested against samples, but nothing in the loop runs them over model output yet.
-- **`input_validation`** - `ingest_document` enforces none of these limits; `max_pages`, `max_file_bytes` and the MIME allowlist are declared and unread.
+- **`output_filter`** - **applied** (2026-10-05), on every reading, before anything else reads it.
+- **`input_validation`** - **applied** (2026-10-05) in `ingest_document`. `max_line_items` and `max_field_length` are output-side and enforced by `InvoiceExtraction` at construction; a test asserts the YAML agrees with the contract.
+- **`hard_prohibitions`** - enforced by `tests/tools/test_tool_contracts.py`, as before; the YAML documents it.
 - **`approval_matrix`** - `request_approval` is still a stub, so no tier or rule is consulted. `PENDING_APPROVAL → APPROVED` is still the dangerous stub edge. Note that the matrix's `match_exception` rule now has something to fire on: `compute_match` produces the reason codes it keys off.
 - Of the tolerances, **all but `qty_under_billing_pct` are now read** by `compute_match`: both price legs, `qty_over_billing_pct`, both unmatched-charge legs, `tax_variance_abs` and `rounding_tolerance_abs`. `invoice_max_age_days` is read by the date rule and the staleness check. `qty_under_billing_pct` is unread because under-billing is tested one-sidedly - a shortfall is the vendor's loss and never an exception - so the value is declared and the rule needs no number.
 
 ## Where we are in the plan
 
-**Day 3 of 7, two-thirds through it.** Days 1 and 2 are done; Day 3 has three
-steps and the first two are finished.
+**Day 3 of 7 is done, and with it Phase 1.** The guardrails file is now enforced
+everywhere except the approval matrix, which waits on `request_approval`.
 
 The honest summary of the build: an invoice can walk the first six of nine doors
 on its own merits, and the rest are still propped open with scaffolding.
@@ -345,6 +367,7 @@ on its own merits, and the rest are still propped open with scaffolding.
 **Real, end to end:** intake (`ingest_document`), two independent readings
 (Sonnet on the image, Haiku on the text layer), the agreement-and-grounding
 check that scores them (`compute_extraction_confidence`, pure code, no model),
+input validation at intake and the output filter on every reading,
 the arithmetic validator, ambiguous-date resolution (receipt window, then vendor
 locale), vendor resolution against the master (`lookup_vendor`), the purchase
 order from QuickBooks (`get_purchase_order`), the goods receipts
@@ -370,11 +393,9 @@ with a failing test to confirm it.
    guardrails file with its tiers, its two-approver rules and its callback hold,
    serving an approval step that does not exist. This is the gap a reviewer
    finds first.
-2. **A configured guardrail with no consumer.** `output_filter` and
-   `input_validation` are declared, reviewed and unread - `grep` finds zero
-   consumers outside `contracts/guardrails.py`. The `hidden_text` fixture proves
-   it is exploitable today. This is Day 3 step 3 and it is the smallest of the
-   three.
+2. ~~**A configured guardrail with no consumer.**~~ **Closed 2026-10-05.**
+   `input_validation` and `output_filter` are applied; five adversarial
+   documents stop for a person, tested end to end and two of them live.
 3. **The second LLM seat does not exist.** The architecture says a model sits in
    exactly two chairs - reading documents, and explaining exceptions in prose.
    Only the first is occupied; `classify_exception` is a stub. As of 2026-09-16
@@ -399,16 +420,27 @@ fix in passing.
 
 ### Recommended order from here
 
-The guardrail first (Day 3 step 3): small, closes a hole the fixture proves is
-open, applies config already argued about rather than deciding anything new, and
-it is the half of Day 3 where the guardrails start doing something. Then
-`request_approval` and the deletion of the dangerous edge, which deserves a
-session of its own. Then `classify_exception`, which is the one that spends
+The guardrails are done. Next is `request_approval` and the deletion of the
+dangerous edge, which deserves a session of its own - and now has more to
+consult: the approval matrix's `remit_to_mismatch` rule (two approvers, callback
+hold) can key off `remit_to_matches_master`. Then `classify_exception`, which is the one that spends
 tokens and is better done once approval exists so the explanation has somewhere
 to land. `find_duplicates` is cheap and deterministic and would delete another
 stub edge whenever it fits.
 
-Neither of the first two needs a live API call.
+`request_approval` needs no live API call.
+
+### Guardrail limits worth knowing
+
+- **The remit-to comparison recognises IBANs only.** A US routing-and-account
+  pair in the block compares as None (nothing to compare), not False.
+- **A remit mismatch parks at `NEW_VENDOR`** rather than a dedicated callback
+  state. That was the least invasive existing state; revisit if callback
+  handling grows its own steps.
+- **No `ReasonCode` means "remit-to changed".** The event, halt state and truth
+  file's `expected_flag` carry it.
+- **The decision row for an output-filter halt is attributed to `EXTRACT-CONF@v1`**,
+  the step's rule; the `OUTPUT-FILTER@v1` rows just above it are the evidence.
 
 ## After Day 3 (report mapping)
 
