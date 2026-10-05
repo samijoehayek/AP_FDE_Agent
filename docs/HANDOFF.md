@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1616 tests**. If it is not, that is the first thing to fix and nothing below is
+**1624 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -432,8 +432,22 @@ stub edge whenever it fits.
 
 ### Guardrail limits worth knowing
 
-- **The remit-to comparison recognises IBANs only.** A US routing-and-account
-  pair in the block compares as None (nothing to compare), not False.
+- **The remit-to comparison recognises IBANs only, and zero IBANs means no
+  check.** A block with no IBAN - a postal address, or a US routing-and-account
+  pair - compares as None, and None does not hold the invoice. So **a changed
+  bank account from a non-IBAN country (the US above all) is not caught by
+  this check today**; it would need the ERP's ACH details and a pattern for
+  them. Asserted in `test_a_block_with_no_iban_compares_nothing`.
+- **More than one IBAN in the block fails unless every one is the account on
+  file.** A legitimate account printed next to a planted one is the attack, so
+  the real one being present never makes the block pass - in any order, spacing
+  or separator (`test_the_right_account_beside_a_second_one_is_a_mismatch`).
+- **One known false hold, in the safe direction.** When an IBAN's body is a
+  multiple of four characters (Spanish and Swedish IBANs, among others), a
+  following four-letter word such as "BANK" reads as one more group; the token
+  no longer matches and a legitimate invoice is held for a person. Pinned by
+  `test_an_account_the_pattern_cannot_split_fails_closed` so it can never turn
+  into a pass. The fix is a per-country IBAN length table (ISO 13616).
 - **The vendor-master fingerprint is an unsalted SHA-256 of a low-entropy
   value.** An IBAN has a known structure and a small keyspace per bank, so
   anyone holding the file could recover a real account by brute force - the

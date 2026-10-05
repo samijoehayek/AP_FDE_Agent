@@ -253,14 +253,64 @@ def test_a_different_account_is_a_mismatch() -> None:
     assert _remit("Meridian Office Supplies, IBAN GB29 NWBK 6016 1331 9268 19") is False
 
 
-def test_the_right_account_beside_a_second_one_is_still_a_mismatch() -> None:
-    """A block that names the real account and another is asking to be paid elsewhere."""
-    assert _remit(f"IBAN {ON_FILE} or IBAN GB29NWBK60161331926819") is False
+PLANTED = "GB29NWBK60161331926819"
+PLANTED_SPACED = "GB29 NWBK 6016 1331 9268 19"
+ON_FILE_SPACED = "XX00 APAG ENT0 0000 0005 9"
 
 
-@pytest.mark.parametrize("display", [None, "", "2140 Larkspur Commerce Way, Denver, CO 80216"])
-def test_a_block_with_no_account_compares_nothing(display: str | None) -> None:
-    """A postal address names no account. Nothing to compare is None, not a pass."""
+@pytest.mark.parametrize(
+    "display",
+    [
+        f"IBAN {ON_FILE} or IBAN {PLANTED}",
+        f"IBAN {PLANTED} / IBAN {ON_FILE}",
+        f"{ON_FILE_SPACED}, {PLANTED_SPACED}",
+        f"{PLANTED_SPACED} {ON_FILE_SPACED}",
+        f"{ON_FILE}\n{PLANTED}",
+        f"{ON_FILE} {PLANTED}",
+        f"Primary: {ON_FILE}. New account from 1 Nov: {PLANTED}",
+    ],
+)
+def test_the_right_account_beside_a_second_one_is_a_mismatch(display: str) -> None:
+    """A legitimate account printed next to a planted one is the attack.
+
+    Every IBAN in the block must be the account on file. Order, spacing and
+    separator make no difference - and nothing about the real account being
+    there too can make the block pass.
+    """
+    assert _remit(display) is False
+
+
+def test_an_account_the_pattern_cannot_split_fails_closed() -> None:
+    """A known false hold, pinned so it stays in the safe direction.
+
+    When an IBAN's body is a multiple of four characters, a following four-letter
+    word ("BANK") reads as one more group, so the token is longer than the account
+    and cannot match it. That holds a legitimate invoice for a person - the right
+    way to be wrong - and HANDOFF.md records it. A per-country IBAN length table
+    would split it; until then, this must never become True.
+    """
+    account = "XX00ABCDEFGHIJKLMNOPQRST"
+    on_file = remit_fingerprint(account)
+    assert remit_matches(f"IBAN {account}", on_file) is True
+    assert remit_matches(f"IBAN {account} BANK OF X", on_file) is False
+
+
+@pytest.mark.parametrize(
+    "display",
+    [
+        None,
+        "",
+        "2140 Larkspur Commerce Way, Denver, CO 80216",
+        "ACH routing 021000021, account 123456789",
+    ],
+)
+def test_a_block_with_no_iban_compares_nothing(display: str | None) -> None:
+    """No IBAN, nothing compared: None, never True.
+
+    A postal address names no account, and a non-IBAN account - a US routing
+    and account pair - is not recognised. None does not hold the invoice, so a
+    changed US account is not caught by this check; HANDOFF.md records that.
+    """
     assert _remit(display) is None
 
 
