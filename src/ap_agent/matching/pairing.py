@@ -48,6 +48,18 @@ if TYPE_CHECKING:
 __all__ = ["IndexedInvoiceLine", "LinePair", "PairedLines", "normalise_description", "pair_lines"]
 
 
+def _normalise_ref(ref: str | None) -> str | None:
+    """Reduce a line reference to what identifies the line, or None if empty.
+
+    Casefold and outer whitespace only. A reference is an identifier, not prose,
+    so its punctuation is kept: ``AB-12`` and ``AB12`` may be two items. Applied
+    to both sides, because a key normalised on one side only matches nothing.
+    """
+    if ref is None:
+        return None
+    return ref.strip().casefold() or None
+
+
 def normalise_description(description: str) -> str:
     """Reduce a line description to something two documents can be compared on.
 
@@ -142,7 +154,7 @@ def pair_lines(
     Never raises. An invoice this cannot pair is a match result with reasons on
     it, not an error - which is the same principle the whole matcher follows.
     """
-    by_ref = _unique_index(po_lines, lambda line: line.item_ref)
+    by_ref = _unique_index(po_lines, lambda line: _normalise_ref(line.item_ref))
     by_description = _unique_index(
         po_lines, lambda line: normalise_description(line.description or "") or None
     )
@@ -181,7 +193,7 @@ def _match_one(
     matches nothing is a claim that turned out to be wrong, and falling through
     to the description is more useful than failing on it.
     """
-    printed_ref = invoice_line.po_line_ref
+    printed_ref = _normalise_ref(invoice_line.po_line_ref)
     if printed_ref:
         found = by_ref.get(printed_ref)
         if found is not None:

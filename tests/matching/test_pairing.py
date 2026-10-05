@@ -76,6 +76,18 @@ def test_a_reference_that_matches_nothing_falls_through_to_the_description() -> 
     assert paired.pairs[0].po_line.line_no == 1
 
 
+@pytest.mark.parametrize(("ordered", "printed"), [("AB-12", " ab-12 "), (" ab-12", "AB-12  ")])
+def test_a_reference_is_compared_casefolded_and_stripped_on_both_sides(
+    ordered: str, printed: str
+) -> None:
+    """Case and outer spacing are rendering; the reference is the same claim."""
+    po_lines = [_po(1, "Widget", item_ref=ordered), _po(2, "Gasket", item_ref="CD-34")]
+
+    paired = pair_lines([_invoice("something else entirely", po_line_ref=printed)], po_lines)
+
+    assert [pair.po_line.line_no for pair in paired.pairs] == [1]
+
+
 # --- the description ---------------------------------------------------------
 
 
@@ -132,6 +144,42 @@ def test_an_ambiguous_description_pairs_nothing() -> None:
     assert paired.pairs == ()
     assert len(paired.unmatched) == 1
     assert len(paired.unbilled) == 2
+
+
+def test_a_reworded_description_is_unmatched_and_its_po_line_unbilled() -> None:
+    """Pairing is exact after normalisation. A synonym is a different string.
+
+    The line goes to the unmatched-charge tolerance and the ordered line shows
+    as outstanding, so a person sees both halves of what may be one item.
+    """
+    po_lines = [_po(1, "27in IPS Monitor")]
+
+    paired = pair_lines([_invoice("27 inch IPS Display")], po_lines)
+
+    assert paired.pairs == ()
+    assert [item.index for item in paired.unmatched] == [0]
+    assert [line.line_no for line in paired.unbilled] == [1]
+
+
+def test_descriptions_differing_only_in_a_digit_do_not_pair() -> None:
+    """A 10mm bolt is not a 12mm bolt. Digits are identity, not rendering."""
+    po_lines = [_po(1, "Hex Bolt 10mm")]
+
+    paired = pair_lines([_invoice("Hex Bolt 12mm")], po_lines)
+
+    assert paired.pairs == ()
+    assert len(paired.unmatched) == 1
+
+
+def test_a_description_duplicated_on_the_po_leaves_every_invoice_line_unmatched() -> None:
+    """Two invoice lines, one ambiguous key: neither is guessed onto a line."""
+    po_lines = [_po(1, "Widget"), _po(2, "WIDGET")]
+
+    paired = pair_lines([_invoice("Widget", qty=2), _invoice("widget", qty=3)], po_lines)
+
+    assert paired.pairs == ()
+    assert [item.index for item in paired.unmatched] == [0, 1]
+    assert [line.line_no for line in paired.unbilled] == [1, 2]
 
 
 def test_a_po_line_with_no_description_is_not_a_key() -> None:
@@ -236,3 +284,9 @@ def test_normalisation_is_the_vendor_normaliser() -> None:
     """Shared on purpose: two implementations would drift, and about money."""
     assert normalise_description("A4 Copier Paper (box)") == "a4 copier paper box"
     assert normalise_description("  Widget,  10mm ") == "widget 10mm"
+
+
+def test_normalisation_keeps_digits() -> None:
+    """Punctuation goes, digits stay - the digit test above depends on it."""
+    assert normalise_description("Hex Bolt M10 x 25") == "hex bolt m10 x 25"
+    assert normalise_description("Hex Bolt 10mm") != normalise_description("Hex Bolt 12mm")

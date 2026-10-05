@@ -31,6 +31,8 @@ from ap_agent.matching import compute_match
 
 if TYPE_CHECKING:
     from ap_agent.contracts.guardrails import GuardrailConfig
+    from ap_agent.contracts.invoice import InvoiceExtraction
+    from ap_agent.contracts.purchase_order import PurchaseOrder
 
 WIDGET = "Widget 10mm"
 GASKET = "Gasket 4in"
@@ -500,6 +502,69 @@ def test_the_share_is_taken_against_the_sum_of_the_ordered_lines(
     )
 
     assert result.matched, "40.00 is under $50 and under 2% of the 2,000.00 ordered"
+
+
+def _with_freight(
+    *amounts: str, qty: str = "500"
+) -> tuple[InvoiceExtraction, PurchaseOrder, ReceiptSet]:
+    """An order for ``qty`` widgets at $20, billed exactly, plus freight lines."""
+    return (
+        invoice(
+            invoice_line(WIDGET, qty, "20.00"),
+            *(invoice_line("Freight", "1", amount) for amount in amounts),
+        ),
+        purchase_order(po_line(1, WIDGET, qty, "20.00")),
+        receipts((1, qty)),
+    )
+
+
+def test_freight_large_split_into_two_lines_is_still_held(
+    guardrails: GuardrailConfig,
+) -> None:
+    """The fixture's $120 as two $60 lines. Each line is over the cap on its own."""
+    extraction, order, received = _with_freight("60.00", "60.00")
+
+    result = compute_match(extraction, order, received, guardrails)
+
+    assert ReasonCode.LINE_NOT_ON_PO in result.reason_codes
+
+
+def test_freight_split_under_the_cap_is_caught_by_the_sum(
+    guardrails: GuardrailConfig,
+) -> None:
+    """$120 as three $40 lines: every line passes alone, so only the sum holds it.
+
+    This is the case the combined test exists for. Without it a vendor could
+    bill any amount of unexplained charges in pieces just under the cap.
+    """
+    extraction, order, received = _with_freight("40.00", "40.00", "40.00")
+
+    result = compute_match(extraction, order, received, guardrails)
+
+    assert ReasonCode.LINE_NOT_ON_PO in result.reason_codes
+    unmatched = [line for line in result.lines if line.outcome is MatchLineOutcome.UNMATCHED]
+    assert [line.invoice_line_index for line in unmatched] == [1, 2, 3], "one row per line"
+
+
+def test_split_freight_is_summed_against_the_percentage_leg_too(
+    guardrails: GuardrailConfig,
+) -> None:
+    """Two $15 lines on a $1,000 order: $30 is under the cap and over the 2% share."""
+    extraction, order, received = _with_freight("15.00", "15.00", qty="50")
+
+    result = compute_match(extraction, order, received, guardrails)
+
+    assert ReasonCode.LINE_NOT_ON_PO in result.reason_codes
+
+
+def test_two_small_freight_lines_within_both_legs_pass(guardrails: GuardrailConfig) -> None:
+    """$40 in total against a $50 cap and a $200 share. Nothing to see."""
+    extraction, order, received = _with_freight("20.00", "20.00")
+
+    result = compute_match(extraction, order, received, guardrails)
+
+    assert result.matched
+    assert [line.outcome for line in result.lines].count(MatchLineOutcome.UNMATCHED) == 2
 
 
 # --- the header -------------------------------------------------------------

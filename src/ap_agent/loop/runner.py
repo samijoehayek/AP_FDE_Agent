@@ -41,7 +41,7 @@ from ap_agent.contracts.audit import (
     ToolActor,
     utc_now,
 )
-from ap_agent.contracts.enums import AuditEventType, ReasonCode
+from ap_agent.contracts.enums import AuditEventType, MatchLineOutcome, ReasonCode
 from ap_agent.contracts.matching import MatchResult
 from ap_agent.contracts.run import (
     Action,
@@ -102,6 +102,7 @@ from ap_agent.tools.lookup_vendor import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from decimal import Decimal
 
     from pydantic import BaseModel
 
@@ -120,7 +121,7 @@ INGEST_RULE_ID = "INGEST@v1"
 EXTRACT_CONF_RULE_ID = "EXTRACT-CONF@v1"
 DATE_RESOLVE_RULE_ID = "DATE-RESOLVE@v1"
 RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
-MATCH_PREP_RULE_ID = "MATCH-PREP@v1"
+MATCH_RULE_ID = "MATCH@v1"
 STUB_RULE_ID = "STUB"
 
 HALT_NO_TOOL = "halt_no_tool"
@@ -397,7 +398,7 @@ def decide(record: InvoiceRecord) -> Action:
             # One step, up to two calls: the order and what arrived against it.
             # The rule decides whether to ask at all, and what to do with the
             # answers - neither tool decides anything.
-            return Action(kind=ActionKind.MATCH_PREP, by="rule", rule_id=MATCH_PREP_RULE_ID)
+            return Action(kind=ActionKind.MATCH_PREP, by="rule", rule_id=MATCH_RULE_ID)
         case _:
             return Action(kind=ActionKind.STUB, by="rule", rule_id=STUB_RULE_ID)
 
@@ -1127,7 +1128,52 @@ def _match_basis(result: MatchResult, order: PurchaseOrder, receipts: ReceiptSet
     ]
     if result.reason_codes:
         parts.append("reasons=" + "|".join(code.value for code in result.reason_codes))
+    if receipts is not None:
+        # Last, so the slice below cuts line detail rather than the codes.
+        parts.append(_match_lines_summary(result))
     return ", ".join(parts)[:MAX_BASIS_CHARS]
+
+
+def _match_lines_summary(result: MatchResult) -> str:
+    """Each paired line's verdict and the numbers behind it, compactly.
+
+    ``lines=1:ok,2:price_over(3.00%,642.00;limit 2%/50) ; unmatched=0 ; unbilled=0``
+
+    So a reviewer reading the trail sees *which* line raised a code and by how
+    much, without opening the stored result. Lines are named by purchase-order
+    line number, never by description: a description is vendor-controlled text,
+    and none of it goes in the trail.
+    """
+    tolerances = load_guardrails().tolerances
+    paired: list[str] = []
+    unmatched = unbilled = 0
+    for line in result.lines:
+        if line.outcome is MatchLineOutcome.UNMATCHED:
+            unmatched += 1
+        elif line.outcome is MatchLineOutcome.UNBILLED:
+            unbilled += 1
+        elif line.outcome is MatchLineOutcome.PRICE_OVER:
+            pct = "n/a" if line.price_variance_pct is None else f"{line.price_variance_pct:.2f}%"
+            paired.append(
+                f"{line.line_no}:price_over({pct},{line.price_variance_abs};"
+                f"limit {_plain(tolerances.price_variance_pct)}%/"
+                f"{_plain(tolerances.price_variance_abs)})"
+            )
+        elif line.outcome is MatchLineOutcome.QTY_OVER:
+            billed = "none" if line.invoice_qty is None else _plain(line.invoice_qty)
+            received = "none" if line.received_qty is None else _plain(line.received_qty)
+            paired.append(
+                f"{line.line_no}:qty_over({billed}>{received};"
+                f"limit {_plain(tolerances.qty_over_billing_pct)}%)"
+            )
+        else:
+            paired.append(f"{line.line_no}:{line.outcome.value}")
+    return f"lines={','.join(paired) or 'none'} ; unmatched={unmatched} ; unbilled={unbilled}"
+
+
+def _plain(value: Decimal) -> str:
+    """A decimal without trailing zeros or an exponent: ``2.0`` -> ``2``."""
+    return f"{value.normalize():f}"
 
 
 def _stub_step(record: InvoiceRecord) -> tuple[InvoiceRecord, StepResult]:

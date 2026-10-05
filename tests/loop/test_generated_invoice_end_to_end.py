@@ -25,7 +25,7 @@ import pymupdf
 import pytest
 
 from ap_agent.audit.writer import JsonlAuditWriter
-from ap_agent.contracts.audit import utc_now
+from ap_agent.contracts.audit import RuleActor, utc_now
 from ap_agent.contracts.enums import MatchLineOutcome, ReasonCode
 from ap_agent.contracts.generated import GeneratedInvoiceTruth, GeneratedVariant
 from ap_agent.contracts.invoice import InvoiceExtraction
@@ -488,6 +488,31 @@ def test_the_exception_run_stops_at_exception_and_says_why(
     assert ReasonCode.PRICE_OVER_TOLERANCE.value in basis
     assert "config_version=guardrails_v1" in basis
     assert decision.to_state is InvoiceState.EXCEPTION
+
+
+def test_the_decision_names_the_line_and_the_limit_it_broke(
+    record: InvoiceRecord, fixture_root: Path
+) -> None:
+    """Which line, by how much, against what - readable from the row alone.
+
+    The decision is recorded under ``MATCH@v1``. The matcher's own tool row keeps
+    its gathering summary; the per-line detail belongs on the decision.
+    """
+    truth = _truth(fixture_root, GeneratedVariant.PRICE_PLUS_3PCT)
+    ctx = _context(fixture_root, truth, variant=GeneratedVariant.PRICE_PLUS_3PCT)
+
+    run(record, ctx)
+
+    decision = next(event for event in ctx.events if event.decision == "match_exception")
+    assert isinstance(decision.actor, RuleActor)
+    assert decision.actor.rule_id == "MATCH@v1"
+    basis = decision.decision_basis or ""
+    assert "price_over(3.00%,45.00;limit 2%/50)" in basis
+    assert "; unmatched=0 ; unbilled=" in basis
+
+    tool_row = next(event for event in ctx.events if event.tool_name == "compute_match")
+    assert "price_over" not in (tool_row.decision_basis or "")
+    assert "unmatched=" not in (tool_row.decision_basis or "")
 
 
 def test_the_matcher_gets_its_own_audit_row_with_a_content_address(

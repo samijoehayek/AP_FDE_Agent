@@ -433,6 +433,13 @@ def _check_unmatched(
     header total. A total the matcher computes from the lines it is comparing
     cannot disagree with those lines; a stored one can, and then the tolerance
     is a percentage of a number nobody checked.
+
+    **Each line, and then all of them together.** A per-line test alone is
+    defeated by arithmetic: $120 of freight printed as three $40 lines passes a
+    $50 cap three times. So the unmatched charges are also summed and the sum is
+    judged against the same two legs. The per-line test stays, because a credit
+    line is negative and would let a $100 charge hide behind a $60 discount in
+    the sum.
     """
     if not unmatched:
         return []
@@ -440,10 +447,13 @@ def _check_unmatched(
     po_total = sum((po_line.extended for po_line in po_lines), Decimal(0))
     share = po_total * tolerances.unmatched_charge_pct / _HUNDRED
 
+    combined = sum((item.line.extended_price for item in unmatched), Decimal(0))
+    if _is_over_unmatched(combined, share, tolerances):
+        reasons.add(ReasonCode.LINE_NOT_ON_PO)
+
     rows: list[MatchLine] = []
     for item in unmatched:
-        amount = item.line.extended_price
-        if amount > tolerances.unmatched_charge_abs or amount > share:
+        if _is_over_unmatched(item.line.extended_price, share, tolerances):
             reasons.add(ReasonCode.LINE_NOT_ON_PO)
         rows.append(
             MatchLine(
@@ -454,6 +464,11 @@ def _check_unmatched(
             )
         )
     return rows
+
+
+def _is_over_unmatched(amount: Decimal, share: Decimal, tolerances: Tolerances) -> bool:
+    """Whether an unmatched amount breaks either leg. Both must hold to pass."""
+    return amount > tolerances.unmatched_charge_abs or amount > share
 
 
 def _unbilled_rows(unbilled: Sequence[PurchaseOrderLine], receipts: ReceiptSet) -> list[MatchLine]:
