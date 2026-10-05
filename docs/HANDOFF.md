@@ -1,6 +1,32 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-09-16, Day 3. Update this file at the end of every working day._
+_Last updated: 2026-10-05. Last code change 2026-09-16 (Day 3, step 2). Update this file at the end of every working day._
+
+## Start here — catching up a new session
+
+Read these four files, in this order, before changing anything:
+
+1. **`CLAUDE.md`** — the seven non-negotiable rules, the conventions, and what is
+   stubbed. Loaded into every session automatically; read it anyway, because the
+   "what is stubbed" section is the fastest true picture of the repo.
+2. **This file** — state of every component, the 7-day plan, and where the plan
+   has actually got to. The section *Where we are in the plan* is the one-screen
+   answer.
+3. **`docs/DECISIONS.md`** — every decision with the alternative it beat, newest
+   first. Read at least the two most recent sections (`2026-09-16 — the
+   three-way match` and `2026-09-15 — guardrails as config`). A decision
+   recorded here is settled; do not re-derive it.
+4. **`ap-invoice-agent-architecture-and-stack.md`** — the original design, where
+   it still exists. Treat as established. Where this repo diverges from it, the
+   divergence is recorded in DECISIONS.md with a reason.
+
+Then run `just lint && just typecheck && just test` once. It should be green at
+**1385 tests**. If it is not, that is the first thing to fix and nothing below is
+trustworthy until it is.
+
+**Gap in the record:** there was a ~3-week pause between 2026-09-16 and
+2026-10-05 with no commits. Nothing changed in the repo during it. `git log
+--oneline -10` is the fastest confirmation.
 
 ## Purpose (three sentences)
 
@@ -239,7 +265,7 @@ Both were found by reading the files rather than by a test failing later.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
 7. Off-keyboard: book the customer interview.
 
-## Day 3 — in progress
+## Day 3 — steps 1 and 2 done, step 3 is next
 
 1. **DONE.** Guardrails as versioned YAML with a typed loader.
    - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`. The price band and the unmatched-charge rule are each a **pair that must both hold** - an absolute cap alone is a licence on a small order, a percentage alone is one on a large order.
@@ -247,8 +273,39 @@ Both were found by reading the files rather than by a test failing later.
    - `MAX_INVOICE_AGE_DAYS` is gone from `loop/dates.py`. `resolve_date_by_receipt_window` takes the window as a required argument and the loop reads it from config, so the number a run applied is the one its `config_version` names.
    - The config and the generated fixture are tested **against each other**: a 3% overcharge breaching a 2% band, two units over a 0% band, and $25/$120 against the $50-and-2% unmatched-charge rule. Neither can drift alone. One test records *which* half is doing the work today: $120 is caught by the absolute cap on every seeded order, and the percentage arm alone would pass it - so if a smaller order is ever seeded, that test flips and says so.
    - `just probe-schema` added (not run): sends each exported schema with a dummy document and reports accepted or refused.
-2. **NEXT, and the owner's to write:** `compute_match`. It takes a `GuardrailConfig` and stamps `config_version` on the `MatchResult`. Everything it compares is already on the record by `DUPLICATE_CHECKED` - extraction, purchase order, receipts.
-3. Then: the five adversarial invoices must land in human review. Four of the five already exist in the generated fixture (hidden text, remit-to mismatch is the gap). Nothing evaluates the output filter yet - the patterns are configured, and the code that applies them is Day 3 step 3.
+2. **DONE, 2026-09-16.** `compute_match`, written in four reviewed pieces. This is the function that decides whether money is owed, and the detail below is what a new session needs so it does not have to re-read the module to know what was decided.
+
+   **Where the code is.** The reasoning is `src/ap_agent/matching/` - `engine.py:137` is `compute_match(extraction, po, receipts, config) -> MatchResult`, and `pairing.py:128` is `pair_lines`. The tool wrapper is `src/ap_agent/tools/compute_match.py:72`, same name, different job: it unpacks the tool envelope, loads the guardrails, checks the version, and calls the real one. **Read `engine.py`; the loop calls the wrapper.**
+
+   **The property that matters most: quantities are compared to what was *received*, never to `qty_ordered`.** An order for 11 monitors that has delivered none is an order a vendor can bill 2 against and look correct against the paperwork, because 2 is well inside what was authorised. Against the goods receipt it is a bill for two monitors nobody has. Two fixtures exist to fail the matcher if anyone changes this: `AP-SEED-010/qty_over_received` bills 2 of a line that ordered 11 and received 0, and `AP-SEED-009/qty_over_received` bills 9 of a line that ordered 9 and received 7. Both pass a two-way match. If a change makes those two tests go green by comparing to the order, the change is wrong.
+
+   **The other four properties**, each with its own test:
+   - **Every two-legged tolerance requires both legs.** Price and unmatched charges each hold a percentage and an absolute cap, and both must pass, so the tighter one binds. Either alone is a licence somewhere: on a $272,100 order 2% is $5,400 and any freight passes; $50 on a $12 line is four times the line.
+   - **It never raises.** An invoice it cannot make sense of is a `MatchResult` carrying reason codes. A raise would travel up as an *error* - something broken, to be retried - when the correct handling is a routing decision. An empty invoice, an order with no lines, a line priced at zero: all return a result.
+   - **No free text enters or leaves.** Line descriptions are join keys in `pairing.py` and nothing else; `suspicious_text`, `remit_to_display`, `payment_terms` and `vendor_name` are never read. `MatchResult` has no string field a vendor controls - lines are identified by PO line number and by position in the extraction. A test serialises all 60 fixture results and asserts no description appears.
+   - **Pure.** No I/O, no clock, no model, no ERP, so a past decision replays identically under its own `config_version`.
+
+   **Design calls worth knowing before editing it:**
+   - Quantity is decided per *purchase-order line*, price per *invoice line*. Two invoice lines of 2 against a receipt of 3 are unremarkable apart and an over-bill together, so quantities sum; prices stay their own, because averaging would let a correct line pay for an inflated one. The summed quantity then appears on **every** row of the group - the decision was made on the sum, and a row showing only its own 2 would make the exception unexplainable.
+   - `RECEIPT_MISSING` and `QUANTITY_OVER_TOLERANCE` both fire on a line that received nothing. Two different facts, and a reviewer needs both.
+   - An ordered line nobody billed raises **nothing**. A partial invoice against a partial delivery is normal; the row exists only so a reviewer sees what is outstanding.
+   - Identity stays in the loop. The matcher is given no vendor at all, because "does this order belong to this vendor" is a comparison of ERP ids. The loop answers "may these be compared"; the matcher answers "do they agree".
+   - Rounding happens *after* every comparison. `Money` refuses to round so a transcribed amount cannot be altered; a derived delta is the matcher's own arithmetic and must be readable, but a tolerance evaluated on a rounded figure would make half a cent the difference between paying and not.
+   - `PARTIALLY_RECEIVED` is a billable status alongside `OPEN`. QuickBooks emits only Open/Closed so it is theoretical today.
+
+   **What the loop does now.** `DUPLICATE_CHECKED` fetches the order and the receipts, runs `compute_match`, writes its own audit row with the result's sha256 as `output_ref`, and moves the invoice to `MATCHED` on `match` or `EXCEPTION` on `match_exception`. The decision's `decision_basis` carries the reason codes **and** the config version together, because a code without the ruleset that raised it cannot be re-checked later. The purchase-order vendor check now raises `PO_VENDOR_MISMATCH` on a `MatchResult` instead of writing a prose sentence. `InvoiceRecord` gained `match_result`; `RunContext` gained `compute_match`.
+
+   **`DUPLICATE_CHECKED → MATCHED` on `stub_ok` is deleted.** It advanced every invoice regardless of its numbers.
+
+   **Tests: 252** (`tests/matching/`, plus `tests/tools/test_compute_match.py`). 39 hand-written cases against the real `config/guardrails.v1.yaml` rather than a double, 19 for pairing, and a sweep of all 60 generated invoices against their truth files.
+
+   **One thing to understand before trusting that sweep.** `expected_reason_codes` in a `truth.json` is the *planted defect's signature* composed with the order's own state - not an exhaustive verdict. `AP-SEED-010/clean` declares `receipt_missing` alone, and a correct matcher also reports `quantity_over_tolerance`, because that invoice bills 9, 11 and 10 units of three lines that received nothing. So the sweep asserts: a declared MATCHED must produce **zero** codes, a declared EXCEPTION must contain **every** code the generator planted, and the one place the two legitimately differ is asserted by name in `test_where_the_matcher_says_more_than_the_truth_file`. The comparison is also filtered to matcher-owned codes, because `hidden_text` carries `suspicious_document_content`, which belongs to the output filter.
+
+   **Side effect worth knowing:** `normalise_vendor_name` moved from `tools/lookup_vendor.py` to `src/ap_agent/text.py`. Not optional - importing it from `tools/` made the matcher import the whole tool package, which imports the matcher. One normaliser shared by vendor resolution and line pairing; two would agree until one was edited.
+
+   **Three loop test fixtures changed**, each quietly wrong in a way nothing had checked: the loop's "clean" invoice claimed $20 of tax on a line with no tax rate, and the ambiguous-date invoice was in INR against a USD order. Harmless until something compared a header to its lines.
+
+3. **NEXT — apply the guardrails that are configured and unread.** The patterns and limits exist in `config/guardrails.v1.yaml` and **nothing reads them**; see *What is configured but not yet applied* below. The fixture already proves the hole: `hidden_text` plants white 4pt type telling the reader to change the vendor's bank account, its arithmetic is perfect so the matcher passes it correctly, its truth file says `expected_human_review: true`, and `tests/loop/test_generated_invoice_end_to_end.py::test_the_hidden_text_variant_reaches_the_same_place_on_the_numbers` asserts it reaches `CLOSED` with a comment naming the gap. Shape of the work: a function that runs the `output_filter` patterns over the extraction's string fields before anything downstream reads them, a route to a human when one matches, **nothing ever silently rewritten** (`never_auto_fix: true`, and stripping an IBAN destroys the evidence that somebody tried), `input_validation` enforced in `ingest_document` before any model call, and that `hidden_text` test flipping from "reaches CLOSED, which is the gap" to "reaches a person, which is the point". No live API calls needed.
 
 ### What is configured but not yet applied
 
@@ -257,7 +314,66 @@ Worth being explicit, because a config file reads like a working control:
 - **`output_filter`** - patterns are declared and unit-tested against samples, but nothing in the loop runs them over model output yet.
 - **`input_validation`** - `ingest_document` enforces none of these limits; `max_pages`, `max_file_bytes` and the MIME allowlist are declared and unread.
 - **`approval_matrix`** - `request_approval` is still a stub, so no tier or rule is consulted. `PENDING_APPROVAL → APPROVED` is still the dangerous stub edge. Note that the matrix's `match_exception` rule now has something to fire on: `compute_match` produces the reason codes it keys off.
-- Of the tolerances, only `invoice_max_age_days` is read by anything today.
+- Of the tolerances, **all but `qty_under_billing_pct` are now read** by `compute_match`: both price legs, `qty_over_billing_pct`, both unmatched-charge legs, `tax_variance_abs` and `rounding_tolerance_abs`. `invoice_max_age_days` is read by the date rule and the staleness check. `qty_under_billing_pct` is unread because under-billing is tested one-sidedly - a shortfall is the vendor's loss and never an exception - so the value is declared and the rule needs no number.
+
+## Where we are in the plan
+
+**Day 3 of 7, two-thirds through it.** Days 1 and 2 are done; Day 3 has three
+steps and the first two are finished.
+
+The honest summary of the build: an invoice can walk the first six of nine doors
+on its own merits, and the rest are still propped open with scaffolding.
+
+**Real, end to end:** intake (`ingest_document`), two independent readings
+(Sonnet on the image, Haiku on the text layer), the agreement-and-grounding
+check that scores them (`compute_extraction_confidence`, pure code, no model),
+the arithmetic validator, ambiguous-date resolution (receipt window, then vendor
+locale), vendor resolution against the master (`lookup_vendor`), the purchase
+order from QuickBooks (`get_purchase_order`), the goods receipts
+(`get_receipts`), and **the three-way match** (`compute_match`). The state
+machine, the transition table, and the hash-chained JSONL audit trail are real
+throughout.
+
+**8 of 16 tools are real.** Stubs: `find_duplicates`, `propose_gl_coding`,
+`request_approval`, `create_bill`, `classify_exception`, `notify`,
+`mark_ready_for_payment`, `verify_vendor_external`.
+
+**10 stub edges remain** in `STUB_TRANSITIONS`, all after `MATCHED`. They are
+enumerated in `states/machine.py` and asserted in
+`tests/states/test_stub_transitions.py`, so deleting one is a deliberate act
+with a failing test to confirm it.
+
+### The three holes that matter, ranked
+
+1. **A machine still approves invoices.** `PENDING_APPROVAL → APPROVED` is a
+   stub edge whose own comment calls it THE DANGEROUS ONE. The pitch for this
+   whole project is deterministic money decisions plus a real human in the loop,
+   and the human is currently a `stub_ok`. The approval matrix sits in the
+   guardrails file with its tiers, its two-approver rules and its callback hold,
+   serving an approval step that does not exist. This is the gap a reviewer
+   finds first.
+2. **A configured guardrail with no consumer.** `output_filter` and
+   `input_validation` are declared, reviewed and unread - `grep` finds zero
+   consumers outside `contracts/guardrails.py`. The `hidden_text` fixture proves
+   it is exploitable today. This is Day 3 step 3 and it is the smallest of the
+   three.
+3. **The second LLM seat does not exist.** The architecture says a model sits in
+   exactly two chairs - reading documents, and explaining exceptions in prose.
+   Only the first is occupied; `classify_exception` is a stub. As of 2026-09-16
+   there are finally real `MatchResult`s for it to explain, so its input exists.
+
+### Recommended order from here
+
+The guardrail first (Day 3 step 3): small, closes a hole the fixture proves is
+open, applies config already argued about rather than deciding anything new, and
+it is the half of Day 3 where the guardrails start doing something. Then
+`request_approval` and the deletion of the dangerous edge, which deserves a
+session of its own. Then `classify_exception`, which is the one that spends
+tokens and is better done once approval exists so the explanation has somewhere
+to land. `find_duplicates` is cheap and deterministic and would delete another
+stub edge whenever it fits.
+
+Neither of the first two needs a live API call.
 
 ## After Day 3 (report mapping)
 
