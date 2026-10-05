@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1609 tests**. If it is not, that is the first thing to fix and nothing below is
+**1616 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -334,7 +334,7 @@ Both were found by reading the files rather than by a test failing later.
 
 3. **DONE, 2026-10-05.** The guardrails applied, in four pieces. Every decision and the alternative it beat is in DECISIONS.md, *2026-10-05 — the guardrails, applied*.
 
-   **Input validation, at intake.** `ingest_document` applies `input_validation` before any model call: file type, size, page count and password; then near-white text on near-white paper, text outside the page box, and a text layer over a blank render. A flag routes `RECEIVED -> NEEDS_HUMAN_EXTRACTION` on the new `input_flagged` event, with an `INPUT-VALIDATE@v1` decision row on every document (`flags=none` when clean). **Zero tokens on a flagged document** - verified live. Across all 230 local documents it flags exactly the 10 planted `hidden_text` PDFs.
+   **Input validation, at intake.** `ingest_document` applies `input_validation` before any model call: file type, size, page count and password; then near-white text on near-white paper, text outside the page box, and a text layer over a blank render. A flag routes `RECEIVED -> NEEDS_HUMAN_EXTRACTION` on the new `input_flagged` event, with an `INPUT-VALIDATE@v1` decision row on every document (`flags=none` when clean). **Zero tokens on a flagged document** - verified live. Across all 270 local documents it flags exactly the 20 intake-detectable plants - `hidden_text` (`near_white_text`) and `offpage_text` (`offpage_text`) on all ten orders - and nothing else.
 
    **Output filter, on every reading.** Each reading is screened the moment it returns, in the extraction step: any non-empty `suspicious_text`, and the `output_filter` patterns (IBAN, account-length digits, bank/remittance/account changes, URLs, ignore-instructions, transfer-funds, pay-to) in every string field except `remit_to_display`. One `OUTPUT-FILTER@v1` row per reading. Any hit routes `INGESTED -> NEEDS_HUMAN_EXTRACTION` on the new `output_flagged` event, and the flagged reading never reaches the record or the confidence check. `account_number_like` skips identifier fields, because measured on the corpus it otherwise fires on every Kaggle invoice number.
 
@@ -434,6 +434,13 @@ stub edge whenever it fits.
 
 - **The remit-to comparison recognises IBANs only.** A US routing-and-account
   pair in the block compares as None (nothing to compare), not False.
+- **The vendor-master fingerprint is an unsalted SHA-256 of a low-entropy
+  value.** An IBAN has a known structure and a small keyspace per bank, so
+  anyone holding the file could recover a real account by brute force - the
+  fingerprint keeps a number out of the file, not out of reach. Acceptable here
+  because every account behind it is fictional. Production would use an HMAC
+  with a server-side key held outside the repository, or keep bank references
+  in the ERP behind its access control and compare there.
 - **A remit mismatch parks at `NEW_VENDOR`** rather than a dedicated callback
   state. That was the least invasive existing state; revisit if callback
   handling grows its own steps.

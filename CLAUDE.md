@@ -86,7 +86,11 @@ except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
 `get_receipts` and `compute_match` raise `NotImplementedError` under a docstring
 describing the responsibility and the constraints.
 
-`guardrails/config.py` and `src/ap_agent/matching/` are real. The matcher is
+`guardrails/config.py`, `guardrails/output_filter.py` and `src/ap_agent/matching/`
+are real. The output filter screens every model reading before anything reads
+it and routes a hit to a person; it never rewrites a reading, never screens
+`remit_to_display` (compared to the vendor master in `lookup_vendor` instead),
+and its flags never carry document text. The matcher is
 pure - no I/O, no clock, no model - and it never raises: an invoice it cannot
 make sense of is a `MatchResult` carrying reason codes, because that is a
 routing decision rather than an error. It compares billed quantities to what was

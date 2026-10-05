@@ -10,6 +10,7 @@ the point of it being a file.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,10 @@ from ap_agent.tools.lookup_vendor import (
     lookup_vendor,
     normalise_tax_id,
     normalise_vendor_name,
+    remit_fingerprint,
+    remit_matches,
 )
+from ap_agent.vendor_master import load_vendor_master
 
 TWO_ACMES = """
 version: "v1"
@@ -218,6 +222,30 @@ def _remit(display: str | None) -> bool | None:
 )
 def test_the_account_on_file_matches_however_it_is_spaced(display: str) -> None:
     assert _remit(display) is True
+
+
+def test_a_spaced_iban_matches_an_unspaced_fingerprint() -> None:
+    """Printed grouped in fours; stored as the SHA-256 of the run-together form.
+
+    The fingerprint is computed here with hashlib directly, not through
+    remit_fingerprint, so the test does not grade the function with itself.
+    """
+    stored = hashlib.sha256(b"GB29NWBK60161331926819").hexdigest()
+    assert remit_matches("Remit to IBAN GB29 NWBK 6016 1331 9268 19", stored) is True
+    assert remit_matches("iban: gb29 nwbk 6016 1331 9268 19", stored) is True
+
+
+def test_every_shipped_fingerprint_is_of_the_normalised_account() -> None:
+    """The master was fingerprinted in the same form the comparison hashes.
+
+    Upper-case, no whitespace. If the two disagreed, every real account would
+    read as a mismatch - so this is checked for all ten, not assumed.
+    """
+    for vendor in load_vendor_master():
+        account = f"XX00APAGENT{int(vendor.erp_id):010d}"
+        assert vendor.remit_account_sha256 == hashlib.sha256(account.encode()).hexdigest()
+        assert vendor.remit_account_sha256 == remit_fingerprint(account.lower())
+        assert vendor.remit_account_sha256 == remit_fingerprint(" ".join(account))
 
 
 def test_a_different_account_is_a_mismatch() -> None:

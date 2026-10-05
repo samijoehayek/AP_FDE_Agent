@@ -116,10 +116,41 @@ def test_the_remit_to_block_is_left_to_the_vendor_master(config: OutputFilter) -
 
 
 def test_an_account_number_in_the_invoice_number_field_is_expected(config: OutputFilter) -> None:
-    """account_number_like skips identifier fields, and only that pattern does."""
-    reading = _reading(invoice_number="123456789012")
-    assert _checks(reading, config) == []
-    assert ("iban", "invoice_number") in _checks(_reading(invoice_number=PLANTED_IBAN), config)
+    """account_number_like skips identifier fields: digits are what identifiers are."""
+    assert _checks(_reading(invoice_number="123456789012"), config) == []
+
+
+def _po_line_ref(ref: str) -> list[LineItem]:
+    return [
+        LineItem(
+            description="Widget, 10mm",
+            quantity=Decimal(10),
+            unit_price=Decimal("20.00"),
+            extended_price=Decimal("200.00"),
+            po_line_ref=ref,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "update"),
+    [
+        ("invoice_number", {"invoice_number": PLANTED_IBAN}),
+        ("po_references", {"po_references": [PLANTED_IBAN]}),
+        ("line_items.po_line_ref", {"line_items": _po_line_ref(PLANTED_IBAN)}),
+        ("vendor_tax_id", {"vendor_tax_id": PLANTED_IBAN}),
+        ("bill_to_tax_id", {"bill_to_tax_id": PLANTED_IBAN}),
+    ],
+)
+def test_an_iban_in_an_identifier_field_still_trips_the_filter(
+    config: OutputFilter, field: str, update: dict[str, object]
+) -> None:
+    """The skip belongs to account_number_like alone. The IBAN pattern skips nothing.
+
+    An identifier is where a document is expected to print digits, not where it
+    is expected to print a payment destination.
+    """
+    assert ("iban", field) in _checks(_reading(**update), config)
 
 
 def test_an_evidence_snippet_is_screened_as_the_field_it_cites(config: OutputFilter) -> None:
