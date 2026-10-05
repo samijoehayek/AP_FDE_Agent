@@ -105,6 +105,11 @@ jobs:
       - name: Run migrations
         run: uv run alembic upgrade head
 
+      # The models and the migrated schema must agree. 0001 shipped without five
+      # of the indexes its models declared, and nothing noticed until Day 4.
+      - name: Check the schema matches the models
+        run: uv run alembic check
+
       # A control nobody exercises is a control nobody can trust. This one was
       # silently broken once; now a regression fails the build.
       - name: Verify audit_events is append-only

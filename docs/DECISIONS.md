@@ -215,6 +215,18 @@ whole document going through the loop could reveal.
 | **Staleness is measured against `received_at`, not the clock** | Against `now`; not checking at all | An invoice being processed late is a different fact from one that was already ancient when it arrived, and only the second is a reason to stop. Skipped entirely when no arrival date was supplied, because inventing one is the loop reading its own clock and calling it evidence. While the date is open every candidate must fail, since nobody has chosen between the readings yet |
 | **A `# TEMP STUB` edge `NON_PO → CODED`** | Leaving non-PO invoices stopped dead | Every Kaggle invoice cites no purchase order, so without it the entire real corpus stops at `NON_PO` and nothing downstream is exercisable. Listed in the stub test like every other piece of scaffolding, so removing it when GL coding lands is deliberate |
 
+## 2026-10-05 — Day 4 schema
+
+| Decision | Rejected | Because |
+| --- | --- | --- |
+| **`approvals` (one per request) plus `approval_decisions` (one per person)** | A single approvals row with one `decided_by` | The matrix's top tier needs two approvers, and `AP-SEED-001` is in it. A request carries `required_approvers` and the tier's `approver_role`; each person's decision is its own row, unique on `(approval_id, decided_by)`, so two approvers are two people |
+| **Completion is derived from the decision rows**: the first `reject` completes the request as rejected; otherwise it is approved when distinct approvers reach `required_approvers` | Setting `approvals.status` directly | A status written independently can disagree with the decisions it claims to summarise. Derived, it cannot. The completing decision and the status are written in one transaction |
+| **A run that resumes from `PENDING_APPROVAL` after a configurable age re-fetches the purchase order and receipts before posting** (implemented in Piece 3) | Posting on the snapshot taken when approval was requested | An approval can sit for days. In that time the order can be amended or closed and goods can be returned, and the approver signed off on numbers that may no longer hold. Past the age limit, the match is re-run on fresh data first; if it no longer matches, the invoice goes back to a person rather than to the ERP. The age is a policy number, so it lives in the guardrails file |
+| **`payloads` is content-addressed and insert-only** | Storing payloads inline on audit rows, or an updatable blob table | The trail stays small and every `output_ref` still resolves. A key that is the hash of its bytes has nothing to update |
+| **No DELETE for the application role, on any table** | Leaving `0002`'s DELETE grants in place | Rule 3 says no tool deletes anything; a grant is where that holds regardless of what code is written later. `tests/db/test_live_grants.py` tries it as the role |
+| **`invoices.record_ref` points at the latest full record, stored as a payload** | A column per record field | A resumed run needs everything the loop knew. The queried fields stay as columns; the rest is one content-addressed document |
+| **`alembic check` is part of `just test` and CI** | Trusting autogenerate at authoring time | `0001` shipped without five indexes its models declared, and nothing noticed for four weeks |
+
 ## 2026-10-05 — the second seat: explaining an exception
 
 | Decision | Rejected | Because |

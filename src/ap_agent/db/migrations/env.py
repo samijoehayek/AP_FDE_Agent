@@ -19,14 +19,30 @@ from sqlalchemy import engine_from_config, pool
 from ap_agent.config import get_settings
 from ap_agent.db.base import Base
 from ap_agent.db.models import (
-    ApprovalRequest,
+    Approval,
+    ApprovalDecision,
     AuditEventRow,
+    DedupEntry,
     Document,
     ErpWrite,
+    Extraction,
     Invoice,
+    Payload,
+    Run,
 )
 
-REGISTERED_TABLES = (ApprovalRequest, AuditEventRow, Document, ErpWrite, Invoice)
+REGISTERED_TABLES = (
+    Approval,
+    ApprovalDecision,
+    AuditEventRow,
+    DedupEntry,
+    Document,
+    ErpWrite,
+    Extraction,
+    Invoice,
+    Payload,
+    Run,
+)
 """Named so the imports are not pruned.
 
 Importing these classes is what registers their tables on ``Base.metadata``,

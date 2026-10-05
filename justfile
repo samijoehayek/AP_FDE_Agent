@@ -27,8 +27,8 @@ fmt:
 typecheck:
     uv run pyright
 
-# Lint, typecheck, and run the test suite with coverage.
-test: lint typecheck
+# Lint, typecheck, check the schema matches the models, and run the test suite.
+test: lint typecheck db-check
     uv run pytest --cov --cov-report=term-missing
 
 # Tests only, no lint or typecheck. For a tight edit loop.
@@ -54,6 +54,11 @@ db-reset:
 
 db-migrate:
     uv run alembic upgrade head
+
+# Fail if the models and the migrated database disagree. Part of `just test`:
+# drift is how 0001 shipped without five of its indexes.
+db-check:
+    uv run alembic check
 
 db-revision message:
     uv run alembic revision --autogenerate -m "{{message}}"

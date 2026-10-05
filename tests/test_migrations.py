@@ -17,17 +17,36 @@ from alembic.script import ScriptDirectory
 
 from ap_agent.config import REPO_ROOT, Settings
 from ap_agent.db.base import Base
-from ap_agent.db.models import ApprovalRequest, AuditEventRow, Document, ErpWrite, Invoice
+from ap_agent.db.models import (
+    Approval,
+    ApprovalDecision,
+    AuditEventRow,
+    DedupEntry,
+    Document,
+    ErpWrite,
+    Extraction,
+    Invoice,
+    Payload,
+    Run,
+)
 
 EXPECTED_TABLES = frozenset(
-    {
-        ApprovalRequest.__tablename__,
-        AuditEventRow.__tablename__,
-        Document.__tablename__,
-        ErpWrite.__tablename__,
-        Invoice.__tablename__,
-    }
+    model.__tablename__
+    for model in (
+        Approval,
+        ApprovalDecision,
+        AuditEventRow,
+        DedupEntry,
+        Document,
+        ErpWrite,
+        Extraction,
+        Invoice,
+        Payload,
+        Run,
+    )
 )
+
+VERSIONS = REPO_ROOT / "src" / "ap_agent" / "db" / "migrations" / "versions"
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +108,31 @@ def _initial_revision_source() -> str:
     return files[0].read_text(encoding="utf-8")
 
 
-def test_the_initial_revision_creates_every_table() -> None:
-    source = _initial_revision_source()
+def _upgrade_sources() -> str:
+    """Every revision's upgrade() body, concatenated."""
+    return "".join(
+        path.read_text(encoding="utf-8").split("def downgrade")[0]
+        for path in sorted(VERSIONS.glob("0*.py"))
+    )
+
+
+def test_the_chain_creates_every_table() -> None:
+    source = _upgrade_sources()
     for table in EXPECTED_TABLES:
-        assert f'op.create_table("{table}"' in source or f"op.create_table('{table}'" in source
+        assert re.search(rf"op\.create_table\(\s*['\"]{table}['\"]", source), table
+
+
+def test_0004_grants_the_minimum_and_no_delete() -> None:
+    """Content and decisions are insert-only; nothing anywhere may be deleted.
+
+    The live version of this - connecting as the application role and trying -
+    is ``tests/db/test_live_grants.py``.
+    """
+    source = (VERSIONS / "0004_state_approvals_payloads.py").read_text(encoding="utf-8")
+    assert 'INSERT_ONLY_TABLES = ("payloads", "dedup_index", "approval_decisions")' in source
+    assert 'READ_UPDATE_TABLES = ("extractions", "runs", "approvals")' in source
+    assert "REVOKE DELETE ON {table}" in source
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON {table}" not in source.split("def _ungrant")[0]
 
 
 def test_the_audit_table_is_revoked_not_merely_documented() -> None:

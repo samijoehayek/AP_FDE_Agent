@@ -194,10 +194,18 @@ stateDiagram-v2
 | Table | Holds | Note |
 | --- | --- | --- |
 | `documents` | One row per distinct file, keyed by SHA-256 | Identity is the bytes |
-| `invoices` | Current state and the extracted header | Unique `(vendor_id, invoice_number)` — the duplicate control the database enforces |
-| `audit_events` | The hash-chained trail | Append-only at the schema level. The application role holds `SELECT` and `INSERT` and nothing else — and it is an ordinary role, not the owner, because a superuser bypasses the check |
-| `approval_requests` | Durable human-in-the-loop approvals | A four-day approval must survive a deploy |
+| `invoices` | Current state, the extracted header, `po_number`, `erp_bill_id`, and `record_ref` to the latest full record | Unique `(vendor_id, invoice_number)` — the duplicate control the database enforces — and unique `document_sha256`: one invoice per file |
+| `payloads` | Bytes keyed by their SHA-256 | What every `output_ref` resolves to. Insert and read only |
+| `extractions` | Which readings belong to an invoice, by payload ref; a person's corrections | The golden set grows from the corrections |
+| `runs` | One row per loop invocation: start, end, steps, last step | |
+| `audit_events` | The hash-chained trail | Append-only at the schema level. The application role holds `SELECT` and `INSERT` and nothing else — and it is an ordinary role, not the owner, because a superuser bypasses the check. Still written as JSONL until Day 5 |
+| `approvals` | One durable request per invoice: how many approvers, of what role, and how it ended | A four-day approval must survive a deploy |
+| `approval_decisions` | One row per person per request | Unique `(approval_id, decided_by)`: two approvers are two people. Insert only |
+| `dedup_index` | What `find_duplicates` compares | Insert only |
 | `erp_writes` | The idempotency ledger | A key is claimed before the call goes out |
+
+The application role holds **no DELETE on any table** (revision `0004`; rule 3).
+`tests/db/test_live_grants.py` checks every grant by trying it as that role.
 
 ## Audit trail
 

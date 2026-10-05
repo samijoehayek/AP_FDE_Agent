@@ -9,20 +9,30 @@ from ap_agent.db.base import (
     session_scope,
 )
 from ap_agent.db.models import (
-    ApprovalRequest,
+    Approval,
+    ApprovalDecision,
     AuditEventRow,
+    DedupEntry,
     Document,
     ErpWrite,
+    Extraction,
     Invoice,
+    Payload,
+    Run,
 )
 
 __all__ = [
-    "ApprovalRequest",
+    "Approval",
+    "ApprovalDecision",
     "AuditEventRow",
     "Base",
+    "DedupEntry",
     "Document",
     "ErpWrite",
+    "Extraction",
     "Invoice",
+    "Payload",
+    "Run",
     "create_db_engine",
     "create_session_factory",
     "session_scope",
