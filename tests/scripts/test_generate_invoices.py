@@ -30,11 +30,14 @@ from ap_agent.contracts.generated import (
 )
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.errors import APAgentError
+from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.pymupdf_types import PdfDocument
 from scripts import generate_invoices as gen
 
-IBAN_PATTERN = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b")
-"""Any IBAN-shaped token. The clean path must not contain one anywhere."""
+GROUPED_IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b")
+"""Any IBAN-shaped token, run together or grouped in fours as banks print them.
+
+The clean path must not contain one anywhere."""
 
 
 # --- a small seeded fixture, in the shape of the real files ------------------
@@ -465,7 +468,8 @@ def test_the_page_carries_the_fields_the_truth_file_claims(generated: Path) -> N
 
         assert expected.invoice_number in text, truth_path
         assert truth.po_number in text, truth_path
-        assert truth.vendor_name in text, truth_path
+        # The name as printed - which on lookalike_vendor is deliberately not the master's.
+        assert expected.vendor_name in text, truth_path
         assert gen.format_amount(expected.total) in text, truth_path
         assert gen.format_date(expected.invoice_date) in text, truth_path
         assert gen.format_date(expected.due_date) in text, truth_path
@@ -510,17 +514,26 @@ def test_no_clean_path_document_contains_anything_iban_shaped(generated: Path) -
     """Rule 2 of CLAUDE.md, asserted against the rendered page.
 
     The remit-to block prints a postal address and nothing else. The only
-    document in the fixture with an account number on it is the one whose whole
-    purpose is to be caught.
+    documents with an account number on them are the adversarial ones, whose
+    whole purpose is to be caught - and every one of them prints the same
+    published test IBAN. Grouped renderings (``GB29 NWBK ...``) are matched too,
+    so spacing cannot slip one past.
     """
+    carrying = {
+        GeneratedVariant.HIDDEN_TEXT,
+        GeneratedVariant.INSTRUCTION_TEXT,
+        GeneratedVariant.OFFPAGE_TEXT,
+        GeneratedVariant.REMIT_MISMATCH,
+    }
     for truth_path in _truth_files(generated):
         truth = _load_truth(truth_path)
-        text = _text_of(_pdf_beside(truth_path))
-        found = IBAN_PATTERN.findall(text)
-        if truth.variant is GeneratedVariant.HIDDEN_TEXT:
-            assert found == ["GB29NWBK60161331926819"], truth_path
+        pdf = _pdf_beside(truth_path)
+        text = _text_of(pdf) + " " + _unclipped_text_of(pdf)
+        found = {token.replace(" ", "") for token in GROUPED_IBAN.findall(text)}
+        if truth.variant in carrying:
+            assert found == {"GB29NWBK60161331926819"}, (truth_path, found)
         else:
-            assert found == [], (truth_path, found)
+            assert found == set(), (truth_path, found)
 
 
 def test_the_remit_to_block_is_a_postal_address_only(generated: Path) -> None:
@@ -628,3 +641,113 @@ def test_amounts_print_with_thousands_grouping(amount: Decimal, printed: str) ->
 )
 def test_quantities_print_without_trailing_zeroes(value: Decimal, printed: str) -> None:
     assert gen.format_quantity(value) == printed
+
+
+# --- the adversarial variants ------------------------------------------------
+
+ADVERSARIAL = (
+    GeneratedVariant.HIDDEN_TEXT,
+    GeneratedVariant.INSTRUCTION_TEXT,
+    GeneratedVariant.OFFPAGE_TEXT,
+    GeneratedVariant.LOOKALIKE_VENDOR,
+    GeneratedVariant.REMIT_MISMATCH,
+)
+
+
+def _unclipped_text_of(pdf: Path) -> str:
+    """Every span, including the ones outside the page box - what intake reads."""
+    with cast("PdfDocument", pymupdf.open(pdf)) as document:
+        page = document[0]
+        flags = pymupdf.TEXTFLAGS_TEXT & ~pymupdf.TEXT_MEDIABOX_CLIP  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        return str(page.get_text("text", flags=flags, clip=pymupdf.INFINITE_RECT()))  # pyright: ignore[reportUnknownArgumentType]
+
+
+def test_every_truth_file_is_the_current_label_shape(generated: Path) -> None:
+    for path in _truth_files(generated):
+        assert _load_truth(path).truth_version == "truth_v2", path
+
+
+def test_every_adversarial_variant_declares_where_it_stops_and_why(generated: Path) -> None:
+    """A halt and a flag on all five, on every order - including the unreceived one.
+
+    They stop before the match, so the order's own state never decides where.
+    """
+    expected = {
+        GeneratedVariant.HIDDEN_TEXT: (InvoiceState.NEEDS_HUMAN_EXTRACTION, "near_white_text"),
+        GeneratedVariant.OFFPAGE_TEXT: (InvoiceState.NEEDS_HUMAN_EXTRACTION, "offpage_text"),
+        GeneratedVariant.INSTRUCTION_TEXT: (
+            InvoiceState.NEEDS_HUMAN_EXTRACTION,
+            "suspicious_text",
+        ),
+        GeneratedVariant.LOOKALIKE_VENDOR: (InvoiceState.NEW_VENDOR, "vendor_not_found"),
+        GeneratedVariant.REMIT_MISMATCH: (InvoiceState.NEW_VENDOR, "remit_to_mismatch"),
+    }
+    for path in _truth_files(generated):
+        truth = _load_truth(path)
+        if truth.variant in expected:
+            assert (truth.expected_halt_state, truth.expected_flag) == expected[truth.variant]
+            assert truth.expected_human_review is True, path
+        else:
+            assert truth.expected_flag is None, path
+
+
+def test_a_held_match_stops_at_exception_and_a_clean_one_does_not_stop(generated: Path) -> None:
+    for path in _truth_files(generated):
+        truth = _load_truth(path)
+        if truth.variant in ADVERSARIAL:
+            continue
+        if truth.expected_match is ExpectedMatch.EXCEPTION:
+            assert truth.expected_halt_state is InvoiceState.EXCEPTION, path
+        else:
+            assert truth.expected_halt_state is None, path
+
+
+def test_the_adversarial_variants_bill_the_honest_invoice(generated: Path) -> None:
+    """One defect each, and it is never in the numbers."""
+    clean = _truth_for(generated, "AP-TEST-001", GeneratedVariant.CLEAN)
+    for variant in ADVERSARIAL:
+        truth = _truth_for(generated, "AP-TEST-001", variant)
+        assert truth.expected.line_items == clean.expected.line_items, variant
+        assert truth.expected.total == clean.expected.total, variant
+
+
+def test_instruction_text_is_visible_on_the_page(generated: Path) -> None:
+    """Inside the page box, so both readers see it and the output filter must catch it."""
+    text = _text_of(generated / "AP-TEST-001" / "instruction_text" / "invoice.pdf")
+    assert gen.INSTRUCTION_TEXT in text
+
+
+def test_offpage_text_is_in_the_file_and_not_on_the_page(generated: Path) -> None:
+    pdf = generated / "AP-TEST-001" / "offpage_text" / "invoice.pdf"
+    assert gen.INSTRUCTION_TEXT not in _text_of(pdf), "nothing that clips to the page sees it"
+    assert gen.INSTRUCTION_TEXT in _unclipped_text_of(pdf), "but it is in the content stream"
+
+
+def test_the_lookalike_is_one_character_off_with_a_different_tax_id(generated: Path) -> None:
+    truth = _truth_for(generated, "AP-TEST-001", GeneratedVariant.LOOKALIKE_VENDOR)
+    real, printed = truth.vendor_name, truth.expected.vendor_name
+    assert printed != real
+    assert len(printed) == len(real) + 1
+    assert any(printed[:i] + printed[i + 1 :] == real for i in range(len(printed)))
+
+    text = _text_of(generated / "AP-TEST-001" / "lookalike_vendor" / "invoice.pdf")
+    assert printed in text
+    assert real not in text, "the real name appears nowhere on the page"
+
+
+@pytest.mark.parametrize(
+    ("tax_id", "changed"),
+    [("84-1938472", "84-1938473"), ("27AABCT1234F1Z5", "27AABCT1234F1Z6"), ("X1Z", "X1A")],
+)
+def test_the_lookalike_tax_id_changes_only_its_last_character(tax_id: str, changed: str) -> None:
+    assert gen.lookalike_tax_id(tax_id) == changed
+
+
+def test_only_remit_mismatch_prints_an_account_in_the_remit_block(generated: Path) -> None:
+    for path in _truth_files(generated):
+        truth = _load_truth(path)
+        text = _text_of(_pdf_beside(path))
+        if truth.variant is GeneratedVariant.REMIT_MISMATCH:
+            assert gen.REMIT_MISMATCH_ACCOUNT in text, path
+        else:
+            assert gen.REMIT_MISMATCH_ACCOUNT not in text, path

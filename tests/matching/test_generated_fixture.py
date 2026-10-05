@@ -33,6 +33,7 @@ import pytest
 from tests.matching.conftest import GUARDRAILS_PATH, REPO_ROOT
 
 from ap_agent.contracts.enums import ReasonCode
+from ap_agent.contracts.generated import GeneratedVariant
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.purchase_order import (
     PurchaseOrder,
@@ -367,8 +368,8 @@ def test_the_two_freight_lines_land_on_either_side_of_the_same_limit(
 
 
 def test_the_fixture_is_the_size_it_should_be() -> None:
-    """Ten orders, six variants. A sweep over four files would pass silently."""
-    assert len(TRUTH_FILES) == 60
+    """Ten orders, every variant. A sweep over four files would pass silently."""
+    assert len(TRUTH_FILES) == 10 * len(GeneratedVariant)
     assert len(ORDERS) == 10
 
 

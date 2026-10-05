@@ -52,6 +52,7 @@ from ap_agent.contracts.enums import (
 from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.generated import (
     GENERATOR_VERSION,
+    TRUTH_VERSION,
     ExpectedInvoice,
     ExpectedLine,
     ExpectedMatch,
@@ -102,6 +103,7 @@ __all__ = [
     "GENERATOR_VERSION",
     "GENESIS_HASH",
     "MAX_VENDOR_CANDIDATES",
+    "TRUTH_VERSION",
     "Actor",
     "ActorKind",
     "AmbiguousNumber",

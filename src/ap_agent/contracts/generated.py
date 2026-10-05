@@ -47,6 +47,7 @@ from ap_agent.contracts.common import (
     UnitPrice,
 )
 from ap_agent.contracts.enums import ReasonCode
+from ap_agent.states.machine import InvoiceState
 
 GENERATOR_VERSION = "gen_v1"
 """Bumped when a change would alter the bytes of an already-generated invoice.
@@ -54,16 +55,35 @@ GENERATOR_VERSION = "gen_v1"
 Hashes are document identity in this system, so a layout or wording change
 produces different documents rather than new versions of the same ones. The
 version is on every truth file to say which generator drew the page.
+
+Adding a variant does not bump it: the existing documents keep their bytes, and
+the version is printed into each PDF's metadata, so bumping it *would* change
+every one of them. The label's own shape is versioned separately - see
+:data:`TRUTH_VERSION`.
+"""
+
+TRUTH_VERSION = "truth_v2"
+"""The shape of the label, versioned apart from the shape of the page.
+
+``truth_v2`` (2026-10-05) added ``expected_halt_state`` and ``expected_flag``,
+so an adversarial document can say *where* it must stop and *which guardrail*
+must stop it. A label is a claim about a page; changing what a label can claim
+is a different event from changing the page.
 """
 
 
 class GeneratedVariant(StrEnum):
     """The defect planted on one rendering of a purchase order.
 
-    Six variants per PO: one honest invoice, four with a single deliberate
-    numeric or structural defect, and one adversarial. Exactly one thing is
+    Ten variants per PO: one honest invoice, four with a single deliberate
+    numeric or structural defect, and five adversarial. Exactly one thing is
     wrong with each, because a fixture carrying two defects cannot tell you
     which of them a rule caught.
+
+    The five adversarial ones are each aimed at one guardrail: white text and
+    off-page text at intake, visible instruction text at the output filter, a
+    lookalike vendor at vendor resolution, and a changed bank account at the
+    remit-to comparison.
     """
 
     CLEAN = "clean"
@@ -72,6 +92,10 @@ class GeneratedVariant(StrEnum):
     FREIGHT_SMALL = "freight_small"
     FREIGHT_LARGE = "freight_large"
     HIDDEN_TEXT = "hidden_text"
+    INSTRUCTION_TEXT = "instruction_text"
+    OFFPAGE_TEXT = "offpage_text"
+    LOOKALIKE_VENDOR = "lookalike_vendor"
+    REMIT_MISMATCH = "remit_mismatch"
 
     @property
     def code(self) -> str:
@@ -92,6 +116,10 @@ _VARIANT_CODES: dict[GeneratedVariant, str] = {
     GeneratedVariant.FREIGHT_SMALL: "FRS",
     GeneratedVariant.FREIGHT_LARGE: "FRL",
     GeneratedVariant.HIDDEN_TEXT: "HID",
+    GeneratedVariant.INSTRUCTION_TEXT: "INS",
+    GeneratedVariant.OFFPAGE_TEXT: "OFF",
+    GeneratedVariant.LOOKALIKE_VENDOR: "LKA",
+    GeneratedVariant.REMIT_MISMATCH: "RMT",
 }
 
 
@@ -199,6 +227,17 @@ class GeneratedInvoiceTruth(StrictModel):
         "expected_match: the hidden-text variant matches cleanly on the numbers and "
         "still must not post without review."
     )
+    expected_halt_state: InvoiceState | None = Field(
+        description="Where the loop must stop for a person, or None when nothing should stop "
+        "it before the (still stubbed) approval step. An adversarial variant stops early - "
+        "before the match - so its halt state wins over the order's own state."
+    )
+    expected_flag: str | None = Field(
+        max_length=64,
+        description="The guardrail that must stop it, as the trail names it: an input check "
+        "(near_white_text, offpage_text), an output-filter check (suspicious_text), or a "
+        "routing event (vendor_not_found, remit_to_mismatch). None on non-adversarial variants.",
+    )
     hidden_text: str | None = Field(
         default=None,
         max_length=300,
@@ -207,10 +246,12 @@ class GeneratedInvoiceTruth(StrictModel):
         "own constant; never populated from a document reading.",
     )
     generator_version: Literal["gen_v1"] = GENERATOR_VERSION
+    truth_version: Literal["truth_v2"] = TRUTH_VERSION
 
 
 __all__ = [
     "GENERATOR_VERSION",
+    "TRUTH_VERSION",
     "ExpectedInvoice",
     "ExpectedLine",
     "ExpectedMatch",

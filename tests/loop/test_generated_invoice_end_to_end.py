@@ -16,6 +16,7 @@ Nothing is written under ``data/`` and nothing leaves the machine.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -42,7 +43,7 @@ from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
 from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
 from ap_agent.tools.get_purchase_order import GetPurchaseOrderOutput
 from ap_agent.tools.get_receipts import GetReceiptsInput, GetReceiptsOutput, get_receipts
-from ap_agent.tools.ingest_document import IngestDocumentOutput
+from ap_agent.tools.ingest_document import IngestDocumentOutput, ingest_document
 from ap_agent.tools.lookup_vendor import LookupVendorInput, LookupVendorOutput, lookup_vendor
 from ap_agent.tools.pymupdf_types import PdfDocument
 from scripts import generate_invoices as gen
@@ -79,11 +80,15 @@ VENDOR = "Northwind Peripherals Inc"
 VENDOR_ERP_ID = "62"
 OTHER_VENDOR_ERP_ID = "67"
 
+ON_FILE_FINGERPRINT = "3f4f41b6ece69dc2432586dd4c6ac96f95ecba0d38c91ab46fdc6a873632dba5"
+"""SHA-256 of the fictional ``XX00APAGENT0000000062`` - the account on file for {VENDOR}."""
+
 VENDOR_MASTER = f"""
 version: "v1"
 vendors:
   - display_name: "{VENDOR}"
     erp_id: "{VENDOR_ERP_ID}"
+    remit_account_sha256: "{ON_FILE_FINGERPRINT}"
     currency: "USD"
     tax_id: "27-6653019"
     country: "US"
@@ -398,29 +403,107 @@ def test_a_po_belonging_to_another_vendor_is_refused(
     assert final.receipts is None
 
 
-def test_the_hidden_text_variant_reaches_the_same_place_on_the_numbers(
-    record: InvoiceRecord, fixture_root: Path
-) -> None:
-    """Its arithmetic is identical to the clean one's, and that is the point.
+ADVERSARIAL = (
+    GeneratedVariant.HIDDEN_TEXT,
+    GeneratedVariant.OFFPAGE_TEXT,
+    GeneratedVariant.INSTRUCTION_TEXT,
+    GeneratedVariant.LOOKALIKE_VENDOR,
+    GeneratedVariant.REMIT_MISMATCH,
+)
 
-    Nothing a tolerance can measure is wrong with this document. What is wrong
-    with it is a line of white 4pt type instructing the reader to change the
-    vendor's bank account - which no rule in the loop looks for yet. The truth
-    file says it must reach a person; nothing here does that, and that gap is
-    the next guardrail to write, not a failure of this step.
+INTAKE_HALTS = frozenset({GeneratedVariant.HIDDEN_TEXT, GeneratedVariant.OFFPAGE_TEXT})
+"""Stopped before either reading seat is called: zero tokens."""
+
+
+def _honest_reading(root: Path, truth: GeneratedInvoiceTruth) -> InvoiceExtraction:
+    """What a reader that follows the extraction prompt returns for this page.
+
+    The truth file states the page; the prompt says where two things go that
+    the truth file does not carry. Instruction-like text is copied verbatim into
+    ``suspicious_text``, and the remit-to block is transcribed as printed into
+    ``remit_to_display``. The printed tax id is read too, so a lookalike misses
+    on both tiers of the vendor lookup, as it would live.
     """
-    truth = _truth(fixture_root, GeneratedVariant.HIDDEN_TEXT)
-    ctx = _context(fixture_root, truth, variant=GeneratedVariant.HIDDEN_TEXT)
+    extraction = _extraction_from(truth)
+    page = _page_text(_pdf(root, truth.variant))
+    update: dict[str, object] = {}
+    if gen.INSTRUCTION_TEXT in page:
+        update["suspicious_text"] = [gen.INSTRUCTION_TEXT]
+    if truth.variant is GeneratedVariant.REMIT_MISMATCH:
+        block = page[page.index("Remit To") + len("Remit To") :].strip()
+        update["remit_to_display"] = " ".join(block.split())
+    if truth.variant is GeneratedVariant.LOOKALIKE_VENDOR:
+        update["vendor_tax_id"] = gen.lookalike_tax_id("27-6653019")
+    return extraction.model_copy(update=update)
+
+
+@pytest.mark.parametrize("variant", ADVERSARIAL, ids=lambda variant: variant.value)
+def test_every_adversarial_document_stops_for_a_person_with_its_flag_on_the_trail(
+    fixture_root: Path, variant: GeneratedVariant
+) -> None:
+    """All five, through the real guardrails, to the state their truth file declares.
+
+    Real here: intake (``ingest_document`` on the rendered PDF), the output
+    filter, the confidence check, ``lookup_vendor`` against a master holding a
+    remittance fingerprint, and the state machine. Faked: the two reading seats,
+    which return what a reader following the prompt would - and which must not
+    even be called for the two documents intake stops.
+    """
+    truth = _truth(fixture_root, variant)
+    assert truth.expected_halt_state is not None
+    assert truth.expected_flag is not None
+
+    reading = _honest_reading(fixture_root, truth)
+    calls: list[str] = []
+
+    def _vision(_payload: ExtractInvoiceVisionInput) -> ExtractInvoiceVisionOutput:
+        calls.append("vision")
+        return ExtractInvoiceVisionOutput(
+            extraction=reading,
+            model_id="claude-sonnet-5",
+            prompt_version="extract_v2",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+        )
+
+    def _text(_payload: ExtractInvoiceTextInput) -> ExtractInvoiceTextOutput:
+        calls.append("text")
+        page = _page_text(_pdf(fixture_root, variant))
+        return ExtractInvoiceTextOutput(
+            raw_text=page,
+            pages=[page],
+            has_text_layer=True,
+            second_read=reading,
+            model_id="claude-haiku-4-5-20251001",
+            prompt_version="extract_text_v2",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+        )
+
+    ctx = replace(
+        _context(fixture_root, truth, variant=variant),
+        ingest=ingest_document,
+        extract=_vision,
+        extract_text=_text,
+    )
+    record = InvoiceRecord(source_path=_pdf(fixture_root, variant), created_at=utc_now())
 
     final = run(record, ctx)
 
-    assert truth.expected_human_review is True
-    assert final.state is InvoiceState.CLOSED, "no guardrail reads suspicious_text yet"
-    assert truth.hidden_text is not None
-    assert truth.hidden_text in _page_text(_pdf(fixture_root, GeneratedVariant.HIDDEN_TEXT))
+    assert final.state is truth.expected_halt_state
+    assert final.match_result is None, "every one of them stops before the match"
+    assert calls == ([] if variant in INTAKE_HALTS else ["vision", "text"])
 
+    halt = next(event for event in ctx.events if event.to_state is truth.expected_halt_state)
+    assert truth.expected_flag in f"{halt.decision} {halt.decision_basis}"
+    assert ctx.events[-1].decision == "halt_no_tool", "and it waits there for a person"
 
-# --- the match, now that it is real ------------------------------------------
+    trail = "".join(event.model_dump_json() for event in ctx.events)
+    assert "ignore prior instructions" not in trail.lower(), "no planted text on the trail"
+    assert "GB29" not in trail, "no account number on the trail"
+    assert JsonlAuditWriter(fixture_root / "audit").verify(str(final.invoice_id)) is True
 
 
 def test_a_clean_invoice_reaches_matched_on_the_numbers(
@@ -542,14 +625,18 @@ def test_the_matcher_gets_its_own_audit_row_with_a_content_address(
 def test_the_variants_land_where_their_truth_files_say(
     record: InvoiceRecord, fixture_root: Path
 ) -> None:
-    """Every variant the generator produces, through the whole loop.
+    """Every variant through the whole loop, with the guardrails faked out.
 
-    ``hidden_text`` is the one to read carefully: its truth file declares
-    MATCHED *and* a reason code, because the numbers are perfect and the
-    document still must not post. The matcher is right to pass it - the code
-    that holds it belongs to a guardrail nobody has written yet.
+    This is a test of the *matcher*, so intake and the readings are clean
+    stand-ins and only the numbers differ. The adversarial variants bill the
+    honest invoice, so they must match exactly as clean does - their defects are
+    caught earlier, by the guardrails, and that is asserted separately below.
+    ``lookalike_vendor`` is the one left out: its defect is identity, so vendor
+    resolution stops it and the match never runs.
     """
     for variant in GeneratedVariant:
+        if variant is GeneratedVariant.LOOKALIKE_VENDOR:
+            continue
         truth = _truth(fixture_root, variant)
         ctx = _context(fixture_root, truth, variant=variant)
         final = run(record, ctx)

@@ -324,7 +324,7 @@ def truths() -> list[GeneratedInvoiceTruth]:
 
 
 def test_the_fixture_exists_locally_or_is_skipped(truths: list[GeneratedInvoiceTruth]) -> None:
-    assert len(truths) == 60
+    assert len(truths) == 10 * len(GeneratedVariant)
 
 
 def test_a_three_percent_overcharge_breaches_the_price_band(
