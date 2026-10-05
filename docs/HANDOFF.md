@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-10-05. Last code change 2026-09-16 (Day 3, step 2). Update this file at the end of every working day._
+_Last updated: 2026-10-05. Last code change 2026-09-16 (Day 3, step 2), verified live 2026-10-05. Update this file at the end of every working day._
 
 ## Start here — catching up a new session
 
@@ -27,6 +27,12 @@ trustworthy until it is.
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
 2026-10-05 with no commits. Nothing changed in the repo during it. `git log
 --oneline -10` is the fastest confirmation.
+
+**The matcher has been verified live**, on 2026-10-05, on three invoices that
+landed in three different places. Details in `docs/EXTRACTION_LOG.md` under
+*2026-10-05 - the matcher, live, three runs*. You do not need to spend credit
+re-confirming it works; the next live run should be spent on whatever is built
+next.
 
 ## Purpose (three sentences)
 
@@ -247,6 +253,9 @@ Both were found by reading the files rather than by a test failing later.
 - **2026-09-10, four confidence runs (EXTRACTION_LOG.md).** The same file, model and prompt twenty minutes apart returned `2024-09-03` and then `2024-03-09` for 51109305. That settles what the bug is: not a model misreading a date, but a document that does not say which reading is meant. The check refused both times; the locale rule answered the same both times.
 - **Behaviour change since those runs:** an ambiguous date is no longer a failure. Both readings stay on the record and are settled by the receipt window at VALIDATED, then the vendor's country at VENDOR_RESOLVED. Runs 2 and 3 in the log predate this and would now be `auto_ok=True` with `date_verdict=ambiguous`. Reasoning in DECISIONS.md, 2026-09-10.
 
+- **2026-10-05, three live runs with the matcher in the loop (EXTRACTION_LOG.md).** The first live runs since `compute_match` existed. `AP-SEED-001/clean` reached `MATCHED`; `price_plus_3pct` and `AP-SEED-010/qty_over_received` reached `EXCEPTION` with the codes their truth files declared. **Cost is now a real number: ~$0.03 per invoice**, two model calls, stable across all three. QuickBooks still authenticates after three weeks idle (token rotated on the first call).
+- The AP-SEED-010 run is the one to cite. It bills 2 of a line that ordered 11 and received 0 - inside the authorisation, outside the delivery - and a two-way match would have paid it.
+
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
 
 1. **DONE.** `extract_invoice_text` (pymupdf text layer → `claude-haiku-4-5` on text only, prompt `extract_text_v1`; images/no-text-layer → `second_read=None`, no OCR) and `compute_extraction_confidence` (pure code: two-read agreement, value-in-raw-text grounding, date verdict; `auto_ok` iff all five load-bearing fields agreed+grounded). `just confidence <path>`. 51109305 → 2024-03-09 with `vendor_country="IN"` is a test.
@@ -298,6 +307,8 @@ Both were found by reading the files rather than by a test failing later.
    **`DUPLICATE_CHECKED → MATCHED` on `stub_ok` is deleted.** It advanced every invoice regardless of its numbers.
 
    **Tests: 252** (`tests/matching/`, plus `tests/tools/test_compute_match.py`). 39 hand-written cases against the real `config/guardrails.v1.yaml` rather than a double, 19 for pairing, and a sweep of all 60 generated invoices against their truth files.
+
+   **Verified live on 2026-10-05**, which the test suite structurally cannot do - every test fakes both model seats and feeds the truth file in. Three invoices through the real models and the real QuickBooks sandbox: `AP-SEED-001/clean` → `MATCHED` with no codes, `AP-SEED-001/price_plus_3pct` → `EXCEPTION` with `price_over_tolerance`, and `AP-SEED-010/qty_over_received` → `EXCEPTION` with `receipt_missing` and `quantity_over_tolerance`. All three agree with their truth files, all three chains verify. **~$0.03 per invoice**, two model calls each. Full write-up in `docs/EXTRACTION_LOG.md`.
 
    **One thing to understand before trusting that sweep.** `expected_reason_codes` in a `truth.json` is the *planted defect's signature* composed with the order's own state - not an exhaustive verdict. `AP-SEED-010/clean` declares `receipt_missing` alone, and a correct matcher also reports `quantity_over_tolerance`, because that invoice bills 9, 11 and 10 units of three lines that received nothing. So the sweep asserts: a declared MATCHED must produce **zero** codes, a declared EXCEPTION must contain **every** code the generator planted, and the one place the two legitimately differ is asserted by name in `test_where_the_matcher_says_more_than_the_truth_file`. The comparison is also filtered to matcher-owned codes, because `hidden_text` carries `suspicious_document_content`, which belongs to the output filter.
 

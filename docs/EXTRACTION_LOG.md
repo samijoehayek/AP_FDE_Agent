@@ -219,6 +219,73 @@ country settled it one state later. To make the window decide, arrival has to
 make exactly one reading impossible: before 2023-07-03, or between 2024-03-07
 and 2024-07-02.
 
+## 2026-10-05 — the matcher, live, three runs
+
+The first live runs since `compute_match` was written. Everything before this
+faked both model seats and fed the truth file in; these read the actual PDFs and
+fetched the actual purchase orders, so they test the one thing the 1385-test
+suite structurally cannot - whether a *real* extraction produces numbers the
+matcher agrees with.
+
+Three invoices, chosen to land in three different places. All three did.
+
+| invoice | final state | reason codes | steps | rows |
+| --- | --- | --- | --- | --- |
+| `AP-SEED-001/clean` | `MATCHED` | none | 14 | 21 |
+| `AP-SEED-001/price_plus_3pct` | `EXCEPTION` | `price_over_tolerance` | 6 | 14 |
+| `AP-SEED-010/qty_over_received` | `EXCEPTION` | `receipt_missing`, `quantity_over_tolerance` | 6 | 14 |
+
+Every verdict matches the `truth.json` declared before the matcher existed.
+Every decision row carries `config_version=guardrails_v1` beside its codes. All
+three hash chains verify.
+
+**The third run is the one worth keeping.** AP-SEED-010 ordered 11 network
+switches and the invoice bills **2**. Two is comfortably inside what was
+authorised, so a system comparing the invoice to the *purchase order* calls that
+clean and pays it. Nothing has been received against that order, so the goods
+receipt says 0, and billing 2 against 0 is a bill for two switches nobody has.
+The matcher reported both facts rather than one: nothing arrived, and more than
+arrived was billed. This is the three-way match doing something a two-way match
+structurally cannot, observed on a live run rather than asserted in a test.
+
+**Both EXCEPTION runs stop at 6 steps, and that is correct.** `EXCEPTION` is a
+state no stub edge may leave, so the run halts and logs `awaiting_human`. The
+`halt` row is the last one in the file.
+
+### Cost, which is a Day 7 metric and now has a real number
+
+| run | Sonnet (in/out) | Haiku (in/out) | cost |
+| --- | --- | --- | --- |
+| clean | 7278 / 798 | 4397 / 577 | $0.029818 |
+| price_plus_3pct | 7277 / 855 | 4397 / 585 | $0.030426 |
+| qty_over_received | 7278 / 1107 | 4393 / 553 | $0.032784 |
+
+**~$0.03 per invoice**, $0.093 for all three, two model calls each. Stable
+across the three: the input is nearly identical because the documents are the
+same template, and the spread is all in output tokens.
+
+Worth noting for anyone comparing latencies in these trails: the **first** call
+of the first run took 87.7 s on Sonnet and 72.0 s on Haiku, against 7.0 s and
+5.3 s on the run immediately after. Cold start, not a regression - the two later
+runs are the representative numbers.
+
+### What these runs confirmed that nothing had tested
+
+- A real extraction is good enough that a clean invoice comes out clean. The
+  matcher is strict, and an extraction off by a cent on any line would have
+  raised `arithmetic_inconsistent` or `totals_over_tolerance`. None did.
+- **QuickBooks still works after three weeks idle.** The refresh token rotated on
+  the first call (`rotated=True`) and the two later runs reused it. Each run
+  fetched its PO live from the sandbox.
+- The audit trail reads correctly end to end: rows 9-11 of each match step are
+  the three tool calls (PO `found`, receipts `received`, matcher `matched` or
+  `exception`), row 12 is the decision that moves the invoice, and only the
+  decision carries a `to_state`.
+
+Trails are at `data/audit/01M45J5E6PMFGBCKSX6H8GYTX9.jsonl` (clean),
+`01M45JAX7577ZGM2MFQQ6V9V1Q.jsonl` (price) and
+`01M45JBK3BQPA4QZR9VTJWR730.jsonl` (quantity). Git-ignored, local only.
+
 ## Known risks
 
 - **Ambiguous slash dates (day ≤ 12):** ~~model is inconsistent across files~~ **confirmed** — the same file read both ways twenty minutes apart (2026-09-10, runs 1 and 2). Handled: the date stays open with both candidates and is settled by the receipt window, then the vendor's country. Still open when neither is available, which is what the missing `lookup_vendor` costs.
