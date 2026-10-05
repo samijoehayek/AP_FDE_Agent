@@ -152,6 +152,7 @@ stateDiagram-v2
     POSTED --> SCHEDULED: stub_ok
     RECEIVED --> CANCELLED: cancel
     RECEIVED --> INGESTED: ingest
+    RECEIVED --> NEEDS_HUMAN_EXTRACTION: input_flagged
     RECONCILED --> CLOSED: close
     RECONCILED --> CLOSED: stub_ok
     SCHEDULED --> PAID: payment_confirmed

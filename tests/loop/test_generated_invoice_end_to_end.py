@@ -226,6 +226,7 @@ def _context(
             text_char_count=len(page),
             pages_with_text=1,
             page_sharpness=[900.0],
+            config_version="guardrails_v1",
         )
 
     def _vision(_payload: ExtractInvoiceVisionInput) -> ExtractInvoiceVisionOutput:
@@ -329,6 +330,7 @@ def test_the_audit_sequence_for_a_generated_invoice(
     run(record, ctx)
 
     assert [event.decision for event in ctx.events] == [
+        "ingested",
         "ingest",
         "read",
         "read",

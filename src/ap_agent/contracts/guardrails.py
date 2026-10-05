@@ -162,6 +162,28 @@ class ApprovalMatrix(StrictModel):
     rules: list[ApprovalRule] = Field(min_length=1, max_length=20)
 
 
+class HiddenTextLimits(StrictModel):
+    """What counts as text a person cannot see.
+
+    Two numbers, both measured against the local corpus before they were
+    written down: across 160 PDFs the only near-white text is the planted
+    ``hidden_text`` variant, and the faintest real page renders 1.9% ink.
+    """
+
+    near_white_min: int = Field(
+        ge=0,
+        le=255,
+        description="A fill at or above this on every RGB channel is near-white. The same "
+        "value separates ink from paper in the render.",
+    )
+    min_ink_fraction: float = Field(
+        gt=0,
+        lt=1,
+        description="A page with a text layer whose render has less ink than this is a page "
+        "of text nobody can read. Set an order of magnitude below the faintest real page.",
+    )
+
+
 class InputValidation(StrictModel):
     """Limits applied before any model call.
 
@@ -176,6 +198,10 @@ class InputValidation(StrictModel):
     allowed_mime_types: list[str] = Field(min_length=1, max_length=20)
     max_line_items: int = Field(ge=1)
     max_field_length: int = Field(ge=1)
+    allow_password_protected: bool = Field(
+        description="A PDF that needs a password to open cannot be checked for anything else."
+    )
+    hidden_text: HiddenTextLimits
 
 
 class OutputFilterPattern(StrictModel):

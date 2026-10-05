@@ -136,6 +136,7 @@ def _context(
             text_char_count=len(page),
             pages_with_text=1,
             page_sharpness=[900.0],
+            config_version="guardrails_v1",
         )
 
     def _vision(_payload: ExtractInvoiceVisionInput) -> ExtractInvoiceVisionOutput:

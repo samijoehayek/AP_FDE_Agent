@@ -146,6 +146,22 @@ input_validation:
   max_line_items: 500
   max_field_length: 500
 
+  # Added 2026-10-05, in place rather than as v2: v1 had governed no payment,
+  # and the only trails stamped guardrails_v1 used the tolerances, which are
+  # unchanged. See DECISIONS.md 2026-10-05.
+  #
+  # A PDF that needs a password cannot be checked for anything below, so it is
+  # never read. Owner-password-only PDFs (print/edit restrictions) open freely
+  # and are not affected.
+  allow_password_protected: false
+
+  # Text a person cannot see is text written for a machine. Both numbers were
+  # measured against the local corpus (160 PDFs): the only near-white spans are
+  # the planted hidden_text variant, and the faintest real page renders 1.9% ink.
+  hidden_text:
+    near_white_min: 240 # every RGB channel at or above this is near-white
+    min_ink_fraction: 0.002 # a text layer rendering less ink than this is invisible
+
 # --- Output filter ---------------------------------------------------------
 # Checked on model output *before* anything downstream reads it. These are not
 # corrections: a match sends the run to a person, and nothing is rewritten.

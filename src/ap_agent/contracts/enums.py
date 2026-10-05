@@ -13,6 +13,23 @@ from __future__ import annotations
 from enum import StrEnum
 
 
+class InputCheck(StrEnum):
+    """The checks applied to a document before any model reads it.
+
+    Each one is a reason a person, not a model, reads the document first. The
+    first four are the declared limits; the last three are text a person
+    cannot see, which on an invoice can only be text written for a machine.
+    """
+
+    FILE_TYPE = "file_type"
+    FILE_SIZE = "file_size"
+    PAGE_COUNT = "page_count"
+    PASSWORD_PROTECTED = "password_protected"  # noqa: S105 - a check name, not a secret
+    NEAR_WHITE_TEXT = "near_white_text"
+    OFFPAGE_TEXT = "offpage_text"
+    INVISIBLE_TEXT_LAYER = "invisible_text_layer"
+
+
 class ArithmeticFlag(StrEnum):
     """Internal inconsistencies found in an extraction's own numbers.
 

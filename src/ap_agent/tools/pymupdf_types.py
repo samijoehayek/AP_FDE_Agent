@@ -16,10 +16,32 @@ count." on ``page_count`` documents nothing.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, overload
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+
+class TextSpan(TypedDict):
+    """One run of text in one font and colour. ``color`` is packed sRGB."""
+
+    text: str
+    color: int
+    bbox: tuple[float, float, float, float]
+
+
+class TextLine(TypedDict):
+    spans: list[TextSpan]
+
+
+class TextBlock(TypedDict):
+    """Image blocks carry no ``lines``."""
+
+    lines: NotRequired[list[TextLine]]
+
+
+class TextPage(TypedDict):
+    blocks: list[TextBlock]
 
 
 class PdfPixmap(Protocol):
@@ -37,6 +59,14 @@ class PdfPixmap(Protocol):
 
 class PdfRect(Protocol):
     @property
+    def x0(self) -> float: ...
+    @property
+    def y0(self) -> float: ...
+    @property
+    def x1(self) -> float: ...
+    @property
+    def y1(self) -> float: ...
+    @property
     def width(self) -> float: ...
     @property
     def height(self) -> float: ...
@@ -45,7 +75,14 @@ class PdfRect(Protocol):
 class PdfPage(Protocol):
     @property
     def rect(self) -> PdfRect: ...
-    def get_text(self, option: str = ...) -> str: ...
+    @overload
+    def get_text(
+        self, option: Literal["text"] = ..., *, flags: int = ..., clip: object = ...
+    ) -> str: ...
+    @overload
+    def get_text(
+        self, option: Literal["dict"], *, flags: int = ..., clip: object = ...
+    ) -> TextPage: ...
     def get_pixmap(self, *, matrix: object, colorspace: object) -> PdfPixmap: ...
 
 
@@ -54,6 +91,8 @@ class PdfDocument(Protocol):
 
     @property
     def page_count(self) -> int: ...
+    @property
+    def needs_pass(self) -> bool: ...
     def __getitem__(self, index: int) -> PdfPage: ...
     def __enter__(self) -> PdfDocument: ...
     def __exit__(

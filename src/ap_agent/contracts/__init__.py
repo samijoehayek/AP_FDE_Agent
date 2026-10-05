@@ -43,6 +43,7 @@ from ap_agent.contracts.enums import (
     ActorKind,
     ArithmeticFlag,
     AuditEventType,
+    InputCheck,
     MatchLineOutcome,
     ReasonCode,
     SuggestedAction,
@@ -64,6 +65,7 @@ from ap_agent.contracts.guardrails import (
     FilterAction,
     GuardrailConfig,
     HardProhibitions,
+    HiddenTextLimits,
     InputValidation,
     OutputFilter,
     OutputFilterPattern,
@@ -85,6 +87,7 @@ from ap_agent.contracts.purchase_order import (
     ReceiptLine,
     ReceiptSet,
 )
+from ap_agent.contracts.screening import InputFlag
 from ap_agent.contracts.vendor import (
     MAX_VENDOR_CANDIDATES,
     VendorCandidate,
@@ -122,7 +125,10 @@ __all__ = [
     "GeneratedVariant",
     "GuardrailConfig",
     "HardProhibitions",
+    "HiddenTextLimits",
     "HumanActor",
+    "InputCheck",
+    "InputFlag",
     "InputValidation",
     "InvoiceExtraction",
     "LineItem",

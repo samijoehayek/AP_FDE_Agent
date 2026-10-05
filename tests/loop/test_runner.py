@@ -20,7 +20,7 @@ import pytest
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
-from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType, ReasonCode
+from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType, InputCheck, ReasonCode
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.purchase_order import (
     PurchaseOrder,
@@ -30,6 +30,7 @@ from ap_agent.contracts.purchase_order import (
     ReceiptSet,
 )
 from ap_agent.contracts.run import Action, ActionKind, InvoiceRecord, StepResult
+from ap_agent.contracts.screening import InputFlag
 from ap_agent.contracts.vendor import VendorCandidate, VendorMatch, VendorMatchBasis
 from ap_agent.errors import ExtractionError
 from ap_agent.loop.runner import (
@@ -69,6 +70,8 @@ HAPPY_PATH_STEPS = 14
 """Loop iterations from RECEIVED to CLOSED. One per state change."""
 
 HAPPY_PATH_EVENTS = [
+    # Intake: the tool, then INPUT-VALIDATE@v1 deciding a model may read it.
+    "ingested",
     "ingest",
     # One step, four rows: two readings, the check that scored them, and the
     # decision that moved the invoice. Only the last one carries a to_state.
@@ -107,6 +110,7 @@ def _fake_ingest(_payload: IngestDocumentInput) -> IngestDocumentOutput:
         text_char_count=500,
         pages_with_text=1,
         page_sharpness=[900.0],
+        config_version="guardrails_v1",
     )
 
 
@@ -405,7 +409,11 @@ def test_the_extraction_step_records_each_call_separately(
     """
     run(record, ctx)
 
-    calls = [event for event in ctx.events if event.to_state is None]
+    calls = [
+        event
+        for event in ctx.events
+        if event.to_state is None and event.from_state is InvoiceState.INGESTED
+    ]
     assert [event.tool_name for event in calls[:3]] == [
         "extract_invoice_vision",
         "extract_invoice_text",
@@ -658,9 +666,10 @@ def test_a_tool_that_raises_stops_the_run_without_raising(
     final = run(record, ctx)
 
     assert final.state is InvoiceState.RECEIVED
-    assert len(ctx.events) == 1
-    assert ctx.events[0].event_type is AuditEventType.ERROR
-    assert "disk went away" in (ctx.events[0].error_message or "")
+    # The tool's own failure row, then the step's.
+    assert [event.event_type for event in ctx.events] == [AuditEventType.ERROR] * 2
+    assert ctx.events[0].tool_name == "ingest_document"
+    assert "disk went away" in (ctx.events[-1].error_message or "")
 
 
 def test_a_terminal_record_does_nothing(record: InvoiceRecord, ctx: RunContext) -> None:
@@ -675,7 +684,10 @@ def test_a_terminal_record_does_nothing(record: InvoiceRecord, ctx: RunContext) 
 def test_the_actor_says_who_is_accountable() -> None:
     """The first question asked of an AP trail."""
     empty = StepResult(event="x")
-    tool = actor_for(Action(kind=ActionKind.INGEST_DOCUMENT, by="rule", rule_id="R"), empty)
+    tool = actor_for(Action(kind=ActionKind.GET_PURCHASE_ORDER, by="rule"), empty)
+    intake = actor_for(
+        Action(kind=ActionKind.INGEST_DOCUMENT, by="rule", rule_id="INPUT-VALIDATE@v1"), empty
+    )
     rule = actor_for(Action(kind=ActionKind.VALIDATE, by="rule", rule_id="VALIDATE@v1"), empty)
     human = actor_for(Action(kind=ActionKind.STUB, by="human"), empty)
     model = actor_for(
@@ -684,7 +696,9 @@ def test_the_actor_says_who_is_accountable() -> None:
     )
 
     assert isinstance(tool, ToolActor)
-    assert tool.name == "ingest_document"
+    assert tool.name == "get_purchase_order"
+    assert isinstance(intake, RuleActor), "intake decides whether a model may read the file"
+    assert intake.rule_id == "INPUT-VALIDATE@v1"
     assert isinstance(rule, RuleActor)
     assert rule.rule_id == "VALIDATE@v1"
     assert isinstance(human, HumanActor)
@@ -1346,12 +1360,13 @@ def test_a_failed_reading_leaves_the_rows_for_the_readings_that_worked(
     assert final.state is InvoiceState.INGESTED
     assert [event.tool_name for event in ctx.events] == [
         "ingest_document",
+        "ingest_document",
         "extract_invoice_vision",
         "extract_invoice_text",
         "compute_extraction_confidence",
     ]
 
-    vision = ctx.events[1]
+    vision = ctx.events[2]
     assert vision.input_tokens == 7000
     assert vision.output_tokens == 900
     assert vision.error_message is None
@@ -1363,7 +1378,7 @@ def test_the_failure_row_names_the_tool_that_failed(record: InvoiceRecord, tmp_p
 
     run(record, ctx)
 
-    failed = ctx.events[2]
+    failed = ctx.events[3]
     assert failed.tool_name == "extract_invoice_text"
     assert failed.event_type is AuditEventType.ERROR
     assert "ExtractionError" in (failed.error_message or "")
@@ -1472,6 +1487,68 @@ def test_an_invoice_within_the_window_does_not(record: InvoiceRecord, tmp_path: 
     final = run(arrived, ctx)
 
     assert "invoice_date_too_old" not in final.validation_flags
+
+
+# --- intake ---------------------------------------------------------------
+
+
+def _flagged_ingest(_payload: IngestDocumentInput) -> IngestDocumentOutput:
+    """What ingest reports for the generated hidden_text variant."""
+    return _fake_ingest(_payload).model_copy(
+        update={
+            "flags": [
+                InputFlag(
+                    check=InputCheck.NEAR_WHITE_TEXT,
+                    detail="page=1, spans=1, near-white on near-white",
+                )
+            ]
+        }
+    )
+
+
+def test_a_flagged_document_goes_to_a_person_without_a_model_reading_it(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """Zero tokens on a flagged document. The readings are never even called."""
+    calls: list[str] = []
+
+    def _never(payload: object) -> ExtractInvoiceVisionOutput:
+        calls.append(type(payload).__name__)
+        raise AssertionError
+
+    ctx = replace(_context(tmp_path), ingest=_flagged_ingest, extract=_never, extract_text=_never)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.NEEDS_HUMAN_EXTRACTION
+    assert calls == []
+    assert all(event.input_tokens is None for event in ctx.events)
+
+    decision = next(event for event in ctx.events if event.decision == "input_flagged")
+    assert isinstance(decision.actor, RuleActor)
+    assert decision.actor.rule_id == "INPUT-VALIDATE@v1"
+    assert decision.decision_basis == (
+        "config_version=guardrails_v1, "
+        "flags=near_white_text(page=1, spans=1, near-white on near-white)"
+    )
+    assert decision.to_state is InvoiceState.NEEDS_HUMAN_EXTRACTION
+    assert ctx.events[-1].event_type is AuditEventType.HALT, "and it waits there"
+
+
+def test_a_clean_document_records_that_the_check_ran(
+    record: InvoiceRecord, ctx: RunContext
+) -> None:
+    """``flags=none`` is a rule that ran and found nothing - not a rule that never ran."""
+    run(record, ctx)
+
+    tool, decision = ctx.events[0], ctx.events[1]
+    assert isinstance(tool.actor, ToolActor)
+    assert tool.actor.name == "ingest_document"
+    assert tool.to_state is None
+    assert isinstance(decision.actor, RuleActor)
+    assert decision.actor.rule_id == "INPUT-VALIDATE@v1"
+    assert decision.decision_basis == "config_version=guardrails_v1, flags=none"
+    assert decision.to_state is InvoiceState.INGESTED
 
 
 def test_a_halt_for_a_missing_tool_is_not_an_error(record: InvoiceRecord, tmp_path: Path) -> None:

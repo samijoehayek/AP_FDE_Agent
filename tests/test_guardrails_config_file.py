@@ -134,6 +134,39 @@ def test_input_limits_reject_a_document_too_big_to_be_an_invoice(
     assert limits.max_file_bytes == 25 * 1024 * 1024
     assert "application/pdf" in limits.allowed_mime_types
     assert "text/html" not in limits.allowed_mime_types
+    assert limits.allow_password_protected is False
+
+
+def test_the_size_limits_are_the_contracts_own_caps(config: GuardrailConfig) -> None:
+    """max_line_items and max_field_length are enforced where a reading is built.
+
+    They are output-side limits - a file has no line items until something reads
+    it - and ``InvoiceExtraction`` rejects a reading that breaks either at
+    construction. This keeps the file honest about what that enforcement is: if
+    either number moves here without the contract moving, the claim is false.
+    """
+    from ap_agent.contracts.invoice import InvoiceExtraction, LineItem  # noqa: PLC0415
+
+    def max_length(model: type[InvoiceExtraction | LineItem], name: str) -> int:
+        caps = [getattr(item, "max_length", None) for item in model.model_fields[name].metadata]
+        return next(cap for cap in caps if cap is not None)
+
+    limits = config.input_validation
+    assert max_length(InvoiceExtraction, "line_items") == limits.max_line_items
+    assert max_length(LineItem, "description") == limits.max_field_length
+
+
+def test_hidden_text_thresholds_sit_well_clear_of_real_documents(
+    config: GuardrailConfig,
+) -> None:
+    """Measured on 160 local PDFs: the faintest real page renders 1.9% ink.
+
+    The cut is an order of magnitude below that, so a real page cannot drift
+    into it, and near-white means nearly white rather than light grey.
+    """
+    hidden = config.input_validation.hidden_text
+    assert hidden.min_ink_fraction <= 0.019 / 5
+    assert hidden.near_white_min >= 230
 
 
 def test_the_output_filter_routes_and_never_rewrites(config: GuardrailConfig) -> None:

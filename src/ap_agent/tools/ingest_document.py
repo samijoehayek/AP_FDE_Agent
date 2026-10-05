@@ -18,8 +18,19 @@ depends on its output being trustworthy:
   not a physical measurement: compare it against the thresholds in the
   guardrails config, not against an absolute.
 
-Nothing here interprets content. A document is bytes, a page count, and a
-quality score until an extraction contract says otherwise.
+* ``flags`` are the ``input_validation`` section of the guardrails, applied
+  here because this runs before any model call. A file of the wrong type, too
+  large, too long or behind a password is refused without being opened past
+  what the check needs. Text a person cannot see - near-white on white, off the
+  page, or a text layer over a blank render - is flagged, because on an invoice
+  invisible text can only be written for a machine.
+
+Nothing here interprets content. A document is bytes, a page count, a quality
+score and a list of flags until an extraction contract says otherwise. The
+flags say where and how much, never what the hidden text says.
+
+What it deliberately does not do: route. A flag is a fact on the output; the
+loop decides that a flagged document goes to a person.
 """
 
 from __future__ import annotations
@@ -32,13 +43,17 @@ import numpy as np
 import pymupdf
 from pydantic import Field
 
+from ap_agent.contracts.enums import InputCheck
+from ap_agent.contracts.screening import InputFlag
 from ap_agent.errors import IngestionError, UnsupportedDocumentError
+from ap_agent.guardrails.config import load_guardrails
 from ap_agent.tools.base import SideEffect, ToolCaller, ToolInput, ToolOutput
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-    from ap_agent.tools.pymupdf_types import PdfDocument, PdfPage
+    from ap_agent.contracts.guardrails import HiddenTextLimits, InputValidation
+    from ap_agent.tools.pymupdf_types import PdfDocument, PdfPage, PdfRect
 
 CALLER = ToolCaller.CODE
 SIDE_EFFECTS: tuple[SideEffect, ...] = (SideEffect.LOCAL_READ,)
@@ -74,6 +89,21 @@ _CHUNK_BYTES: Final = 1 << 20
 _LAPLACIAN_KERNEL_SPAN: Final = 3
 """The 4-neighbour kernel needs a 3x3 neighbourhood to have an interior."""
 
+_UNKNOWN_MEDIA_TYPE: Final = "application/octet-stream"
+
+_TEXT_FLAGS: Final[int] = cast(
+    "int",
+    pymupdf.TEXTFLAGS_DICT  # pyright: ignore[reportUnknownMemberType] - an int, unannotated
+    & ~pymupdf.TEXT_MEDIABOX_CLIP,  # pyright: ignore[reportUnknownMemberType]
+)
+"""Read every span, including the ones PyMuPDF would drop for lying off the page.
+
+By default text outside the page box is clipped away before it is returned,
+which is exactly the text the off-page check exists to find. Clearing this flag
+is not enough on its own: ``get_text`` also clips to the page through its
+``clip`` argument, so the call passes an infinite rectangle as well.
+"""
+
 
 class IngestDocumentInput(ToolInput):
     """Input for :func:`ingest_document`."""
@@ -99,7 +129,10 @@ class IngestDocumentOutput(ToolOutput):
     sha256: str = Field(min_length=64, max_length=64)
     byte_size: int = Field(ge=0)
     media_type: str = Field(min_length=1, max_length=64)
-    page_count: int = Field(ge=1)
+    page_count: int = Field(
+        ge=0,
+        description="Zero only when the file was refused before it was opened - see flags.",
+    )
 
     has_text_layer: bool = Field(
         description="True when at least one page carries enough embedded text to extract from."
@@ -113,6 +146,16 @@ class IngestDocumentOutput(ToolOutput):
         default_factory=list[float],
         description="Laplacian variance per scored page, in page order. Empty when scoring was "
         "skipped. Relative: compare against the guardrails thresholds.",
+    )
+
+    flags: list[InputFlag] = Field(
+        default_factory=list[InputFlag],
+        description="Every input_validation check this document failed. Empty means clean.",
+    )
+    config_version: str = Field(
+        min_length=1,
+        max_length=32,
+        description="The guardrails version the flags were computed under.",
     )
 
     @property
@@ -171,8 +214,12 @@ def _laplacian_variance(gray: NDArray[np.float32]) -> float:
     return float(laplacian.var())
 
 
-def _page_gray(page: PdfPage) -> NDArray[np.float32]:
-    """Render one page to a greyscale array normalised to a fixed long edge."""
+def _page_gray(page: PdfPage) -> tuple[NDArray[np.float32], float]:
+    """Render one page to greyscale at a fixed long edge; return it and the zoom.
+
+    The zoom travels with the render so a span's PDF coordinates can be mapped
+    onto it.
+    """
     rect = page.rect
     longest = max(rect.width, rect.height) or 1.0
     zoom = SHARPNESS_TARGET_PX / longest
@@ -181,22 +228,153 @@ def _page_gray(page: PdfPage) -> NDArray[np.float32]:
     # PyMuPDF pads each row to `stride` bytes; slicing to width drops the padding.
     flat = np.frombuffer(pixmap.samples, dtype=np.uint8)
     rows = flat.reshape(pixmap.height, pixmap.stride)
-    return rows[:, : pixmap.width].astype(np.float32)
+    return rows[:, : pixmap.width].astype(np.float32), zoom
+
+
+def _is_near_white(color: int, limits: HiddenTextLimits) -> bool:
+    """Whether a packed sRGB fill is near-white on every channel."""
+    channels = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+    return min(channels) >= limits.near_white_min
+
+
+def _inside(bbox: tuple[float, float, float, float], rect: PdfRect) -> bool:
+    """Whether a span lies wholly within the page box."""
+    x0, y0, x1, y1 = bbox
+    return x0 >= rect.x0 and y0 >= rect.y0 and x1 <= rect.x1 and y1 <= rect.y1
+
+
+def _on_paper(
+    bbox: tuple[float, float, float, float],
+    rect: PdfRect,
+    render: tuple[NDArray[np.float32], float],
+    limits: HiddenTextLimits,
+) -> bool:
+    """Whether what is behind a span renders as paper.
+
+    White text on a dark header bar is ordinary and visible; white text on white
+    paper is not. So a near-white fill is only hidden when the area it sits on
+    is near-white too - measured on the render, not inferred from the PDF.
+    """
+    gray, zoom = render
+    x0, y0, x1, y1 = bbox
+    left = max(int((x0 - rect.x0) * zoom), 0)
+    top = max(int((y0 - rect.y0) * zoom), 0)
+    right = min(int((x1 - rect.x0) * zoom) + 1, gray.shape[1])
+    bottom = min(int((y1 - rect.y0) * zoom) + 1, gray.shape[0])
+    region = gray[top:bottom, left:right]
+    return region.size == 0 or float(np.median(region)) >= limits.near_white_min
+
+
+def _hidden_text_flags(
+    page: PdfPage,
+    page_no: int,
+    text_chars: int,
+    render: tuple[NDArray[np.float32], float] | None,
+    limits: HiddenTextLimits,
+) -> list[InputFlag]:
+    """Flag text on this page that a person looking at it would not see.
+
+    Three checks, because there are three cheap ways to hide text from a person
+    and leave it in front of a model: colour it like the paper, put it outside
+    the page box, or put a text layer over a page that renders blank. Counts
+    and measurements go in ``detail``; the text itself never does.
+
+    ``render`` is None on a page with no text inside the page box. Only the
+    off-page check can fire there, and it needs no render - so a scan with a
+    line planted off the page is still caught without paying for one.
+    """
+    rect = page.rect
+    near_white = 0
+    offpage = 0
+    unclipped = page.get_text("dict", flags=_TEXT_FLAGS, clip=pymupdf.INFINITE_RECT())
+    for block in unclipped["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                if not span["text"].strip():
+                    continue
+                if not _inside(span["bbox"], rect):
+                    offpage += 1
+                elif (
+                    render is not None
+                    and _is_near_white(span["color"], limits)
+                    and _on_paper(span["bbox"], rect, render, limits)
+                ):
+                    near_white += 1
+
+    flags: list[InputFlag] = []
+    if near_white:
+        flags.append(
+            InputFlag(
+                check=InputCheck.NEAR_WHITE_TEXT,
+                detail=f"page={page_no}, spans={near_white}, near-white on near-white",
+            )
+        )
+    if offpage:
+        flags.append(
+            InputFlag(
+                check=InputCheck.OFFPAGE_TEXT,
+                detail=f"page={page_no}, spans={offpage}, outside the page box",
+            )
+        )
+    if render is not None and text_chars >= MIN_TEXT_CHARS_PER_PAGE:
+        ink = float((render[0] < limits.near_white_min).mean())
+        if ink < limits.min_ink_fraction:
+            flags.append(
+                InputFlag(
+                    check=InputCheck.INVISIBLE_TEXT_LAYER,
+                    detail=f"page={page_no}, text_chars={text_chars}, "
+                    f"ink={ink:.4f} < {limits.min_ink_fraction}",
+                )
+            )
+    return flags
+
+
+def _refused_before_opening(
+    path: Path, limits: InputValidation, byte_size: int
+) -> tuple[str, str | None, list[InputFlag]]:
+    """Check type and size, which need no parse. Returns the type and any flags.
+
+    A file that fails either is never handed to a parser: the point of checking
+    before reading is that a hostile file gets no further than its first bytes.
+    An unrecognised header is a type flag rather than an error, because it is
+    a fact about the document - one a person should look at - not a fault here.
+    """
+    with path.open("rb") as handle:
+        header = handle.read(16)
+    try:
+        media_type, filetype = sniff_media_type(header)
+    except UnsupportedDocumentError:
+        flag = InputFlag(check=InputCheck.FILE_TYPE, detail="unrecognised document header")
+        return _UNKNOWN_MEDIA_TYPE, None, [flag]
+
+    flags: list[InputFlag] = []
+    if media_type not in limits.allowed_mime_types:
+        flags.append(
+            InputFlag(check=InputCheck.FILE_TYPE, detail=f"media_type={media_type} not allowed")
+        )
+    if byte_size > limits.max_file_bytes:
+        flags.append(
+            InputFlag(
+                check=InputCheck.FILE_SIZE, detail=f"bytes={byte_size} > {limits.max_file_bytes}"
+            )
+        )
+    return media_type, filetype, flags
 
 
 def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
-    """Hash, identify, and quality-check a document.
+    """Hash, identify, quality-check and validate a document.
 
     Args:
         payload: The path to read and how much work to do on it.
 
     Returns:
-        The document's identity, structure, and per-page legibility.
+        The document's identity, structure, per-page legibility, and every
+        ``input_validation`` check it failed, stamped with the guardrails
+        version that defined them.
 
     Raises:
         IngestionError: The path does not exist, is not a file, is empty, or
             could not be parsed as the type its bytes claim.
-        UnsupportedDocumentError: The media type is not one this pipeline accepts.
     """
     path = payload.path
     if not path.is_file():
@@ -208,9 +386,25 @@ def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
         msg = f"empty file: {path}"
         raise IngestionError(msg)
 
-    with path.open("rb") as handle:
-        header = handle.read(16)
-    media_type, filetype = sniff_media_type(header)
+    config = load_guardrails()
+    limits = config.input_validation
+
+    def output(**facts: object) -> IngestDocumentOutput:
+        return IngestDocumentOutput.model_validate(
+            {"sha256": sha256, "byte_size": byte_size, "config_version": config.config_version}
+            | facts
+        )
+
+    media_type, filetype, refused = _refused_before_opening(path, limits, byte_size)
+    if refused or filetype is None:
+        return output(
+            media_type=media_type,
+            page_count=0,
+            has_text_layer=False,
+            text_char_count=0,
+            pages_with_text=0,
+            flags=refused,
+        )
 
     data = path.read_bytes()
     try:
@@ -221,13 +415,29 @@ def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
 
     with document:
         page_count = document.page_count
+        unread = output(
+            media_type=media_type,
+            page_count=page_count,
+            has_text_layer=False,
+            text_char_count=0,
+            pages_with_text=0,
+        )
+        if document.needs_pass and not limits.allow_password_protected:
+            flag = InputFlag(check=InputCheck.PASSWORD_PROTECTED, detail="password required")
+            return unread.model_copy(update={"flags": [flag]})
         if page_count < 1:
             msg = f"document has no pages: {path}"
             raise IngestionError(msg)
+        if page_count > limits.max_pages:
+            flag = InputFlag(
+                check=InputCheck.PAGE_COUNT, detail=f"pages={page_count} > {limits.max_pages}"
+            )
+            return unread.model_copy(update={"flags": [flag]})
 
         text_char_count = 0
         pages_with_text = 0
         sharpness: list[float] = []
+        flags: list[InputFlag] = []
 
         for index in range(page_count):
             page = document[index]
@@ -236,16 +446,21 @@ def ingest_document(payload: IngestDocumentInput) -> IngestDocumentOutput:
             if len(stripped) >= MIN_TEXT_CHARS_PER_PAGE:
                 pages_with_text += 1
 
-            if payload.compute_sharpness and index < payload.max_pages_scored:
-                sharpness.append(_laplacian_variance(_page_gray(page)))
+            scored = payload.compute_sharpness and index < payload.max_pages_scored
+            # No text on the page and no score wanted: nothing needs the render.
+            render = _page_gray(page) if scored or stripped else None
+            if scored and render is not None:
+                sharpness.append(_laplacian_variance(render[0]))
+            flags.extend(
+                _hidden_text_flags(page, index + 1, len(stripped), render, limits.hidden_text)
+            )
 
-    return IngestDocumentOutput(
-        sha256=sha256,
-        byte_size=byte_size,
+    return output(
         media_type=media_type,
         page_count=page_count,
         has_text_layer=pages_with_text > 0,
         text_char_count=text_char_count,
         pages_with_text=pages_with_text,
         page_sharpness=sharpness,
+        flags=flags,
     )

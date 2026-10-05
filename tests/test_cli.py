@@ -38,8 +38,18 @@ def test_ingest_prints_json(born_digital_pdf: Path) -> None:
 
 
 def test_ingest_reports_a_bad_document_without_a_traceback(tmp_path: Path) -> None:
+    """Not an error any more: an unrecognised file is a flag a person reads."""
     path = tmp_path / "bad.pdf"
     path.write_bytes(b"not a document at all")
+    result = runner.invoke(app, ["ingest", str(path)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert [flag["check"] for flag in payload["flags"]] == ["file_type"]
+
+
+def test_ingest_reports_an_unreadable_document_without_a_traceback(tmp_path: Path) -> None:
+    path = tmp_path / "truncated.pdf"
+    path.write_bytes(b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog")
     result = runner.invoke(app, ["ingest", str(path)])
     assert result.exit_code == 1
     assert "error:" in result.output
@@ -146,10 +156,10 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     )
     assert result.exit_code == 0, result.output
     assert "final state : CLOSED" in result.output
-    # Fourteen moves. Eighteen rows: the extraction step is one move and four
-    # rows, and resolving the vendor is one move and two.
+    # Fourteen moves. Nineteen rows: intake is one move and two rows, the
+    # extraction step one move and four, and resolving the vendor one and two.
     assert "steps       : 14" in result.output
-    assert "audit rows  : 18" in result.output
+    assert "audit rows  : 19" in result.output
     assert "chain intact: True" in result.output
 
 

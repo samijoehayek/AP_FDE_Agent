@@ -59,6 +59,7 @@ class InvoiceEvent(StrEnum):
     """
 
     INGEST = "ingest"
+    INPUT_FLAGGED = "input_flagged"
     EXTRACT = "extract"
     EXTRACTION_FAILED = "extraction_failed"
     HUMAN_EXTRACTION_PROVIDED = "human_extraction_provided"
@@ -107,6 +108,10 @@ _E = InvoiceEvent
 TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     # --- intake -----------------------------------------------------------
     (_S.RECEIVED, _E.INGEST): _S.INGESTED,
+    # A document that failed input validation is read by a person, never by a
+    # model. NEEDS_HUMAN_EXTRACTION is that state: its only way forward is a
+    # person supplying the extraction, so no reading seat ever sees the file.
+    (_S.RECEIVED, _E.INPUT_FLAGGED): _S.NEEDS_HUMAN_EXTRACTION,
     # --- extraction -------------------------------------------------------
     (_S.INGESTED, _E.EXTRACT): _S.EXTRACTED,
     (_S.INGESTED, _E.EXTRACTION_FAILED): _S.NEEDS_HUMAN_EXTRACTION,

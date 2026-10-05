@@ -117,7 +117,7 @@ RULE_CONFIG_VERSION = "v1"
 """The guardrails version a rule actor is recorded under."""
 
 VALIDATE_RULE_ID = "VALIDATE@v1"
-INGEST_RULE_ID = "INGEST@v1"
+INPUT_VALIDATE_RULE_ID = "INPUT-VALIDATE@v1"
 EXTRACT_CONF_RULE_ID = "EXTRACT-CONF@v1"
 DATE_RESOLVE_RULE_ID = "DATE-RESOLVE@v1"
 RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
@@ -380,7 +380,11 @@ def decide(record: InvoiceRecord) -> Action:
     """
     match record.state:
         case InvoiceState.RECEIVED:
-            return Action(kind=ActionKind.INGEST_DOCUMENT, by="rule", rule_id=INGEST_RULE_ID)
+            # One call and a decision on it: what the file is, then whether a
+            # model may read it at all.
+            return Action(
+                kind=ActionKind.INGEST_DOCUMENT, by="rule", rule_id=INPUT_VALIDATE_RULE_ID
+            )
         case InvoiceState.INGESTED:
             # One step, three calls: two readings and the check that scores
             # them. The step is attributed to the rule that decides on the
@@ -518,15 +522,7 @@ def apply(
     """
     match action.kind:
         case ActionKind.INGEST_DOCUMENT:
-            output = ctx.ingest(IngestDocumentInput(path=record.source_path))
-            return (
-                record.model_copy(update={"ingest": output}),
-                StepResult(
-                    event=InvoiceEvent.INGEST.value,
-                    output_ref=content_ref(output),
-                    result_summary=f"sha256={output.sha256[:12]}, pages={output.page_count}",
-                ),
-            )
+            return _ingest_step(record, ctx, trail)
 
         case ActionKind.COMPUTE_EXTRACTION_CONFIDENCE:
             return _read_and_score(record, ctx, trail)
@@ -557,6 +553,56 @@ def effective_date(record: InvoiceRecord) -> date:
     if record.extraction is not None:
         return record.extraction.invoice_date
     return date.min
+
+
+def _ingest_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """Find out what the file is, then decide whether a model may read it.
+
+    ``ingest_document`` measures and flags; this rule decides. Any flag sends the
+    document to a person *before* the extraction step, which is the only step
+    that spends tokens - so a flagged document costs nothing, and a hidden
+    instruction in it is never put in front of a model that might act on it.
+
+    Every document gets the decision row, clean ones included. ``flags=none`` is
+    a rule that ran and found nothing, which is a different fact from a rule
+    that did not run.
+    """
+    output = _call(trail, ActionKind.INGEST_DOCUMENT, "rule", ctx.ingest)(
+        IngestDocumentInput(path=record.source_path)
+    )
+    summary = f"sha256={output.sha256[:12]}, pages={output.page_count}"
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.INGEST_DOCUMENT,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="flagged" if output.flags else "ingested",
+            output_ref=content_ref(output),
+            result_summary=summary,
+        )
+    )
+    event = InvoiceEvent.INPUT_FLAGGED if output.flags else InvoiceEvent.INGEST
+    return (
+        record.model_copy(update={"ingest": output}),
+        StepResult(
+            event=event.value,
+            output_ref=content_ref(output),
+            result_summary=summary,
+            decision_basis=_input_basis(output),
+        ),
+    )
+
+
+def _input_basis(output: IngestDocumentOutput) -> str:
+    """The flags, and the ruleset that defined them, for one audit row.
+
+    ``detail`` is this system's own measurement - page, count, colour, ink -
+    and never document text, so nothing planted in the file reaches the trail.
+    """
+    flags = "|".join(f"{flag.check.value}({flag.detail})" for flag in output.flags)
+    return f"config_version={output.config_version}, flags={flags or 'none'}"[:MAX_BASIS_CHARS]
 
 
 def _read_and_score(
@@ -1213,6 +1259,7 @@ class StepTransition:
 
 _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
     {
+        ActionKind.INGEST_DOCUMENT,
         ActionKind.VALIDATE,
         ActionKind.STUB,
         ActionKind.MATCH_PREP,
@@ -1223,7 +1270,9 @@ _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
 """Kinds whose *step* is a decision over several calls rather than one call.
 
 A step that **is** one call is attributed to the callee: "which tool ran" is what
-an auditor wants, and ``ingest_document`` is not in this set for that reason. A
+an auditor wants. ``ingest_document`` used to be such a step; it is in this set
+now because its step decides whether a model may read the file at all, and that
+decision belongs to ``INPUT-VALIDATE@v1`` rather than to the tool. A
 step that *weighed* calls - each of which wrote its own row naming its own tool -
 is attributed to the rule that weighed them.
 
