@@ -28,7 +28,6 @@ worse than no trail, because it looks complete.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -61,6 +60,11 @@ from ap_agent.guardrails.config import load_guardrails
 from ap_agent.guardrails.output_filter import screen_extraction
 from ap_agent.logging import get_logger
 from ap_agent.loop.dates import resolve_date_by_locale, resolve_date_by_receipt_window
+from ap_agent.payloads import (
+    InMemoryPayloadStore,
+    PayloadStore,
+    store_ref,
+)
 from ap_agent.pricing import UNKNOWN_PRICING_VERSION, cost_usd, pricing_version
 from ap_agent.states.machine import (
     HUMAN_ONLY_EVENTS,
@@ -265,6 +269,9 @@ class RunContext:
     get_receipts: Callable[[GetReceiptsInput], GetReceiptsOutput] = _default_get_receipts
     compute_match: Callable[[ComputeMatchInput], ComputeMatchOutput] = _default_compute_match
     classify: Callable[[ClassifyExceptionInput], ClassifyExceptionOutput] = _default_classify
+    payloads: PayloadStore = field(default_factory=InMemoryPayloadStore)
+    """Where every ``output_ref`` is stored. In memory unless the caller says
+    otherwise; ``just run`` passes the Postgres store."""
     now: Callable[[], datetime] = utc_now
     events: list[AuditEvent] = field(default_factory=list[AuditEvent])
     """Every event written this run, in order. Convenience for callers and tests."""
@@ -293,6 +300,16 @@ class StepTrail:
     ctx: RunContext
     record: InvoiceRecord
     from_state: InvoiceState
+
+    def ref(self, value: BaseModel | str) -> str:
+        """Store ``value`` as a payload, then return the reference that cites it.
+
+        Every ``output_ref`` goes through here, so every one resolves. Stored
+        before it is returned, and therefore before the row carrying it is
+        written: a crash in between leaves an unused payload, never a dangling
+        reference.
+        """
+        return store_ref(self.ctx.payloads, value)
 
     def call(self, call: ToolCallRecord) -> None:
         """Write one call's row now. Never carries a ``to_state``."""
@@ -337,7 +354,7 @@ class StepTrail:
                 by="model",
                 event_type=AuditEventType.MODEL_CALL,
                 summary=summary,
-                output_ref=content_ref(output),
+                output_ref=self.ref(output),
                 result_summary=f"pricing={_pricing_version()}",
                 model_id=model_id,
                 prompt_version=prompt_version,
@@ -616,7 +633,7 @@ def _ingest_step(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary="flagged" if output.flags else "ingested",
-            output_ref=content_ref(output),
+            output_ref=trail.ref(output),
             result_summary=summary,
         )
     )
@@ -625,7 +642,7 @@ def _ingest_step(
         record.model_copy(update={"ingest": output}),
         StepResult(
             event=event.value,
-            output_ref=content_ref(output),
+            output_ref=trail.ref(output),
             result_summary=summary,
             decision_basis=_input_basis(output),
         ),
@@ -700,7 +717,7 @@ def _read_and_score(
         # flagged transcription; the person this goes to supplies their own.
         return record, StepResult(
             event=InvoiceEvent.OUTPUT_FLAGGED.value,
-            output_ref=content_ref("|".join(flagged)),
+            output_ref=trail.ref("|".join(flagged)),
             result_summary=f"flags={len(flagged)}",
             decision_basis=(f"config_version={guardrails_version()}, flags={'|'.join(flagged)}")[
                 :MAX_BASIS_CHARS
@@ -726,7 +743,7 @@ def _read_and_score(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary="auto_ok" if verdict.auto_ok else "needs_human",
-            output_ref=content_ref(verdict),
+            output_ref=trail.ref(verdict),
             result_summary=f"fields={len(verdict.fields)}, needs_human={len(verdict.needs_human)}",
         )
     )
@@ -743,7 +760,7 @@ def _read_and_score(
         ),
         StepResult(
             event=event.value,
-            output_ref=content_ref(vision.extraction),
+            output_ref=trail.ref(vision.extraction),
             result_summary=f"invoice={vision.extraction.invoice_number}",
             decision_basis=confidence_basis(verdict),
         ),
@@ -773,7 +790,7 @@ def _screen_reading(trail: StepTrail, kind: ActionKind, extraction: InvoiceExtra
             rule_id=OUTPUT_FILTER_RULE_ID,
             event_type=AuditEventType.RULE_EVALUATION,
             summary="flagged" if flags else "clean",
-            output_ref=content_ref(basis),
+            output_ref=trail.ref(basis),
             result_summary=f"hits={len(flags)}",
             basis=basis[:MAX_BASIS_CHARS],
         )
@@ -886,7 +903,7 @@ def _settle_by_receipt_window(record: InvoiceRecord, trail: StepTrail) -> Invoic
             rule_id=DATE_RESOLVE_RULE_ID,
             event_type=AuditEventType.RULE_EVALUATION,
             summary=DateResolutionReason.RECEIPT_WINDOW.value[:64],
-            output_ref=content_ref(chosen.isoformat()),
+            output_ref=trail.ref(chosen.isoformat()),
             result_summary=f"date={chosen.isoformat()}",
             basis=basis[:MAX_BASIS_CHARS],
         )
@@ -897,40 +914,6 @@ def _settle_by_receipt_window(record: InvoiceRecord, trail: StepTrail) -> Invoic
             "date_resolution_reason": DateResolutionReason.RECEIPT_WINDOW,
         }
     )
-
-
-VOLATILE_FIELDS: frozenset[str] = frozenset({"latency_ms", "input_tokens", "output_tokens"})
-"""Excluded from a content address: they measure the call, not its answer.
-
-``output_ref`` answers "what came back". How long it took and what it cost are
-separate columns on the same row, and folding them into the hash would make the
-same answer hash differently on every run - which destroys the one thing a
-content address is for.
-"""
-
-
-def content_ref(value: BaseModel | str) -> str:
-    """A content address for what a call returned, for ``output_ref``.
-
-    The trail points at payloads, it does not inline them - an audit row is a
-    claim about what happened, not a copy of it. Hashing what came back means the
-    row identifies it exactly, so a snapshot stored elsewhere can later be proved
-    to be the one that was acted on.
-
-    Hashes the JSON rather than the object, because a ``repr`` carries no
-    stability guarantee and a reference that moved when pydantic changed its
-    formatting would report tampering where none happened.
-
-    Human-readable notes do not go here. ``date=2024-03-09`` in an ``output_ref``
-    is a label pretending to be an address; ``tool_result_summary`` exists for
-    it.
-    """
-    if isinstance(value, str):
-        payload = value
-    else:
-        payload = value.model_dump_json(exclude=set(VOLATILE_FIELDS))
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return f"sha256:{digest}"
 
 
 def _resolve_vendor_step(
@@ -976,7 +959,7 @@ def _resolve_vendor_step(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary=match.match_basis.value[:64],
-            output_ref=content_ref(match),
+            output_ref=trail.ref(match),
             result_summary=f"vendor={match.vendor_name or 'none'}",
             basis=_vendor_basis(extraction.vendor_name, match),
             latency_ms=found.latency_ms,
@@ -988,7 +971,7 @@ def _resolve_vendor_step(
             record.model_copy(update={"vendor_match": match}),
             StepResult(
                 event=InvoiceEvent.VENDOR_NOT_FOUND.value,
-                output_ref=content_ref(match),
+                output_ref=trail.ref(match),
                 decision_basis=_vendor_basis(extraction.vendor_name, match),
             ),
         )
@@ -1006,7 +989,7 @@ def _resolve_vendor_step(
         # before anything else is decided about the invoice; see the edge.
         return resolved, StepResult(
             event=InvoiceEvent.REMIT_TO_MISMATCH.value,
-            output_ref=content_ref(match),
+            output_ref=trail.ref(match),
             result_summary=f"vendor_id={match.vendor_id}",
             decision_basis=_vendor_basis(extraction.vendor_name, match),
         )
@@ -1016,7 +999,7 @@ def _resolve_vendor_step(
         resolved,
         StepResult(
             event=InvoiceEvent.RESOLVE_VENDOR.value,
-            output_ref=content_ref(match),
+            output_ref=trail.ref(match),
             result_summary=f"vendor_id={match.vendor_id}, country={match.country}",
             decision_basis=_vendor_basis(extraction.vendor_name, match),
         ),
@@ -1075,7 +1058,7 @@ def _settle_by_vendor_locale(record: InvoiceRecord, trail: StepTrail) -> Invoice
             rule_id=DATE_RESOLVE_RULE_ID,
             event_type=AuditEventType.RULE_EVALUATION,
             summary=DateResolutionReason.VENDOR_LOCALE.value[:64],
-            output_ref=content_ref(chosen.isoformat()),
+            output_ref=trail.ref(chosen.isoformat()),
             result_summary=f"date={chosen.isoformat()}",
             basis=basis[:MAX_BASIS_CHARS],
         )
@@ -1135,7 +1118,7 @@ def _match_prep_step(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary="found" if order else "not_found",
-            output_ref=content_ref(order) if order else content_ref(f"po_not_found:{po_number}"),
+            output_ref=trail.ref(order) if order else trail.ref(f"po_not_found:{po_number}"),
             result_summary=f"po_number={po_number}, lines={len(order.lines) if order else 0}",
             basis=f"po_number={po_number}",
             latency_ms=fetched.latency_ms,
@@ -1147,7 +1130,7 @@ def _match_prep_step(
             record,
             StepResult(
                 event=InvoiceEvent.MATCH_EXCEPTION.value,
-                output_ref=content_ref(f"po_not_found:{po_number}"),
+                output_ref=trail.ref(f"po_not_found:{po_number}"),
                 result_summary=f"po_number={po_number}",
                 decision_basis=f"po_number={po_number}, po_not_found",
             ),
@@ -1159,7 +1142,7 @@ def _match_prep_step(
             record.model_copy(update={"purchase_order": order, "match_result": mismatch}),
             StepResult(
                 event=InvoiceEvent.MATCH_EXCEPTION.value,
-                output_ref=content_ref(mismatch),
+                output_ref=trail.ref(mismatch),
                 result_summary=f"po_number={po_number}",
                 decision_basis=_match_basis(mismatch, order, None),
             ),
@@ -1174,7 +1157,7 @@ def _match_prep_step(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary="nothing_received" if received.receipts.is_empty else "received",
-            output_ref=content_ref(received.receipts),
+            output_ref=trail.ref(received.receipts),
             result_summary=f"lines={len(received.receipts.lines)}",
             basis=f"po_number={po_number}, lines={len(received.receipts.lines)}",
             latency_ms=received.latency_ms,
@@ -1197,7 +1180,7 @@ def _match_prep_step(
             by="rule",
             event_type=AuditEventType.TOOL_CALL,
             summary="matched" if result.matched else "exception",
-            output_ref=content_ref(result),
+            output_ref=trail.ref(result),
             result_summary=f"po_number={po_number}, lines={len(result.lines)}",
             basis=_match_prep_basis(order, received.receipts),
         )
@@ -1213,7 +1196,7 @@ def _match_prep_step(
         ),
         StepResult(
             event=(InvoiceEvent.MATCH if result.matched else InvoiceEvent.MATCH_EXCEPTION).value,
-            output_ref=content_ref(result),
+            output_ref=trail.ref(result),
             result_summary=f"po_number={po_number}",
             decision_basis=_match_basis(result, order, received.receipts),
         ),
@@ -1405,7 +1388,7 @@ def _classify_step(
         ),
         StepResult(
             event=InvoiceEvent.CLASSIFY.value,
-            output_ref=content_ref(out.classification) if out.classification else None,
+            output_ref=trail.ref(out.classification) if out.classification else None,
             result_summary=f"codes={len(result.reason_codes)}",
             decision_basis=_classify_basis(config.config_version, result, out.classification, why),
         ),

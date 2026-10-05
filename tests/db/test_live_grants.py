@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.pool import NullPool
 
 from ap_agent.config import Settings
 
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 def _engine() -> sa.Engine | None:
     """The application role's engine, or None if the database is not up."""
-    engine = sa.create_engine(Settings.model_fields["database_url"].default)
+    engine = sa.create_engine(Settings.model_fields["database_url"].default, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             # Not alembic_version: 0002 revokes it from this role, rightly.

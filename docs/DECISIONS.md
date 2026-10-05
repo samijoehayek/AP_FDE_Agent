@@ -226,6 +226,9 @@ whole document going through the loop could reveal.
 | **No DELETE for the application role, on any table** | Leaving `0002`'s DELETE grants in place | Rule 3 says no tool deletes anything; a grant is where that holds regardless of what code is written later. `tests/db/test_live_grants.py` tries it as the role |
 | **`invoices.record_ref` points at the latest full record, stored as a payload** | A column per record field | A resumed run needs everything the loop knew. The queried fields stay as columns; the rest is one content-addressed document |
 | **`alembic check` is part of `just test` and CI** | Trusting autogenerate at authoring time | `0001` shipped without five indexes its models declared, and nothing noticed for four weeks |
+| **Every `output_ref` is stored at the moment it is computed, through `StepTrail.ref`** (Piece 1) | Hashing as before and storing afterwards, or storing at the end of a step | The reference is made before the row that carries it is written, so storing at the same moment means a payload always exists before anything cites it. A crash in between leaves an unused payload, never a dangling reference. A test writer refuses any row whose reference is not already stored |
+| **The stored bytes are exactly the hashed bytes** - the same serialisation, latency and token counts excluded from both | Storing the full tool output | A payload that is not what was hashed cannot prove which answer was acted on. `just payload` prints it, and hashing it again gives the reference back |
+| **`RunContext` defaults to an in-memory store; `just run` passes Postgres** | Requiring a database for every loop test | Tests stay hermetic. The CLI is the production path, and it stores to Postgres as the application role. Nothing written before Piece 1 is backfilled: those references do not resolve, and `just payload` says so |
 
 ## 2026-10-05 — the second seat: explaining an exception
 

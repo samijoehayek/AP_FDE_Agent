@@ -8,20 +8,29 @@ a database or a key.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from tests.loop.conftest import fake_classify
 
 from ap_agent.audit.writer import JsonlAuditWriter
-from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
+from ap_agent.contracts.audit import (
+    AuditEvent,
+    HumanActor,
+    ModelActor,
+    RuleActor,
+    ToolActor,
+    utc_now,
+)
 from ap_agent.contracts.enums import ArithmeticFlag, AuditEventType, InputCheck, ReasonCode
+from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.purchase_order import (
     PurchaseOrder,
@@ -45,12 +54,12 @@ from ap_agent.loop.runner import (
     StepTrail,
     actor_for,
     apply_human_decision,
-    content_ref,
     decide,
     run,
     validate_extraction,
 )
 from ap_agent.loop.runner import apply as _apply_step
+from ap_agent.payloads import InMemoryPayloadStore, content_ref, parse_ref
 from ap_agent.pricing import cost_usd, pricing_version
 from ap_agent.states.machine import InvoiceEvent, InvoiceState
 from ap_agent.tools import TOOL_MODULE_NAMES
@@ -1889,3 +1898,91 @@ def test_the_loop_refuses_a_human_only_event_from_a_rule(
     refused = ctx.events[-1]
     assert refused.event_type is AuditEventType.ERROR
     assert refused.error_class == "HumanOnlyEvent"
+
+
+# --- payloads: every output_ref resolves -------------------------------------
+
+
+class _CheckingWriter:
+    """An audit writer that refuses a row whose output_ref is not already stored.
+
+    Stored-before-cited is the property: a crash between the two must leave an
+    unused payload, never a reference to nothing.
+    """
+
+    def __init__(self, inner: JsonlAuditWriter, store: InMemoryPayloadStore) -> None:
+        self.inner = inner
+        self.store = store
+
+    def append(self, event: AuditEvent) -> AuditEvent:
+        if event.output_ref is not None:
+            assert self.store.get(parse_ref(event.output_ref)) is not None, event.output_ref
+        return self.inner.append(event)
+
+
+def _resolving(ctx: RunContext) -> tuple[RunContext, InMemoryPayloadStore]:
+    store = InMemoryPayloadStore()
+    writer = _CheckingWriter(cast("JsonlAuditWriter", ctx.writer), store)
+    return replace(ctx, payloads=store, writer=cast("JsonlAuditWriter", writer)), store
+
+
+def _assert_every_ref_resolves(ctx: RunContext, store: InMemoryPayloadStore) -> int:
+    refs = [event.output_ref for event in ctx.events if event.output_ref is not None]
+    for ref in refs:
+        stored = store.get(parse_ref(ref))
+        assert stored is not None, ref
+        assert "sha256:" + hashlib.sha256(stored.content).hexdigest() == ref
+    return len(refs)
+
+
+def _po_missing(path: Path) -> RunContext:
+    return _context(path, po_found=False)
+
+
+def _new_vendor(path: Path) -> RunContext:
+    return _context(path, vendor_match=UNRESOLVED_VENDOR)
+
+
+def _output_flagged(path: Path) -> RunContext:
+    return _context(path, _extraction(suspicious_text=["x"]))
+
+
+def _input_flagged(path: Path) -> RunContext:
+    return replace(_context(path), ingest=_flagged_ingest)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_context, id="clean-to-closed"),
+        pytest.param(_held, id="held-to-pending-human"),
+        pytest.param(_po_missing, id="po-not-found"),
+        pytest.param(_new_vendor, id="new-vendor"),
+        pytest.param(_output_flagged, id="output-flagged"),
+        pytest.param(_input_flagged, id="input-flagged"),
+    ],
+)
+def test_every_output_ref_on_the_trail_resolves(
+    record: InvoiceRecord, tmp_path: Path, build: Callable[[Path], RunContext]
+) -> None:
+    ctx, store = _resolving(build(tmp_path))
+
+    run(record, ctx)
+
+    assert _assert_every_ref_resolves(ctx, store) > 0
+
+
+def test_the_classification_is_retrievable_by_its_ref(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """What the person reads can be fetched by the hash the trail carries."""
+    ctx, store = _resolving(_held(tmp_path))
+
+    final = run(record, ctx)
+
+    move = next(event for event in ctx.events if event.decision == "classify")
+    assert move.output_ref is not None
+    stored = store.get(parse_ref(move.output_ref))
+    assert stored is not None
+    assert final.classification is not None
+    assert ExceptionClassification.model_validate_json(stored.content) == final.classification

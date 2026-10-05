@@ -112,6 +112,10 @@ receipts PO:
 po PO:
     uv run ap-agent po {{PO}}
 
+# Print what an audit row's output_ref points at. Reads Postgres; no network.
+payload SHA:
+    uv run ap-agent payload {{SHA}}
+
 # Walk data/ and write data/index.csv.
 ingest *ARGS:
     uv run python scripts/index_invoices.py {{ARGS}}

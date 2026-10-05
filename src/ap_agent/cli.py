@@ -14,6 +14,7 @@ from typing import Annotated, cast
 
 import typer
 from pydantic import ValidationError
+from sqlalchemy.pool import NullPool
 from ulid import ULID
 
 from ap_agent import __version__
@@ -21,10 +22,12 @@ from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.config import REPO_ROOT
 from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.run import InvoiceRecord
+from ap_agent.db.base import create_db_engine, create_session_factory
 from ap_agent.errors import APAgentError
 from ap_agent.loop.dates import resolve_date_by_receipt_window
 from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext, invoice_max_age_days
 from ap_agent.loop.runner import run as loop_run
+from ap_agent.payloads import JSON, PayloadStore, PostgresPayloadStore, parse_ref
 from ap_agent.states.machine import (
     TERMINAL_STATES,
     TRANSITIONS,
@@ -453,6 +456,45 @@ def po(
     typer.echo(found.model_dump_json(indent=2))
 
 
+def payload_store() -> PayloadStore:
+    """The store ``run`` and ``payload`` use: Postgres, as the application role.
+
+    A function rather than a constant so a test can substitute an in-memory one
+    without a database. ``NullPool`` because a CLI command is one short process:
+    a pool would hold connections open past the command's own lifetime.
+    """
+    return PostgresPayloadStore(create_session_factory(create_db_engine(poolclass=NullPool)))
+
+
+@app.command()
+def payload(
+    ref: Annotated[str, typer.Argument(help="A sha256, bare or as sha256:<hex>.")],
+) -> None:
+    """Print one stored payload: whatever an audit row's output_ref points at.
+
+    Reads Postgres as the application role. JSON is pretty-printed; anything
+    else is printed as stored. Exits 1 if the reference is malformed or nothing
+    is stored under it - a reference written before payloads were stored, for
+    instance, which is honest about not resolving.
+    """
+    try:
+        digest = parse_ref(ref)
+    except ValueError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    stored = payload_store().get(digest)
+    if stored is None:
+        typer.secho(f"no payload stored under sha256:{digest}", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
+
+    typer.secho(f"# sha256:{stored.sha256}  {stored.media_type}", fg=typer.colors.BLUE, err=True)
+    text = stored.content.decode("utf-8", errors="replace")
+    if stored.media_type == JSON:
+        text = json.dumps(json.loads(text), indent=2)
+    typer.echo(text)
+
+
 @app.command(name="run")
 def run_invoice(
     path: Annotated[Path, typer.Argument(help="Invoice document to process.")],
@@ -487,7 +529,7 @@ def run_invoice(
         received_at=received_at.replace(tzinfo=UTC) if received_at else None,
     )
     writer = JsonlAuditWriter(audit_dir)
-    ctx = RunContext(run_id=str(ULID()), writer=writer)
+    ctx = RunContext(run_id=str(ULID()), writer=writer, payloads=payload_store())
 
     final = loop_run(record, ctx, max_steps=max_steps)
 

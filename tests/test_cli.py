@@ -18,12 +18,19 @@ from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.loop import runner as runner_module
+from ap_agent.payloads import InMemoryPayloadStore
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.compute_extraction_confidence import ComputeExtractionConfidenceInput
 from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
 from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def in_memory_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`run` stores payloads in Postgres; these tests must not need a database."""
+    monkeypatch.setattr(cli_module, "payload_store", InMemoryPayloadStore)
 
 
 def test_version() -> None:
