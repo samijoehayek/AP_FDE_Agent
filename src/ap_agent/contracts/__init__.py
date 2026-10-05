@@ -87,7 +87,7 @@ from ap_agent.contracts.purchase_order import (
     ReceiptLine,
     ReceiptSet,
 )
-from ap_agent.contracts.screening import InputFlag
+from ap_agent.contracts.screening import InputFlag, OutputFlag
 from ap_agent.contracts.vendor import (
     MAX_VENDOR_CANDIDATES,
     VendorCandidate,
@@ -139,6 +139,7 @@ __all__ = [
     "Money",
     "OutputFilter",
     "OutputFilterPattern",
+    "OutputFlag",
     "Percentage",
     "PurchaseOrder",
     "PurchaseOrderLine",

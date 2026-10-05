@@ -217,6 +217,11 @@ class OutputFilterPattern(StrictModel):
         description="Why this pattern is here. A filter nobody can explain is a filter "
         "somebody eventually deletes.",
     )
+    skip_fields: list[str] = Field(
+        max_length=20,
+        description="Field paths where this pattern is expected on honest documents - an "
+        "8-digit invoice number is not an account number. Empty for most patterns.",
+    )
 
 
 class OutputFilter(StrictModel):
@@ -226,6 +231,11 @@ class OutputFilter(StrictModel):
     never_auto_fix: bool = Field(
         description="Always true, and stated rather than assumed. Silently stripping an IBAN "
         "out of a field would destroy the evidence that somebody tried to put one there."
+    )
+    unscreened_fields: list[str] = Field(
+        max_length=10,
+        description="Fields no pattern is run over. The remit-to block prints payment details "
+        "by design; it is compared to the vendor master server-side instead.",
     )
     patterns: list[OutputFilterPattern] = Field(min_length=1, max_length=50)
 

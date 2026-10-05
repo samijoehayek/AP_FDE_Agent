@@ -52,6 +52,7 @@ from ap_agent.contracts.run import (
 )
 from ap_agent.errors import APAgentError, IllegalTransition
 from ap_agent.guardrails.config import load_guardrails
+from ap_agent.guardrails.output_filter import screen_extraction
 from ap_agent.logging import get_logger
 from ap_agent.loop.dates import resolve_date_by_locale, resolve_date_by_receipt_window
 from ap_agent.pricing import UNKNOWN_PRICING_VERSION, cost_usd, pricing_version
@@ -108,6 +109,7 @@ if TYPE_CHECKING:
 
     from ap_agent.audit.writer import AuditWriter
     from ap_agent.contracts.audit import Actor
+    from ap_agent.contracts.invoice import InvoiceExtraction
     from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
     from ap_agent.contracts.vendor import VendorMatch
 
@@ -118,6 +120,7 @@ RULE_CONFIG_VERSION = "v1"
 
 VALIDATE_RULE_ID = "VALIDATE@v1"
 INPUT_VALIDATE_RULE_ID = "INPUT-VALIDATE@v1"
+OUTPUT_FILTER_RULE_ID = "OUTPUT-FILTER@v1"
 EXTRACT_CONF_RULE_ID = "EXTRACT-CONF@v1"
 DATE_RESOLVE_RULE_ID = "DATE-RESOLVE@v1"
 RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
@@ -618,6 +621,12 @@ def _read_and_score(
     Each call writes its own row as it returns. A reading that raises writes a
     row naming *itself*, and the rows for the readings that already succeeded
     stay on the trail - because they happened, and because they were paid for.
+
+    Each reading is put through the output filter the moment it returns, before
+    anything else reads it. A flag on either sends the document to a person and
+    the readings go no further: not onto the record, not into the confidence
+    check. Both readings still run, because they are independent evidence and
+    the second one's flags are worth having on the trail too.
     """
     vision = _call(trail, ActionKind.EXTRACT_INVOICE_VISION, "model", ctx.extract)(
         ExtractInvoiceVisionInput(path=record.source_path)
@@ -633,6 +642,7 @@ def _read_and_score(
         latency_ms=vision.latency_ms,
         retry_count=vision.retry_count,
     )
+    flagged = _screen_reading(trail, ActionKind.EXTRACT_INVOICE_VISION, vision.extraction)
 
     text = _call(trail, ActionKind.EXTRACT_INVOICE_TEXT, "model", ctx.extract_text)(
         ExtractInvoiceTextInput(path=record.source_path)
@@ -648,6 +658,20 @@ def _read_and_score(
         latency_ms=text.latency_ms,
         retry_count=text.retry_count,
     )
+    if text.second_read is not None:
+        flagged += _screen_reading(trail, ActionKind.EXTRACT_INVOICE_TEXT, text.second_read)
+
+    if flagged:
+        # The readings stay off the record. Nothing downstream may read a
+        # flagged transcription; the person this goes to supplies their own.
+        return record, StepResult(
+            event=InvoiceEvent.OUTPUT_FLAGGED.value,
+            output_ref=content_ref("|".join(flagged)),
+            result_summary=f"flags={len(flagged)}",
+            decision_basis=(f"config_version={guardrails_version()}, flags={'|'.join(flagged)}")[
+                :MAX_BASIS_CHARS
+            ],
+        )
 
     scored = _call(trail, ActionKind.COMPUTE_EXTRACTION_CONFIDENCE, "rule", ctx.confidence)(
         ComputeExtractionConfidenceInput(
@@ -690,6 +714,37 @@ def _read_and_score(
             decision_basis=confidence_basis(verdict),
         ),
     )
+
+
+def _screen_reading(trail: StepTrail, kind: ActionKind, extraction: InvoiceExtraction) -> list[str]:
+    """Run ``OUTPUT-FILTER@v1`` over one reading and write its row. Returns the hits.
+
+    One row per reading, clean ones included: ``hits=none`` says the filter ran
+    and found nothing, which is a different fact from a filter that never ran.
+    The row is a rule evaluation filed under the reading's own kind, so the
+    trail shows which seat's output was screened. Hits name the pattern and the
+    field - ``iban(payment_terms)`` - and never the text that matched.
+    """
+    config = load_guardrails()
+    flags = screen_extraction(extraction, config.output_filter)
+    seat = "vision" if kind is ActionKind.EXTRACT_INVOICE_VISION else "text"
+    hits = [f"{seat}:{flag.check}({flag.field})" for flag in flags]
+    basis = (
+        f"config_version={config.config_version}, reading={seat}, hits={'|'.join(hits) or 'none'}"
+    )
+    trail.call(
+        ToolCallRecord(
+            kind=kind,
+            by="rule",
+            rule_id=OUTPUT_FILTER_RULE_ID,
+            event_type=AuditEventType.RULE_EVALUATION,
+            summary="flagged" if flags else "clean",
+            output_ref=content_ref(basis),
+            result_summary=f"hits={len(flags)}",
+            basis=basis[:MAX_BASIS_CHARS],
+        )
+    )
+    return hits
 
 
 def _call(

@@ -126,6 +126,7 @@ stateDiagram-v2
     INGESTED --> CANCELLED: cancel
     INGESTED --> EXTRACTED: extract
     INGESTED --> NEEDS_HUMAN_EXTRACTION: extraction_failed
+    INGESTED --> NEEDS_HUMAN_EXTRACTION: output_flagged
     MATCHED --> CANCELLED: cancel
     MATCHED --> CODED: code
     MATCHED --> CODED: stub_ok

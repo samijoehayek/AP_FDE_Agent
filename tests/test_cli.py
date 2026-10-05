@@ -156,10 +156,11 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     )
     assert result.exit_code == 0, result.output
     assert "final state : CLOSED" in result.output
-    # Fourteen moves. Nineteen rows: intake is one move and two rows, the
-    # extraction step one move and four, and resolving the vendor one and two.
+    # Fourteen moves. Twenty-one rows: intake is one move and two rows, the
+    # extraction step one move and six (two readings, the output filter's
+    # verdict on each, the score, the decision), resolving the vendor one and two.
     assert "steps       : 14" in result.output
-    assert "audit rows  : 19" in result.output
+    assert "audit rows  : 21" in result.output
     assert "chain intact: True" in result.output
 
 

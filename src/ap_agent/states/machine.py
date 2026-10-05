@@ -62,6 +62,7 @@ class InvoiceEvent(StrEnum):
     INPUT_FLAGGED = "input_flagged"
     EXTRACT = "extract"
     EXTRACTION_FAILED = "extraction_failed"
+    OUTPUT_FLAGGED = "output_flagged"
     HUMAN_EXTRACTION_PROVIDED = "human_extraction_provided"
     VALIDATE = "validate"
     VALIDATION_FAILED = "validation_failed"
@@ -115,6 +116,9 @@ TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     # --- extraction -------------------------------------------------------
     (_S.INGESTED, _E.EXTRACT): _S.EXTRACTED,
     (_S.INGESTED, _E.EXTRACTION_FAILED): _S.NEEDS_HUMAN_EXTRACTION,
+    # A reading the output filter flagged: a person transcribes the document
+    # instead, and the flagged reading is never put on the record.
+    (_S.INGESTED, _E.OUTPUT_FLAGGED): _S.NEEDS_HUMAN_EXTRACTION,
     (_S.NEEDS_HUMAN_EXTRACTION, _E.HUMAN_EXTRACTION_PROVIDED): _S.EXTRACTED,
     # --- validation -------------------------------------------------------
     (_S.EXTRACTED, _E.VALIDATE): _S.VALIDATED,
