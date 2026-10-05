@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1692 tests**. If it is not, that is the first thing to fix and nothing below is
+**1694 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -271,6 +271,16 @@ Both were found by reading the files rather than by a test failing later.
   | `AP-SEED-001/instruction_text` | `NEEDS_HUMAN_EXTRACTION` | 2 | $0.031070 | `OUTPUT-FILTER@v1`: `suspicious_text`, on **both** readings |
 
   Both seats - Sonnet on the image (7,323 in / 900 out, $0.0236) and Haiku on the text (4,434 in / 598 out, $0.0074) - independently copied the planted instruction into `suspicious_text` as their prompts tell them to. Neither the instruction nor the IBAN appears anywhere on either trail. Both chains verify.
+- **2026-10-05, the explanation seat live.** One schema probe for `ExceptionClassification` (accepted, 4.1 s, fractions of a cent), then two full runs, three model calls each, `--received-at 2026-09-01`. Trails in `data/retest/2026-10-05/`.
+
+  | run | final state | vision | text | classify | total | lead / resolver / action |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | `AP-SEED-001/price_plus_3pct` | `PENDING_HUMAN` | $0.022564 | $0.007207 | $0.008974 (3,787 in / 140 out, 2.7 s) | **$0.038745** | `price_over_tolerance` / `buyer` / `request_po_amendment` |
+  | `AP-SEED-010/qty_over_received` | `PENDING_HUMAN` | $0.023536 | $0.007168 | $0.010166 (4,003 in / 216 out, 3.8 s) | **$0.040870** | `receipt_missing` / `receiving` / `request_goods_receipt` |
+
+  Both classifications were **accepted** by the checks in code; both leads were among the codes the match reported, and both picked the resolver the prompt's table names. 7 steps, 19 rows, chains verify. **The explanation adds about $0.01 per held invoice**, so a held invoice now costs ~$0.04 against ~$0.03 for a clean one. **The two `human_summary` texts were not captured**: the trail keeps the classification's hash by design and `just run` did not print the record. `just run` now prints the explanation for any invoice that stops at `PENDING_HUMAN`, labelled `[AI-generated]`; the next live run will show it.
+
+  **Spend on 2026-10-05: ~$0.204** - matcher runs $0.093, guardrail runs $0.031, explanation runs $0.080, schema probe under a cent.
 
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
 
@@ -290,7 +300,7 @@ Both were found by reading the files rather than by a test failing later.
 6. End-of-day target: a generated PO-matched invoice and a Kaggle invoice both run through the loop with confidence in the audit trail; the PO-matched one reaches the match step with real PO + receipt data in context.
 7. Off-keyboard: book the customer interview.
 
-## Day 3 — done. Phase 1 closed
+## Day 3 — closed. Phase 1 closed
 
 1. **DONE.** Guardrails as versioned YAML with a typed loader.
    - `config/guardrails.v1.yaml`, `config_version: guardrails_v1`. Five sections: `tolerances`, `approval_matrix`, `input_validation`, `output_filter`, `hard_prohibitions`. The price band and the unmatched-charge rule are each a **pair that must both hold** - an absolute cap alone is a licence on a small order, a percentage alone is one on a large order.
@@ -358,8 +368,10 @@ Worth being explicit, because a config file reads like a working control:
 
 ## Where we are in the plan
 
-**Day 3 of 7 is done, and with it Phase 1.** The guardrails file is now enforced
-everywhere except the approval matrix, which waits on `request_approval`.
+**Day 3 of 7 is closed, and with it Phase 1.** The guardrails file is enforced
+everywhere except the approval matrix, which waits on `request_approval`. Both
+LLM seats are real and have run live. 9 of 16 tools are real; 10 stub edges
+remain, all after `MATCHED`.
 
 The honest summary of the build: an invoice can walk the first six of nine doors
 on its own merits, and the rest are still propped open with scaffolding.
