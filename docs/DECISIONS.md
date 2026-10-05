@@ -215,6 +215,13 @@ whole document going through the loop could reveal.
 | **Staleness is measured against `received_at`, not the clock** | Against `now`; not checking at all | An invoice being processed late is a different fact from one that was already ancient when it arrived, and only the second is a reason to stop. Skipped entirely when no arrival date was supplied, because inventing one is the loop reading its own clock and calling it evidence. While the date is open every candidate must fail, since nobody has chosen between the readings yet |
 | **A `# TEMP STUB` edge `NON_PO → CODED`** | Leaving non-PO invoices stopped dead | Every Kaggle invoice cites no purchase order, so without it the entire real corpus stops at `NON_PO` and nothing downstream is exercisable. Listed in the stub test like every other piece of scaffolding, so removing it when GL coding lands is deliberate |
 
+## 2026-10-05 — two limits of the match, accepted for now
+
+| Decision | Rejected | Because |
+| --- | --- | --- |
+| **The invoice is compared to the *total* received, not to what is still open to bill** | Subtracting what earlier invoices already billed against the same order line | The open quantity needs the order's billing history, and nothing here holds it: QuickBooks links a bill to a purchase order through `LinkedTxn`, and `get_purchase_order` does not read it yet. So cumulative billing is **not tracked**. A second invoice, under a new number, for goods a first invoice already billed is judged against the same receipt and passes. `find_duplicates` catches the same invoice twice, not a different invoice for the same goods. Closing it means reading the bills linked to the PO from QuickBooks and comparing `billed_so_far + this_invoice` to received |
+| **Description pairing is exact after normalisation; no fuzzy matching** | Token overlap, edit distance or embeddings to pair a reworded line | A fuzzy pairer needs a threshold, and a threshold chosen without real wording to measure against is a guess about money. The generated fixture prints the ERP's own descriptions, so it cannot show what vendors actually do. **Deferred until the real invoice stream shows real rewording.** The cost, accepted knowingly: a reworded line is unmatched, so it gets **no price or quantity check**. It passes as an unmatched charge if it and every other unmatched charge together stay within $50 and 2% of the order; its ordered line shows as unbilled, which raises nothing |
+
 ## 2026-09-16 — the three-way match
 
 | Decision | Rejected | Because |

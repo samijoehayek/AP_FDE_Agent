@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-10-05. Last code change 2026-09-16 (Day 3, step 2), verified live 2026-10-05. Update this file at the end of every working day._
+_Last updated: 2026-10-05. Last code change 2026-10-05 (matcher hardening, Day 3 step 2 follow-up); the match itself verified live 2026-10-05. Update this file at the end of every working day._
 
 ## Start here — catching up a new session
 
@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1385 tests**. If it is not, that is the first thing to fix and nothing below is
+**1396 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -254,6 +254,13 @@ Both were found by reading the files rather than by a test failing later.
 - **Behaviour change since those runs:** an ambiguous date is no longer a failure. Both readings stay on the record and are settled by the receipt window at VALIDATED, then the vendor's country at VENDOR_RESOLVED. Runs 2 and 3 in the log predate this and would now be `auto_ok=True` with `date_verdict=ambiguous`. Reasoning in DECISIONS.md, 2026-09-10.
 
 - **2026-10-05, three live runs with the matcher in the loop (EXTRACTION_LOG.md).** The first live runs since `compute_match` existed. `AP-SEED-001/clean` reached `MATCHED`; `price_plus_3pct` and `AP-SEED-010/qty_over_received` reached `EXCEPTION` with the codes their truth files declared. **Cost is now a real number: ~$0.03 per invoice**, two model calls, stable across all three. QuickBooks still authenticates after three weeks idle (token rotated on the first call).
+
+  | run | final state | cost |
+  | --- | --- | --- |
+  | `AP-SEED-001/clean` | `MATCHED` | $0.029818 |
+  | `AP-SEED-001/price_plus_3pct` | `EXCEPTION` | $0.030426 |
+  | `AP-SEED-010/qty_over_received` | `EXCEPTION` | $0.032784 |
+  | **total** | | **$0.093028** |
 - The AP-SEED-010 run is the one to cite. It bills 2 of a line that ordered 11 and received 0 - inside the authorisation, outside the delivery - and a two-way match would have paid it.
 
 ## Day 2 plan (from the architecture report's 7-day mapping) — in progress
@@ -372,6 +379,23 @@ with a failing test to confirm it.
    exactly two chairs - reading documents, and explaining exceptions in prose.
    Only the first is occupied; `classify_exception` is a stub. As of 2026-09-16
    there are finally real `MatchResult`s for it to explain, so its input exists.
+
+### Known limitations of the match
+
+Accepted on purpose, recorded in DECISIONS.md (2026-10-05). Neither is a bug to
+fix in passing.
+
+1. **Cumulative billing is not tracked.** The invoice is compared to the *total*
+   received, not to what is still open to bill. A second invoice, under a new
+   number, for goods a first invoice already billed passes against the same
+   receipt, and `find_duplicates` will not catch it because the invoices differ.
+   Closing it needs the bills linked to the PO (`LinkedTxn`) from QuickBooks,
+   which `get_purchase_order` does not read yet.
+2. **Description pairing is exact after normalisation.** A reworded line is
+   unmatched, so it gets no price or quantity check. It passes as an unmatched
+   charge if all unmatched charges together stay within $50 and 2% of the order,
+   and its ordered line shows as unbilled, which raises nothing. Fuzzy pairing
+   is deferred until the real stream shows real wording.
 
 ### Recommended order from here
 
