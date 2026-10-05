@@ -57,6 +57,7 @@ def _write(tmp_path: Path, document: dict[str, Any], name: str = "guardrails.v1.
 def test_the_shipped_file_loads(config: GuardrailConfig) -> None:
     assert config.config_version == "guardrails_v1"
     assert config.base_currency == "USD"
+    assert config.approval_matrix.base_currency == "USD"
 
 
 def test_the_settings_point_at_it() -> None:
@@ -245,6 +246,14 @@ def test_an_unknown_key_is_refused(tmp_path: Path) -> None:
     document = _document()
     document["tolerances"]["price_variance_pcnt"] = "5.0"
     with pytest.raises(GuardrailsError, match="not a valid guardrails config"):
+        load_guardrails(_write(tmp_path, document))
+
+
+def test_ceilings_in_another_currency_are_refused(tmp_path: Path) -> None:
+    """Dollar price bands and euro approval ceilings would need an exchange rate."""
+    document = _document()
+    document["approval_matrix"]["base_currency"] = "EUR"
+    with pytest.raises(GuardrailsError, match="no exchange rate to bridge them"):
         load_guardrails(_write(tmp_path, document))
 
 

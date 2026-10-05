@@ -23,7 +23,6 @@ def _require(  # noqa: PLR0913 - one keyword per fact the matrix keys on
     config = load_guardrails()
     return approval_requirement(
         config.approval_matrix,
-        base_currency=config.base_currency,
         config_version=config.config_version,
         amount=Decimal(amount),
         currency=currency,

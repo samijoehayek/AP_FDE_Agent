@@ -35,7 +35,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ap_agent.contracts.common import CurrencyCode, Money, StrictModel
 
@@ -152,6 +152,10 @@ class ApprovalRule(StrictModel):
 class ApprovalMatrix(StrictModel):
     """Who signs off, at what amount, and what overrides the amount."""
 
+    base_currency: CurrencyCode = Field(
+        description="The currency the tier ceilings are written in. Any other currency gets "
+        "the top tier: without an exchange rate its amount cannot be compared to a ceiling."
+    )
     auto_approve_max_amount: Money = Field(
         ge=0,
         description="Below this a clean invoice needs no human. Zero disables "
@@ -306,6 +310,17 @@ class GuardrailConfig(StrictModel):
     loop_limits: LoopLimits
     duplicate_detection: DuplicateDetection
     hard_prohibitions: HardProhibitions
+
+    @model_validator(mode="after")
+    def _one_currency(self) -> GuardrailConfig:
+        """Ceilings in one currency and price bands in another would need an FX rate."""
+        if self.approval_matrix.base_currency != self.base_currency:
+            msg = (
+                f"approval_matrix.base_currency {self.approval_matrix.base_currency} != "
+                f"base_currency {self.base_currency}; there is no exchange rate to bridge them"
+            )
+            raise ValueError(msg)
+        return self
 
 
 __all__ = [

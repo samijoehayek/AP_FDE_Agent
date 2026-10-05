@@ -6,7 +6,7 @@ behind it, as a basis an auditor can re-check against ``guardrails.v1.yaml``.
 How it decides:
 
 * **The tier** is chosen by amount, smallest ceiling first. An invoice in a
-  currency other than ``base_currency`` gets the **top tier**: there is no
+  currency other than ``matrix.base_currency`` gets the **top tier**: there is no
   exchange rate in this system, and comparing 272,100 INR to a dollar ceiling
   would be a number that looks like an answer. The conservative tier is the
   honest one until an FX source exists.
@@ -42,7 +42,6 @@ RULE_ID = "APPROVAL-MATRIX@v1"
 def approval_requirement(  # noqa: PLR0913 - one keyword per fact the matrix keys on
     matrix: ApprovalMatrix,
     *,
-    base_currency: str,
     config_version: str,
     amount: Decimal,
     currency: str,
@@ -52,6 +51,7 @@ def approval_requirement(  # noqa: PLR0913 - one keyword per fact the matrix key
     match_exception: bool,
 ) -> ApprovalRequirement:
     """Apply the matrix to one invoice's facts. See the module docstring."""
+    base_currency = matrix.base_currency
     foreign = currency != base_currency
     tiers = matrix.tiers
     tier = (

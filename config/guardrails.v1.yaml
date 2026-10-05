@@ -78,6 +78,13 @@ tolerances:
 # --- Approval matrix -------------------------------------------------------
 
 approval_matrix:
+  # Added 2026-10-06, in place. The currency every ceiling below is written in.
+  # An invoice in any other currency gets the top tier: there is no exchange
+  # rate in this system, so 900 INR is not "under 1,000", it is unknown. Must
+  # equal the file's base_currency - the loader refuses a matrix in one currency
+  # and a price band in another.
+  base_currency: "USD"
+
   # Straight-through processing is OFF. The report suggests $1,000 as an
   # auto-approve floor; this is 0 until the golden set says what the exception
   # rate actually is. Turning it on is a reviewed change with a number attached,

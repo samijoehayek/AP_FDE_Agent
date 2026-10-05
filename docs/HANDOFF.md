@@ -504,6 +504,13 @@ explanation seat has had one live schema probe and no live classification yet.
   handling grows its own steps.
 - **No `ReasonCode` means "remit-to changed".** The event, halt state and truth
   file's `expected_flag` carry it.
+- **There is no exchange rate.** The approval ceilings are in
+  `approval_matrix.base_currency` (USD), and an invoice in any other currency
+  gets the **top tier** - owner, two approvers - whatever its amount: 900 INR
+  needs the same sign-off as $272,100. Safe, and noisy for a vendor that bills
+  in rupees. The loader refuses a matrix whose currency differs from the
+  file's `base_currency`. The fix is an FX source with a dated rate on the
+  trail (`test_another_currency_gets_the_top_tier`).
 - **The decision row for an output-filter halt is attributed to `EXTRACT-CONF@v1`**,
   the step's rule; the `OUTPUT-FILTER@v1` rows just above it are the evidence.
 

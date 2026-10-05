@@ -1271,7 +1271,6 @@ def _request_approval_step(
     )
     requirement = approval_requirement(
         config.approval_matrix,
-        base_currency=config.base_currency,
         config_version=config.config_version,
         amount=extraction.total,
         currency=extraction.currency,

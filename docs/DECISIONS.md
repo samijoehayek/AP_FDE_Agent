@@ -336,6 +336,7 @@ whole document going through the loop could reveal.
 | `invoice_max_age_days` | 180 | **365** | The failure modes are not symmetric: too wide and the date rule declines and something later settles it, too narrow and it silently eliminates a candidate that was correct. Six months resolved a real `09/03/2024` to the wrong month. Recorded 2026-09-10 |
 | unmatched charge | `$50` **or** `2%` | **`$50` and `2%`** | An OR lets the percentage arm pass $13,000 of freight on a large order. As an AND it only ever tightens. Today the absolute half is what catches the fixture's $120 line on every seeded order, and a test says so |
 | `rounding_tolerance_abs` | $10 total variance from PO | **$1.00** | The report's figure covers total variance after line checks; this one is only rounding, and is deliberately tight because anything larger should already have been caught on a line |
+| loop budget (`DEFAULT_MAX_STEPS`) | max 15 iterations per run | **9** | Since 2026-10-05 a run stops at every human door, so a budget is spent per *run*, not per invoice. The longest stretch the loop walks alone is RECEIVED → PENDING_APPROVAL, eight steps; nine is that plus one, so a step added to the pipeline is a deliberate change to this number rather than something the slack absorbs. A run resumed after a human decision starts a fresh budget. Tests: `test_the_default_budget_fits_the_happy_path_with_no_room_to_spare` and `test_max_steps_stops_the_run_and_logs_an_escalation` |
 
 ### Things that bit during the scaffold
 
