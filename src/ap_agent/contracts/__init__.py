@@ -39,6 +39,7 @@ from ap_agent.contracts.common import (
     is_allowed_currency,
     normalise_decimal_text,
 )
+from ap_agent.contracts.dedup import DedupEntry, DuplicateRule
 from ap_agent.contracts.enums import (
     ActorKind,
     ArithmeticFlag,
@@ -69,6 +70,7 @@ from ap_agent.contracts.guardrails import (
     ApprovalMatrix,
     ApprovalRule,
     ApprovalTier,
+    DuplicateDetection,
     FilterAction,
     GuardrailConfig,
     HardProhibitions,
@@ -123,6 +125,9 @@ __all__ = [
     "Confidence",
     "CostUsd",
     "CurrencyCode",
+    "DedupEntry",
+    "DuplicateDetection",
+    "DuplicateRule",
     "EvidenceEntry",
     "EvidenceField",
     "ExceptionClassification",

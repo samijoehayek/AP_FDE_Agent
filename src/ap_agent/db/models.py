@@ -56,24 +56,30 @@ _ID_LEN = 64
 
 
 class Document(Base):
-    """A file that arrived, identified by the hash of its bytes."""
+    """A file that arrived, identified by the hash of its bytes.
+
+    The row is written when the file arrives - that is what lets a second run of
+    the same file find its invoice - so what only parsing can tell (type, pages,
+    text layer) is null until intake fills it in. Zero pages means intake
+    refused the file before opening it.
+    """
 
     __tablename__ = "documents"
 
     sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
     storage_uri: Mapped[str] = mapped_column(Text, nullable=False)
-    media_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    media_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    has_text_layer: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    pages_with_text: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    has_text_layer: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    pages_with_text: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_sharpness: Mapped[float | None] = mapped_column(nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
-        CheckConstraint("page_count >= 1", name="page_count_positive"),
+        CheckConstraint("page_count IS NULL OR page_count >= 0", name="page_count_known"),
         CheckConstraint("byte_size > 0", name="byte_size_positive"),
     )
 

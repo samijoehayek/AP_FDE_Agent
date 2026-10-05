@@ -49,7 +49,6 @@ from ap_agent.tools.extract_invoice_vision import (
     extract_invoice_vision,
 )
 from ap_agent.tools.find_duplicates import (
-    DuplicateCandidate,
     FindDuplicatesInput,
     FindDuplicatesOutput,
     find_duplicates,
@@ -128,7 +127,6 @@ __all__ = [
     "ComputeMatchOutput",
     "CreateBillInput",
     "CreateBillOutput",
-    "DuplicateCandidate",
     "ExtractInvoiceTextInput",
     "ExtractInvoiceTextOutput",
     "ExtractInvoiceVisionInput",

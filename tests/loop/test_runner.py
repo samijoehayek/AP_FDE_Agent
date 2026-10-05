@@ -60,6 +60,7 @@ from ap_agent.loop.runner import (
 )
 from ap_agent.loop.runner import apply as _apply_step
 from ap_agent.payloads import InMemoryPayloadStore, content_ref, parse_ref
+from ap_agent.persistence import InMemoryDedupIndex, InMemoryInvoiceStore
 from ap_agent.pricing import cost_usd, pricing_version
 from ap_agent.states.machine import InvoiceEvent, InvoiceState
 from ap_agent.tools import TOOL_MODULE_NAMES
@@ -100,8 +101,9 @@ HAPPY_PATH_EVENTS = [
     # Resolving the vendor: the lookup, then what the rule decided about it.
     "tax_id_exact",
     "resolve_vendor",
-    # find_duplicates is still a stub.
-    "stub_ok",
+    # The duplicate check: the rule's verdict, then the decision.
+    "clear",
+    "check_duplicates",
     # The match: the order, what arrived, the matcher itself, then the decision.
     # Four rows for one step, and the last is the only one that moves the
     # invoice - on `match`, a real event, not a stub.
@@ -508,8 +510,7 @@ def test_only_the_last_row_of_a_step_moves_the_invoice(
         "extract",
         "validate",
         "resolve_vendor",
-        # find_duplicates is still a stub; the match that follows it is not.
-        "stub_ok",
+        "check_duplicates",
         "match",
         *["stub_ok"] * 8,
     ]
@@ -1986,3 +1987,187 @@ def test_the_classification_is_retrievable_by_its_ref(
     assert stored is not None
     assert final.classification is not None
     assert ExceptionClassification.model_validate_json(stored.content) == final.classification
+
+
+# --- state in a store: resume, restart, duplicates ---------------------------
+
+
+def _stored(tmp_path: Path, name: str, store: InMemoryInvoiceStore) -> InvoiceRecord:
+    """A new invoice for a new document, created in ``store`` as `just run` would."""
+    record = InvoiceRecord(source_path=tmp_path / f"{name}.pdf", created_at=utc_now())
+    store.create(
+        record,
+        document_sha256=hashlib.sha256(name.encode()).hexdigest(),
+        byte_size=1,
+        storage_uri=f"file:///{name}.pdf",
+    )
+    return record
+
+
+def _persistent(
+    ctx: RunContext, store: InMemoryInvoiceStore, dedup: InMemoryDedupIndex, run_id: str
+) -> RunContext:
+    return replace(ctx, store=store, dedup=dedup, run_id=run_id)
+
+
+def test_the_store_is_the_truth_and_every_transition_is_saved(tmp_path: Path) -> None:
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "a", store)
+    ctx = _persistent(_context(tmp_path), store, dedup, "run-a")
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.CLOSED
+    assert store.load(str(record.invoice_id)).state is InvoiceState.CLOSED
+    assert store.runs["run-a"] == {
+        "invoice_id": str(record.invoice_id),
+        "ended": True,
+        "step_count": HAPPY_PATH_STEPS,
+        "last_step": "stub_ok",
+        "last_state": InvoiceState.CLOSED,
+    }
+
+
+def test_a_halted_invoice_resumes_where_it_stopped_without_reading_again(tmp_path: Path) -> None:
+    """PENDING_HUMAN, run again: nothing re-read, nothing re-matched, halts again."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "held", store)
+    run(record, _persistent(_held(tmp_path), store, dedup, "run-1"))
+    assert store.load(str(record.invoice_id)).state is InvoiceState.PENDING_HUMAN
+
+    reads: list[str] = []
+
+    def _counting(payload: ExtractInvoiceVisionInput) -> ExtractInvoiceVisionOutput:
+        reads.append("vision")
+        return _fake_extract_factory()(payload)
+
+    second = replace(_persistent(_held(tmp_path), store, dedup, "run-2"), extract=_counting)
+    final = run(store.load(str(record.invoice_id)), second)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    assert reads == []
+    assert [event.decision for event in second.events] == [HALT_NO_TOOL]
+    assert final.classification is not None, "the stored explanation survives the restart"
+
+
+def test_a_crash_mid_step_restarts_that_step_and_nothing_before_it(tmp_path: Path) -> None:
+    """The vendor lookup dies once. The re-run starts at VALIDATED, not at RECEIVED."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "crash", store)
+    calls: list[str] = []
+    resolved = _fake_lookup_factory(RESOLVED_VENDOR)
+
+    def _flaky(payload: LookupVendorInput) -> LookupVendorOutput:
+        calls.append("lookup")
+        if calls.count("lookup") == 1:
+            msg = "connection reset"
+            raise OSError(msg)
+        return resolved(payload)
+
+    def _counting_ingest(payload: IngestDocumentInput) -> IngestDocumentOutput:
+        calls.append("ingest")
+        return _fake_ingest(payload)
+
+    base = replace(_context(tmp_path), lookup_vendor=_flaky, ingest=_counting_ingest)
+    first = run(record, _persistent(base, store, dedup, "run-1"))
+    assert first.state is InvoiceState.VALIDATED, "the failed step did not advance the state"
+
+    final = run(store.load(str(record.invoice_id)), _persistent(base, store, dedup, "run-2"))
+
+    assert final.state is InvoiceState.CLOSED
+    assert calls == ["ingest", "lookup", "lookup"], "ingest ran once; the lookup step ran twice"
+
+
+def test_a_second_copy_of_the_same_invoice_is_held_for_a_person(tmp_path: Path) -> None:
+    """Same vendor, number and amount, a different document: ON_HOLD_DUPLICATE."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    first = _stored(tmp_path, "first", store)
+    run(first, _persistent(_context(tmp_path), store, dedup, "run-1"))
+
+    second = _stored(tmp_path, "second", store)
+    ctx = _persistent(_context(tmp_path), store, dedup, "run-2")
+    final = run(second, ctx)
+
+    assert final.state is InvoiceState.ON_HOLD_DUPLICATE
+    held = next(event for event in ctx.events if event.decision == "duplicate_suspected")
+    assert isinstance(held.actor, RuleActor)
+    assert held.actor.rule_id == "DEDUP@v1"
+    assert (held.decision_basis or "").startswith(
+        f"rule=exact_number, candidate={first.invoice_id}, similarity=1.0"
+    )
+    assert ctx.events[-1].decision == HALT_NO_TOOL, "a person decides"
+
+
+def test_resent_with_a_suffix_three_days_later_is_caught(tmp_path: Path) -> None:
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    first = _stored(tmp_path, "first", store)
+    run(
+        first,
+        _persistent(
+            _context(tmp_path, _extraction(invoice_number="INV-001")), store, dedup, "run-1"
+        ),
+    )
+
+    resent = _extraction(invoice_number="INV-001A", invoice_date=date(2026, 1, 4))
+    ctx = _persistent(_context(tmp_path, resent), store, dedup, "run-2")
+    final = run(_stored(tmp_path, "second", store), ctx)
+
+    assert final.state is InvoiceState.ON_HOLD_DUPLICATE
+    held = next(event for event in ctx.events if event.decision == "duplicate_suspected")
+    assert f"rule=near_number, candidate={first.invoice_id}" in (held.decision_basis or "")
+
+
+def test_two_invoices_a_month_apart_are_not_held(tmp_path: Path) -> None:
+    """The same monthly amount, a new number, 31 days on: an ordinary second bill."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    run(
+        _stored(tmp_path, "jan", store),
+        _persistent(_context(tmp_path, _extraction(invoice_number="INV-001")), store, dedup, "r1"),
+    )
+
+    february = _extraction(invoice_number="INV-014", invoice_date=date(2026, 2, 1))
+    ctx = _persistent(_context(tmp_path, february), store, dedup, "run-2")
+    final = run(_stored(tmp_path, "feb", store), ctx)
+
+    assert final.state is InvoiceState.CLOSED
+    cleared = next(event for event in ctx.events if event.decision == "check_duplicates")
+    # 31 days is outside every window, so January is not even a candidate.
+    assert cleared.decision_basis == "rule=none, candidates=0"
+
+
+def test_the_invoice_s_own_entry_is_written_after_the_check(tmp_path: Path) -> None:
+    """Restart the duplicate step after its entry exists: the invoice is still not its own twin."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "solo", store)
+    ctx = _persistent(_context(tmp_path), store, dedup, "run-1")
+    run(record, ctx)
+    assert str(record.invoice_id) in dedup.entries
+
+    rewound = store.load(str(record.invoice_id)).model_copy(
+        update={"state": InvoiceState.VENDOR_RESOLVED}
+    )
+    store.save(rewound)
+    again = _persistent(_context(tmp_path), store, dedup, "run-2")
+    final = run(rewound, again)
+
+    assert final.state is InvoiceState.CLOSED
+    assert next(e for e in again.events if e.decision == "check_duplicates").decision_basis == (
+        "rule=none, candidates=0"
+    )
+
+
+def test_a_person_s_decision_is_saved(tmp_path: Path) -> None:
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "held", store)
+    ctx = _persistent(_held(tmp_path), store, dedup, "run-1")
+    held = run(record, ctx)
+
+    apply_human_decision(held, ctx, event=InvoiceEvent.REJECT, user_id="u-1")
+
+    assert store.load(str(record.invoice_id)).state is InvoiceState.REJECTED
+
+
+def test_a_record_survives_a_round_trip_through_json(record: InvoiceRecord, tmp_path: Path) -> None:
+    """The stored form is JSON; what comes back must be what went in."""
+    final = run(record, _held(tmp_path))
+    assert InvoiceRecord.model_validate_json(final.model_dump_json()) == final

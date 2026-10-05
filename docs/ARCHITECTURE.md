@@ -168,7 +168,6 @@ stateDiagram-v2
     VENDOR_RESOLVED --> CANCELLED: cancel
     VENDOR_RESOLVED --> DUPLICATE_CHECKED: check_duplicates
     VENDOR_RESOLVED --> ON_HOLD_DUPLICATE: duplicate_suspected
-    VENDOR_RESOLVED --> DUPLICATE_CHECKED: stub_ok
     CANCELLED --> [*]
     CLOSED --> [*]
     REJECTED --> [*]

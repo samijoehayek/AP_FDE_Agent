@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["LEGAL_SUFFIXES", "normalise_vendor_name"]
+__all__ = ["LEGAL_SUFFIXES", "normalise_invoice_number", "normalise_vendor_name"]
 
 LEGAL_SUFFIXES: frozenset[str] = frozenset(
     {
@@ -82,3 +82,17 @@ def normalise_vendor_name(name: str) -> str:
     while tokens and tokens[-1] in LEGAL_SUFFIXES:
         tokens.pop()
     return " ".join(tokens)
+
+
+_NOT_ALPHANUMERIC = re.compile(r"[^0-9A-Z]")
+
+
+def normalise_invoice_number(number: str) -> str:
+    """Reduce a printed invoice number to its letters and digits, upper-cased.
+
+    ``INV-001``, ``inv 001`` and ``INV/001`` are one number printed three ways,
+    and the duplicate check must see one. Leading zeros are kept: ``0012`` and
+    ``12`` are as likely to be two invoices as one, and the similarity rule
+    handles the near case without this guessing.
+    """
+    return _NOT_ALPHANUMERIC.sub("", number.upper())

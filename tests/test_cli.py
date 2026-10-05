@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 from decimal import Decimal
@@ -13,12 +14,15 @@ from typer.testing import CliRunner
 from ap_agent import __version__
 from ap_agent import cli as cli_module
 from ap_agent.cli import app
+from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.enums import ReasonCode, SuggestedAction, SuggestedResolver
 from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.loop import runner as runner_module
+from ap_agent.loop.runner import RunContext
 from ap_agent.payloads import InMemoryPayloadStore
+from ap_agent.persistence import InMemoryDedupIndex, InMemoryInvoiceStore
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.compute_extraction_confidence import ComputeExtractionConfidenceInput
 from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
@@ -28,9 +32,22 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def in_memory_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`run` stores payloads in Postgres; these tests must not need a database."""
+def in_memory_stores(monkeypatch: pytest.MonkeyPatch) -> InMemoryInvoiceStore:
+    """`run` stores in Postgres; these tests must not need a database.
+
+    One invoice store for the whole test, so a second `run` of the same file
+    finds what the first one stored - which is what resume means.
+    """
+    store = InMemoryInvoiceStore()
+    dedup = InMemoryDedupIndex()
     monkeypatch.setattr(cli_module, "payload_store", InMemoryPayloadStore)
+
+    def _store(_payloads: object) -> InMemoryInvoiceStore:
+        return store
+
+    monkeypatch.setattr(cli_module, "invoice_store", _store)
+    monkeypatch.setattr(cli_module, "dedup_index", lambda: dedup)
+    return store
 
 
 def test_version() -> None:
@@ -167,11 +184,12 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     )
     assert result.exit_code == 0, result.output
     assert "final state : CLOSED" in result.output
-    # Fourteen moves. Twenty-one rows: intake is one move and two rows, the
+    # Fourteen moves. Twenty-two rows: intake is one move and two rows, the
     # extraction step one move and six (two readings, the output filter's
-    # verdict on each, the score, the decision), resolving the vendor one and two.
+    # verdict on each, the score, the decision), resolving the vendor one and
+    # two, and the duplicate check one and two.
     assert "steps       : 14" in result.output
-    assert "audit rows  : 21" in result.output
+    assert "audit rows  : 22" in result.output
     assert "chain intact: True" in result.output
 
 
@@ -328,14 +346,17 @@ def test_run_shows_what_the_person_at_pending_human_will_read(  # noqa: PLR0913,
 ) -> None:
     """The summary is on the record, not the trail - so a held run must print it."""
 
-    def _held(record: InvoiceRecord, _ctx: object, **_kwargs: object) -> InvoiceRecord:
-        return record.model_copy(
+    def _held(record: InvoiceRecord, ctx: RunContext, **_kwargs: object) -> InvoiceRecord:
+        held = record.model_copy(
             update={
                 "state": InvoiceState.PENDING_HUMAN,
                 "classification": classification,
                 "classification_rejected": rejected,
             }
         )
+        assert ctx.store is not None
+        ctx.store.save(held)  # what the CLI prints is what was stored
+        return held
 
     monkeypatch.setattr(cli_module, "loop_run", _held)
 
@@ -347,3 +368,84 @@ def test_run_shows_what_the_person_at_pending_human_will_read(  # noqa: PLR0913,
     assert "final state : PENDING_HUMAN" in result.output
     for line in expected:
         assert line in result.output
+
+
+# --- resume, keyed by the document -------------------------------------------
+
+
+def _stored_in(
+    store: InMemoryInvoiceStore, pdf: Path, state: InvoiceState, **update: object
+) -> InvoiceRecord:
+    """An invoice for ``pdf`` already in the store, in ``state``."""
+    record = InvoiceRecord(source_path=pdf, created_at=utc_now())
+    store.create(
+        record,
+        document_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+        byte_size=pdf.stat().st_size,
+        storage_uri=pdf.as_uri(),
+    )
+    record = record.model_copy(update={"state": state, **update})
+    store.save(record)
+    return record
+
+
+@pytest.mark.parametrize(
+    "state", [InvoiceState.CLOSED, InvoiceState.REJECTED, InvoiceState.CANCELLED]
+)
+def test_a_finished_invoice_is_reported_and_left_alone(
+    born_digital_pdf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_memory_stores: InMemoryInvoiceStore,
+    state: InvoiceState,
+) -> None:
+    record = _stored_in(in_memory_stores, born_digital_pdf, state)
+
+    def _never(*_args: object, **_kwargs: object) -> InvoiceRecord:
+        msg = "a finished invoice must not be run again"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli_module, "loop_run", _never)
+
+    result = runner.invoke(
+        app, ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"already {state.value}: invoice {record.invoice_id}. Nothing to do." in result.output
+    assert not (tmp_path / "audit").exists(), "not one row written"
+
+
+def test_a_held_invoice_resumes_and_shows_the_stored_explanation(
+    born_digital_pdf: Path, tmp_path: Path, in_memory_stores: InMemoryInvoiceStore
+) -> None:
+    """The real loop, from PENDING_HUMAN: no reading seat is reached, so no model is."""
+    stored = ExceptionClassification(
+        reason_code=ReasonCode.RECEIPT_MISSING,
+        suggested_resolver=SuggestedResolver.RECEIVING,
+        human_summary="Nothing has been received against PO line 1.",
+        suggested_action=SuggestedAction.REQUEST_GOODS_RECEIPT,
+    )
+    record = _stored_in(
+        in_memory_stores, born_digital_pdf, InvoiceState.PENDING_HUMAN, classification=stored
+    )
+
+    result = runner.invoke(
+        app, ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"resuming    : invoice {record.invoice_id} from PENDING_HUMAN" in result.output
+    assert "final state : PENDING_HUMAN" in result.output
+    assert "[AI-generated] Nothing has been received against PO line 1." in result.output
+
+
+def test_an_empty_file_is_refused_before_anything_is_stored(
+    tmp_path: Path, in_memory_stores: InMemoryInvoiceStore
+) -> None:
+    empty = tmp_path / "empty.pdf"
+    empty.touch()
+    result = runner.invoke(app, ["run", str(empty)])
+    assert result.exit_code == 1
+    assert "empty file" in result.output
+    assert in_memory_stores.records == {}

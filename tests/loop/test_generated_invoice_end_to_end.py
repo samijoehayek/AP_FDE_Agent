@@ -348,8 +348,9 @@ def test_the_audit_sequence_for_a_generated_invoice(
         "validate",
         "name_exact",
         "resolve_vendor",
-        # find_duplicates is still a stub.
-        "stub_ok",
+        # The duplicate check: the rule's verdict, then the decision.
+        "clear",
+        "check_duplicates",
         # The match: the order, what arrived, the matcher, then the decision -
         # `match`, a real event, on a document the generator declared clean.
         "found",

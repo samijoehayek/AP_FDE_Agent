@@ -214,8 +214,6 @@ system approving its own exception, which the architecture forbids by name.
 
 
 STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
-    # TEMP STUB: duplicate detection is not implemented (find_duplicates).
-    (_S.VENDOR_RESOLVED, _E.STUB_OK): _S.DUPLICATE_CHECKED,
     # TEMP STUB: GL coding is not implemented, and a non-PO invoice needs it
     # before anything else can happen to it. Without this edge every invoice
     # with no purchase-order reference - which is the whole Kaggle corpus -

@@ -83,7 +83,7 @@ Rules are not honour-system. Most of them fail a test if broken:
 `audit/chain.py`, `evals/golden.py`, `PostgresAuditWriter`, and every tool
 except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
 `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`,
-`get_receipts`, `compute_match` and `classify_exception` raise
+`get_receipts`, `compute_match`, `classify_exception` and `find_duplicates` raise
 `NotImplementedError` under a docstring describing the responsibility and the
 constraints. `classify_exception` is the second and last model seat: it is shown
 codes and numbers, never document text, and its answer is checked in code.

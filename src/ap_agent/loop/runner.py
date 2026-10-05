@@ -40,6 +40,7 @@ from ap_agent.contracts.audit import (
     ToolActor,
     utc_now,
 )
+from ap_agent.contracts.dedup import DedupEntry
 from ap_agent.contracts.enums import AuditEventType, MatchLineOutcome, ReasonCode
 from ap_agent.contracts.exceptions import HeaderNumbers, PoSnapshot, VendorSummary
 from ap_agent.contracts.matching import MatchResult
@@ -65,6 +66,11 @@ from ap_agent.payloads import (
     PayloadStore,
     store_ref,
 )
+from ap_agent.persistence import (
+    DedupIndex,
+    InMemoryDedupIndex,
+    InvoiceStore,
+)
 from ap_agent.pricing import UNKNOWN_PRICING_VERSION, cost_usd, pricing_version
 from ap_agent.states.machine import (
     HUMAN_ONLY_EVENTS,
@@ -73,6 +79,7 @@ from ap_agent.states.machine import (
     is_terminal,
     transition,
 )
+from ap_agent.text import normalise_invoice_number
 from ap_agent.tools.classify_exception import (
     ClassifyExceptionInput,
     ClassifyExceptionOutput,
@@ -100,6 +107,11 @@ from ap_agent.tools.extract_invoice_vision import (
     ExtractInvoiceVisionInput,
     ExtractInvoiceVisionOutput,
     extract_invoice_vision,
+)
+from ap_agent.tools.find_duplicates import (
+    FindDuplicatesInput,
+    FindDuplicatesOutput,
+    find_duplicates,
 )
 from ap_agent.tools.get_purchase_order import (
     GetPurchaseOrderInput,
@@ -148,6 +160,7 @@ DATE_RESOLVE_RULE_ID = "DATE-RESOLVE@v1"
 RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
 MATCH_RULE_ID = "MATCH@v1"
 CLASSIFY_RULE_ID = "CLASSIFY@v1"
+DEDUP_RULE_ID = "DEDUP@v1"
 STUB_RULE_ID = "STUB"
 
 HALT_NO_TOOL = "halt_no_tool"
@@ -238,6 +251,11 @@ def _default_compute_match(payload: ComputeMatchInput) -> ComputeMatchOutput:
     return compute_match(payload)
 
 
+def _default_find_duplicates(payload: FindDuplicatesInput) -> FindDuplicatesOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`."""
+    return find_duplicates(payload)
+
+
 def _default_classify(payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
     """Dispatch through the module attribute. See :func:`_default_ingest`."""
     return classify_exception(payload)
@@ -270,6 +288,13 @@ class RunContext:
     compute_match: Callable[[ComputeMatchInput], ComputeMatchOutput] = _default_compute_match
     classify: Callable[[ClassifyExceptionInput], ClassifyExceptionOutput] = _default_classify
     payloads: PayloadStore = field(default_factory=InMemoryPayloadStore)
+    store: InvoiceStore | None = None
+    """Durable invoice state. None runs in memory only - tests, and nothing else."""
+    dedup: DedupIndex = field(default_factory=InMemoryDedupIndex)
+    """What the duplicate check compares against. ``just run`` passes Postgres."""
+    find_duplicates: Callable[[FindDuplicatesInput], FindDuplicatesOutput] = (
+        _default_find_duplicates
+    )
     """Where every ``output_ref`` is stored. In memory unless the caller says
     otherwise; ``just run`` passes the Postgres store."""
     now: Callable[[], datetime] = utc_now
@@ -445,6 +470,8 @@ def decide(record: InvoiceRecord) -> Action:  # noqa: PLR0911 - one arm per stat
             return Action(kind=ActionKind.VALIDATE, by="rule", rule_id=VALIDATE_RULE_ID)
         case InvoiceState.VALIDATED:
             return Action(kind=ActionKind.LOOKUP_VENDOR, by="rule", rule_id=RESOLVE_VENDOR_RULE_ID)
+        case InvoiceState.VENDOR_RESOLVED:
+            return Action(kind=ActionKind.FIND_DUPLICATES, by="rule", rule_id=DEDUP_RULE_ID)
         case InvoiceState.EXCEPTION:
             # The one way out of EXCEPTION. The seat explains; the rule routes
             # to a person whatever the seat says, or fails to say.
@@ -589,6 +616,9 @@ def apply(  # noqa: PLR0911 - one arm per action kind
 
         case ActionKind.CLASSIFY_EXCEPTION:
             return _classify_step(record, ctx, trail)
+
+        case ActionKind.FIND_DUPLICATES:
+            return _dedup_step(record, ctx, trail)
 
         case _:
             return _stub_step(record)
@@ -1071,6 +1101,77 @@ def _settle_by_vendor_locale(record: InvoiceRecord, trail: StepTrail) -> Invoice
     )
 
 
+def _dedup_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """Hold a possible duplicate for a person, then index this invoice.
+
+    ``DEDUP@v1``. The candidates are this vendor's earlier invoices from
+    ``dedup_index``; ``find_duplicates`` applies the rule; a match routes to
+    ON_HOLD_DUPLICATE and the decision row names the rule and the earlier
+    invoice. Either way, this invoice's own entry is added *after* the check -
+    so it can never be its own duplicate, and a step restarted after the entry
+    was written still sees only the others.
+
+    An invoice that somehow reaches here without a vendor or an extraction is
+    held rather than waved through: a check that could not run is not a pass.
+    """
+    rules = load_guardrails().duplicate_detection
+    extraction = record.extraction
+    if extraction is None or record.vendor_id is None:
+        return record, StepResult(
+            event=InvoiceEvent.DUPLICATE_SUSPECTED.value,
+            decision_basis="not_checked: no extraction or no resolved vendor",
+        )
+
+    printed = extraction.invoice_number
+    entry = DedupEntry(
+        invoice_id=str(record.invoice_id),
+        vendor_id=record.vendor_id,
+        normalised_invoice_number=(normalise_invoice_number(printed) or printed.strip())[:64],
+        amount=extraction.total,
+        currency=extraction.currency,
+        invoice_date=effective_date(record),
+    )
+    window = max(rules.date_window_days, rules.same_amount_window_days)
+    candidates = ctx.dedup.candidates(entry, window)
+    out = _call(trail, ActionKind.FIND_DUPLICATES, "rule", ctx.find_duplicates)(
+        FindDuplicatesInput(entry=entry, candidates=candidates, rules=rules)
+    )
+    basis = _dedup_basis(out)
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.FIND_DUPLICATES,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="suspected" if out.rule else "clear",
+            output_ref=trail.ref(out),
+            result_summary=f"candidates={out.candidates_compared}",
+            basis=basis,
+        )
+    )
+    # After the check, never before: an invoice must not be its own duplicate.
+    ctx.dedup.add(entry)
+
+    event = InvoiceEvent.DUPLICATE_SUSPECTED if out.rule else InvoiceEvent.CHECK_DUPLICATES
+    return record, StepResult(
+        event=event.value,
+        output_ref=trail.ref(out),
+        result_summary=f"candidates={out.candidates_compared}",
+        decision_basis=basis,
+    )
+
+
+def _dedup_basis(out: FindDuplicatesOutput) -> str:
+    """Which rule fired against which earlier invoice - the queue item's whole case."""
+    if out.rule is None:
+        return f"rule=none, candidates={out.candidates_compared}"
+    return (
+        f"rule={out.rule.value}, candidate={out.candidate_invoice_id}, "
+        f"similarity={out.similarity}, candidates={out.candidates_compared}"
+    )[:MAX_BASIS_CHARS]
+
+
 def _match_prep_step(
     record: InvoiceRecord, ctx: RunContext, trail: StepTrail
 ) -> tuple[InvoiceRecord, StepResult]:
@@ -1485,7 +1586,10 @@ def apply_human_decision(
         StepResult(event=event.value, decision_basis=basis[:MAX_BASIS_CHARS]),
         StepTransition(record.state, to_state),
     )
-    return updated.model_copy(update={"state": to_state})
+    decided = updated.model_copy(update={"state": to_state})
+    if ctx.store is not None:
+        ctx.store.save(decided)
+    return decided
 
 
 def _stub_step(record: InvoiceRecord) -> tuple[InvoiceRecord, StepResult]:
@@ -1527,6 +1631,7 @@ _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
     {
         ActionKind.INGEST_DOCUMENT,
         ActionKind.CLASSIFY_EXCEPTION,
+        ActionKind.FIND_DUPLICATES,
         ActionKind.VALIDATE,
         ActionKind.STUB,
         ActionKind.MATCH_PREP,
@@ -1633,6 +1738,14 @@ def make_event(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _Progress:
+    """How far a run got, for its ``runs`` row."""
+
+    steps: int = 0
+    last_step: str | None = None
+
+
 def run(
     record: InvoiceRecord, ctx: RunContext, max_steps: int = DEFAULT_MAX_STEPS
 ) -> InvoiceRecord:
@@ -1643,12 +1756,39 @@ def run(
     before returning - a run that ends silently is indistinguishable from one
     that never started.
 
+    With a store, the store is the truth: the invoice is reloaded at the top of
+    every iteration and saved after every transition, and the run gets a
+    ``runs`` row that says how it ended. A run that dies mid-step leaves the
+    invoice in the state the step began in, so running it again restarts that
+    step and nothing before it.
+
     Never raises. A failed invoice is a routing outcome, not a crash: the caller
     gets a record whose state says where it stopped.
     """
-    step_seq = 0
+    progress = _Progress()
+    if ctx.store is not None:
+        ctx.store.start_run(ctx.run_id, str(record.invoice_id))
+    try:
+        record = _advance(record, ctx, max_steps, progress)
+    finally:
+        if ctx.store is not None:
+            ctx.store.finish_run(
+                ctx.run_id,
+                step_count=progress.steps,
+                last_step=progress.last_step,
+                last_state=record.state,
+            )
+    return record
 
-    while step_seq < max_steps:
+
+def _advance(
+    record: InvoiceRecord, ctx: RunContext, max_steps: int, progress: _Progress
+) -> InvoiceRecord:
+    """The loop body. See :func:`run`."""
+    while progress.steps < max_steps:
+        if ctx.store is not None:
+            # The database, not this process's memory, says where the invoice is.
+            record = ctx.store.load(str(record.invoice_id))
         if is_terminal(record.state):
             break
 
@@ -1660,7 +1800,8 @@ def run(
             record, result = apply(action, record, ctx, trail)
         except Exception as exc:
             # The failing tool has already written its own row through the trail.
-            # This one records that the *step* stopped, and why.
+            # This one records that the *step* stopped, and why. Nothing is
+            # saved: the invoice stays where the step began, so a re-run restarts it.
             result = StepResult(
                 event="error",
                 error=f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS],
@@ -1669,6 +1810,7 @@ def run(
             _write(
                 ctx, record, action, result, StepTransition(from_state, None, AuditEventType.ERROR)
             )
+            progress.last_step = "error"
             log.exception("step_failed", invoice_id=str(record.invoice_id))
             return record
 
@@ -1685,18 +1827,27 @@ def run(
             _write(
                 ctx, record, action, refused, StepTransition(from_state, None, AuditEventType.ERROR)
             )
+            progress.last_step = "error"
             return record
 
         try:
             to_state = transition(from_state, result.event)
         except IllegalTransition as exc:
             _write(ctx, record, action, *_halt(from_state, result, exc))
+            progress.last_step = HALT_NO_TOOL
             log.info("awaiting_human", invoice_id=str(record.invoice_id), state=from_state.value)
             return record
 
+        # The row first, then the state. A crash between them repeats the step's
+        # row on resume rather than losing it - rule 4 says every transition is
+        # recorded, and a duplicate is visible where a gap is not. Piece 4's
+        # checkpointing removes the duplicate.
         _write(ctx, record, action, result, StepTransition(from_state, to_state))
         record = record.model_copy(update={"state": to_state})
-        step_seq += 1
+        if ctx.store is not None:
+            ctx.store.save(record)
+        progress.steps += 1
+        progress.last_step = result.event
 
     if not is_terminal(record.state):
         _escalate(ctx, record, max_steps)

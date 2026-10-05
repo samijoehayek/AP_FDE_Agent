@@ -246,6 +246,26 @@ loop_limits:
   # the invoice should be accepted with a reason or rejected instead.
   max_rematches: 2
 
+# --- Duplicate detection ---------------------------------------------------
+# Added 2026-10-05, in place - see the note under input_validation. The rule
+# is the architecture report's: a possible duplicate goes to a person
+# (ON_HOLD_DUPLICATE); nothing here rejects anything.
+#
+#   same vendor AND number >= number_similarity_min similar
+#                AND amount within amount_tolerance_pct AND date within date_window_days
+#   OR same vendor AND the same amount within same_amount_window_days
+#
+# Plus one the database forces: the same vendor and the same normalised number
+# is always held, whatever the amount or date, because the invoices table
+# refuses a second (vendor_id, invoice_number) and a person must decide which
+# one is real.
+
+duplicate_detection:
+  number_similarity_min: 0.85 # difflib ratio on the normalised number; INV001 vs INV001A is 0.92
+  amount_tolerance_pct: "0.5"
+  date_window_days: 7
+  same_amount_window_days: 30
+
 # --- Hard prohibitions -----------------------------------------------------
 # Not thresholds. These tools do not exist, and this section is the written
 # statement of that - `tests/tools/test_tool_contracts.py` walks the package and

@@ -7,14 +7,18 @@ system is visible from ``--help`` on day one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, cast
+from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
 from pydantic import ValidationError
 from sqlalchemy.pool import NullPool
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session, sessionmaker
 from ulid import ULID
 
 from ap_agent import __version__
@@ -23,16 +27,19 @@ from ap_agent.config import REPO_ROOT
 from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.db.base import create_db_engine, create_session_factory
+from ap_agent.db.store import PostgresDedupIndex, PostgresInvoiceStore
 from ap_agent.errors import APAgentError
 from ap_agent.loop.dates import resolve_date_by_receipt_window
 from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext, invoice_max_age_days
 from ap_agent.loop.runner import run as loop_run
 from ap_agent.payloads import JSON, PayloadStore, PostgresPayloadStore, parse_ref
+from ap_agent.persistence import DedupIndex, InvoiceStore
 from ap_agent.states.machine import (
     TERMINAL_STATES,
     TRANSITIONS,
     InvoiceState,
     allowed_events,
+    is_terminal,
     to_mermaid,
     transition,
 )
@@ -456,14 +463,32 @@ def po(
     typer.echo(found.model_dump_json(indent=2))
 
 
-def payload_store() -> PayloadStore:
-    """The store ``run`` and ``payload`` use: Postgres, as the application role.
+def _sessions() -> sessionmaker[Session]:
+    """Sessions as the application role.
 
-    A function rather than a constant so a test can substitute an in-memory one
-    without a database. ``NullPool`` because a CLI command is one short process:
-    a pool would hold connections open past the command's own lifetime.
+    ``NullPool``: a CLI command is one short process, and a pool would hold
+    connections open past its own lifetime.
     """
-    return PostgresPayloadStore(create_session_factory(create_db_engine(poolclass=NullPool)))
+    return create_session_factory(create_db_engine(poolclass=NullPool))
+
+
+def payload_store() -> PayloadStore:
+    """The payload store ``run`` and ``payload`` use: Postgres.
+
+    Functions rather than constants, here and below, so a test can substitute an
+    in-memory store without a database.
+    """
+    return PostgresPayloadStore(_sessions())
+
+
+def invoice_store(payloads: PayloadStore) -> InvoiceStore:
+    """The invoice store ``run`` uses: Postgres, records as payloads."""
+    return PostgresInvoiceStore(_sessions(), payloads)
+
+
+def dedup_index() -> DedupIndex:
+    """The duplicate index ``run`` uses: Postgres."""
+    return PostgresDedupIndex(_sessions())
 
 
 @app.command()
@@ -513,25 +538,72 @@ def run_invoice(
         Path, typer.Option("--audit-dir", help="Where the JSONL trail is written.")
     ] = REPO_ROOT / "data" / "audit",
 ) -> None:
-    """Run one invoice through the loop and print where it stopped.
+    """Run one invoice through the loop - or resume it - and print where it stopped.
 
-    This spends tokens: the extraction step reads the document twice. Most other
-    steps are stubs, so a run that reaches CLOSED has proved the pipeline's
-    shape, not that an invoice was really matched, approved or posted.
+    **Keyed by the document's sha256.** A file that has never arrived starts a
+    new invoice. A file that has arrived before resumes its invoice from the
+    state stored for it: a halted one carries on (or halts again, if it is still
+    waiting for a person), one interrupted mid-step restarts that step. A file
+    whose invoice is CLOSED, REJECTED or CANCELLED is reported and left alone.
 
-    ``--received-at`` is the caller's to supply. The loop never reads a clock to
-    decide when a document arrived - a receipt date it invented would be
-    evidence it made up about itself.
+    This spends tokens when it reaches the extraction step. Most steps after the
+    match are stubs, so a run that reaches CLOSED has proved the pipeline's
+    shape, not that an invoice was really approved or posted.
+
+    ``--received-at`` is the caller's to supply, and only on the first run: the
+    loop never reads a clock to decide when a document arrived.
     """
-    record = InvoiceRecord(
-        source_path=path,
-        created_at=utc_now(),
-        received_at=received_at.replace(tzinfo=UTC) if received_at else None,
-    )
-    writer = JsonlAuditWriter(audit_dir)
-    ctx = RunContext(run_id=str(ULID()), writer=writer, payloads=payload_store())
+    if not path.is_file():
+        typer.secho(f"error: not a file: {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    content = path.read_bytes()
+    if not content:
+        typer.secho(f"error: empty file: {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    document_sha256 = hashlib.sha256(content).hexdigest()
 
-    final = loop_run(record, ctx, max_steps=max_steps)
+    payloads = payload_store()
+    store = invoice_store(payloads)
+    existing = store.find_by_document(document_sha256)
+
+    if existing is not None and is_terminal(existing.state):
+        typer.secho(
+            f"already {existing.state.value}: invoice {existing.invoice_id}. Nothing to do.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    if existing is not None:
+        typer.echo(f"resuming    : invoice {existing.invoice_id} from {existing.state.value}")
+        if received_at is not None:
+            typer.secho(
+                "received-at : ignored on resume - the first run's arrival date stands",
+                fg=typer.colors.YELLOW,
+            )
+        record = existing.model_copy(update={"source_path": path})
+        store.save(record)  # the file may have moved; later steps read it from here
+    else:
+        record = InvoiceRecord(
+            source_path=path,
+            created_at=utc_now(),
+            received_at=received_at.replace(tzinfo=UTC) if received_at else None,
+        )
+        store.create(
+            record,
+            document_sha256=document_sha256,
+            byte_size=len(content),
+            storage_uri=path.resolve().as_uri(),
+        )
+
+    writer = JsonlAuditWriter(audit_dir)
+    ctx = RunContext(
+        run_id=str(ULID()), writer=writer, payloads=payloads, store=store, dedup=dedup_index()
+    )
+
+    loop_run(record, ctx, max_steps=max_steps)
+    # Printed from the store, not from this process's memory: what is shown is
+    # what a fresh process resuming this invoice would see.
+    final = store.load(str(record.invoice_id))
 
     moves = [event for event in ctx.events if event.to_state is not None]
     colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
@@ -551,10 +623,9 @@ def _print_explanation(final: InvoiceRecord) -> None:
     """Show what the person at PENDING_HUMAN will read.
 
     The trail keeps the classification's hash, not its words - prose belongs on
-    the record - and this command does not save the record. So this is the one
-    place a run's summary can be seen, and a held invoice that printed nothing
-    would hide the very thing the explanation seat exists to produce. Labelled
-    as model-written, as the architecture asks of anywhere it is displayed.
+    the record - and the record shown here is the one *stored*, so a resumed run
+    prints the summary the original run wrote. Labelled as model-written, as the
+    architecture asks of anywhere it is displayed.
     """
     if final.state is not InvoiceState.PENDING_HUMAN:
         return

@@ -251,6 +251,19 @@ class LoopLimits(StrictModel):
     )
 
 
+class DuplicateDetection(StrictModel):
+    """The architecture report's duplicate rule, as numbers a reviewer can read."""
+
+    number_similarity_min: float = Field(
+        gt=0, le=1, description="difflib ratio on normalised invoice numbers."
+    )
+    amount_tolerance_pct: Percentage = Field(
+        description="How far apart two amounts may be and still be the same bill."
+    )
+    date_window_days: int = Field(ge=0, le=366)
+    same_amount_window_days: int = Field(ge=0, le=366)
+
+
 class HardProhibitions(StrictModel):
     """Tools that must not exist. Not thresholds - absences.
 
@@ -285,6 +298,7 @@ class GuardrailConfig(StrictModel):
     input_validation: InputValidation
     output_filter: OutputFilter
     loop_limits: LoopLimits
+    duplicate_detection: DuplicateDetection
     hard_prohibitions: HardProhibitions
 
 
