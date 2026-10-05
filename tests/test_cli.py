@@ -22,7 +22,11 @@ from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.loop import runner as runner_module
 from ap_agent.loop.runner import RunContext
 from ap_agent.payloads import InMemoryPayloadStore
-from ap_agent.persistence import InMemoryDedupIndex, InMemoryInvoiceStore
+from ap_agent.persistence import (
+    InMemoryApprovalStore,
+    InMemoryDedupIndex,
+    InMemoryInvoiceStore,
+)
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.compute_extraction_confidence import ComputeExtractionConfidenceInput
 from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextOutput
@@ -47,6 +51,8 @@ def in_memory_stores(monkeypatch: pytest.MonkeyPatch) -> InMemoryInvoiceStore:
 
     monkeypatch.setattr(cli_module, "invoice_store", _store)
     monkeypatch.setattr(cli_module, "dedup_index", lambda: dedup)
+    approvals = InMemoryApprovalStore()
+    monkeypatch.setattr(cli_module, "approval_store", lambda: approvals)
     return store
 
 
@@ -107,16 +113,12 @@ def test_states_check_rejects_an_illegal_transition() -> None:
     assert result.exit_code == 1
 
 
-def test_run_processes_an_invoice_and_reports_where_it_stopped(
-    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The extraction seat is replaced, so this never reaches the API.
+def _fake_seats(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace both reading seats with a faked TechVision invoice that cites no PO.
 
     The vendor is a real one from the committed master, and the invoice cites no
-    purchase order - so the run resolves the vendor against a local file and
-    routes down the NON_PO path. Nothing here touches QuickBooks:
-    ``get_purchase_order`` is never reached, because an invoice with no PO
-    reference has nothing to fetch.
+    purchase order - so a run resolves the vendor against a local file and routes
+    down the NON_PO path. Nothing touches QuickBooks or the API.
     """
     extraction = InvoiceExtraction.model_validate(
         {
@@ -178,18 +180,33 @@ def test_run_processes_an_invoice_and_reports_where_it_stopped(
     # it is pure code, so faking it would only test the fake.
     monkeypatch.setattr(runner_module, "extract_invoice_vision", _extract)
     monkeypatch.setattr(runner_module, "extract_invoice_text", _extract_text)
+
+
+def test_run_processes_an_invoice_and_reports_where_it_stopped(
+    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extraction seat is replaced, so this never reaches the API.
+
+    The vendor is a real one from the committed master, and the invoice cites no
+    purchase order - so the run resolves the vendor against a local file and
+    routes down the NON_PO path. Nothing here touches QuickBooks:
+    ``get_purchase_order`` is never reached, because an invoice with no PO
+    reference has nothing to fetch.
+    """
+    _fake_seats(monkeypatch)
     result = runner.invoke(
         app,
         ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")],
     )
     assert result.exit_code == 0, result.output
-    assert "final state : CLOSED" in result.output
-    # Fourteen moves. Twenty-two rows: intake is one move and two rows, the
-    # extraction step one move and six (two readings, the output filter's
-    # verdict on each, the score, the decision), resolving the vendor one and
-    # two, and the duplicate check one and two.
-    assert "steps       : 14" in result.output
-    assert "audit rows  : 22" in result.output
+    assert "final state : PENDING_APPROVAL" in result.output
+    # Eight moves to the people who must approve it. Nineteen rows: intake two,
+    # the extraction step six (two readings, the output filter's verdict on
+    # each, the score, the decision), validation one, the vendor two, the
+    # duplicate check two, NON_PO one, GL coding's stub one, the approval
+    # request three (request, notification, decision), and the halt.
+    assert "steps       : 8" in result.output
+    assert "audit rows  : 19" in result.output
     assert "chain intact: True" in result.output
 
 
@@ -449,3 +466,69 @@ def test_an_empty_file_is_refused_before_anything_is_stored(
     assert result.exit_code == 1
     assert "empty file" in result.output
     assert in_memory_stores.records == {}
+
+
+# --- just decide -----------------------------------------------------------------
+
+
+def _run_to_approval(pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """`just run` with both seats faked, to PENDING_APPROVAL. Returns the invoice id."""
+    _fake_seats(monkeypatch)
+    result = runner.invoke(app, ["run", str(pdf), "--audit-dir", str(tmp_path / "audit")])
+    assert "final state : PENDING_APPROVAL" in result.output, result.output
+    assert "approval    : 0 of 2 (ap_clerk)" in result.output
+    assert "to decide   : just decide" in result.output
+    line = next(text for text in result.output.splitlines() if text.startswith("to decide"))
+    return line.split()[5]
+
+
+def test_decide_records_votes_until_the_approval_completes_then_carries_on(
+    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first invoice from this vendor: two approvers. One vote waits; two move it."""
+    invoice_id = _run_to_approval(born_digital_pdf, tmp_path, monkeypatch)
+    audit = ["--audit-dir", str(tmp_path / "audit")]
+
+    first = runner.invoke(
+        app, ["decide", invoice_id, "approve", "--by", "alice", "--reason", "fine", *audit]
+    )
+    assert first.exit_code == 0, first.output
+    assert "recorded    : approval_id=" in first.output
+    assert "approvals=1 of 2, status=pending" in first.output
+
+    again = runner.invoke(
+        app, ["decide", invoice_id, "approve", "--by", "alice", "--reason", "fine", *audit]
+    )
+    assert again.exit_code == 1
+    assert "alice has already decided" in again.output
+
+    second = runner.invoke(
+        app, ["decide", invoice_id, "approve", "--by", "bob", "--reason", "agreed", *audit]
+    )
+    assert second.exit_code == 0, second.output
+    assert "decided     : PENDING_APPROVAL -> APPROVED" in second.output
+    assert "final state : CLOSED" in second.output, "the stubs after the gate"
+    assert "chain intact: True" in second.output
+
+
+def test_decide_refuses_an_approval_without_a_reason(
+    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invoice_id = _run_to_approval(born_digital_pdf, tmp_path, monkeypatch)
+    result = runner.invoke(app, ["decide", invoice_id, "approve", "--by", "alice"])
+    assert result.exit_code == 1
+    assert "approve needs a written reason" in result.output
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["decide", "NOPE", "approve", "--by", "a"], "no invoice NOPE"),
+        (["decide", "NOPE", "pay", "--by", "a"], "'pay' is not one of"),
+    ],
+)
+@pytest.mark.usefixtures("in_memory_stores")
+def test_decide_refuses_what_it_cannot_do(argv: list[str], message: str) -> None:
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 1
+    assert message in result.output

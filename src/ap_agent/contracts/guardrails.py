@@ -158,6 +158,12 @@ class ApprovalMatrix(StrictModel):
         "straight-through processing entirely, which is the correct day-one value: "
         "turning it on should be a reviewed change with a golden-set number attached.",
     )
+    pending_approval_refresh_after_hours: int = Field(
+        ge=1,
+        le=24 * 90,
+        description="A PENDING_APPROVAL snapshot older than this is refreshed - order and "
+        "receipts re-fetched, match re-run - before the invoice may go further.",
+    )
     tiers: list[ApprovalTier] = Field(min_length=1, max_length=10)
     rules: list[ApprovalRule] = Field(min_length=1, max_length=20)
 

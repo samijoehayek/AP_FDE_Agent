@@ -112,6 +112,11 @@ receipts PO:
 po PO:
     uv run ap-agent po {{PO}}
 
+# Record a person's decision on a waiting invoice, then carry on from it.
+#   just decide <invoice_id> approve --by alice --reason "checked against PO"
+decide ID ACTION *ARGS:
+    uv run ap-agent decide {{ID}} {{ACTION}} {{ARGS}}
+
 # Print what an audit row's output_ref points at. Reads Postgres; no network.
 payload SHA:
     uv run ap-agent payload {{SHA}}

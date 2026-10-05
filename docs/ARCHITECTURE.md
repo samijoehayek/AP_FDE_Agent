@@ -112,7 +112,6 @@ stateDiagram-v2
     APPROVED --> POSTED: stub_ok
     CODED --> CANCELLED: cancel
     CODED --> PENDING_APPROVAL: request_approval
-    CODED --> PENDING_APPROVAL: stub_ok
     DUPLICATE_CHECKED --> CANCELLED: cancel
     DUPLICATE_CHECKED --> MATCHED: match
     DUPLICATE_CHECKED --> EXCEPTION: match_exception
@@ -139,14 +138,14 @@ stateDiagram-v2
     NON_PO --> CODED: stub_ok
     ON_HOLD_DUPLICATE --> CANCELLED: cancel
     ON_HOLD_DUPLICATE --> REJECTED: confirm_duplicate
-    ON_HOLD_DUPLICATE --> DUPLICATE_CHECKED: duplicate_cleared
+    ON_HOLD_DUPLICATE --> DUPLICATE_CHECKED: not_duplicate
     PAID --> RECONCILED: reconcile
     PAID --> RECONCILED: stub_ok
     PENDING_APPROVAL --> APPROVED: approve
     PENDING_APPROVAL --> CANCELLED: cancel
+    PENDING_APPROVAL --> EXCEPTION: match_changed
     PENDING_APPROVAL --> REJECTED: reject
     PENDING_APPROVAL --> EXCEPTION: request_changes
-    PENDING_APPROVAL --> APPROVED: stub_ok
     PENDING_HUMAN --> MATCHED: accept_with_reason
     PENDING_HUMAN --> CANCELLED: cancel
     PENDING_HUMAN --> REJECTED: reject

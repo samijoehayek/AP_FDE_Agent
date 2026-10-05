@@ -1,27 +1,32 @@
-"""Open a durable approval request and notify the approver.
+"""Open a durable approval request for the people the matrix names.
 
 Caller: code. The orchestrator calls this; no model can.
-Side effects: DB_WRITE, NOTIFICATION.
+Side effects: DB_WRITE, NOTIFICATION. Writes an ``approvals`` row.
 
-The human-in-the-loop boundary. The request is a row in the database, not a
-callback or an in-memory future: the process can restart, the approver can
-take four days, and the request survives both.
+**Who must approve is decided before this is called**, by ``APPROVAL-MATRIX@v1``
+(``guardrails/approval.py``): a count and a role, never a named person. This
+records that requirement as a request that survives a deploy - approvals take
+days - and it is completed only by people, through ``approval_decisions``.
 
-The approver is chosen by the approval matrix in the versioned guardrails
-config - never by a model, and never by the invoice itself.
+**Idempotent.** The request's id is derived from the idempotency key, so a step
+restarted after the row was written finds it (``already_existed``) instead of
+opening a second request for the same invoice.
 
-Not implemented: the approver resolution, the notification transport, the
-reminder schedule, and the escalation path when nobody responds.
-
+**Where it writes** is the store the loop bound for the run
+(:data:`~ap_agent.persistence.CURRENT_APPROVAL_STORE`): a tool takes exactly
+one argument, its input, and the run decides between Postgres and memory.
+Called outside a run, it refuses.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
 
 from pydantic import Field
 
-from ap_agent.contracts.common import CurrencyCode, Money
+from ap_agent.contracts.approval import ApprovalRequirement
+from ap_agent.errors import APAgentError
+from ap_agent.persistence import CURRENT_APPROVAL_STORE
 from ap_agent.tools.base import IdempotentToolInput, SideEffect, ToolCaller, ToolOutput
 
 CALLER = ToolCaller.CODE
@@ -33,29 +38,48 @@ class RequestApprovalInput(IdempotentToolInput):
     """Input for :func:`request_approval`."""
 
     invoice_id: str = Field(min_length=1, max_length=64)
-    approver_user_id: str = Field(
-        min_length=1,
-        max_length=64,
-        description="Resolved from the approval matrix by the caller. Recorded on the row.",
-    )
-    reason: str = Field(min_length=1, max_length=700, description="Display text for the queue.")
-    amount: Money
-    currency: CurrencyCode
+    requirement: ApprovalRequirement
     config_version: str = Field(min_length=1, max_length=32)
-    due_by: datetime | None = None
 
 
 class RequestApprovalOutput(ToolOutput):
     """Output of :func:`request_approval`."""
 
-    approval_id: str = Field(min_length=1, max_length=64)
+    approval_id: str = Field(min_length=1, max_length=26)
     already_existed: bool = False
+    required_approvers: int = Field(ge=1, le=4)
+    approver_role: str = Field(min_length=1, max_length=64)
+
+
+def approval_id_for(idempotency_key: str) -> str:
+    """The request's id, derived from the key so a retry finds the same row."""
+    return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:26]
 
 
 def request_approval(payload: RequestApprovalInput) -> RequestApprovalOutput:
-    """Open a durable approval request and notify the approver.
+    """Open the request, or find the one this key already opened.
 
     Raises:
-        NotImplementedError: Written by hand in a later session.
+        APAgentError: Called outside a run, with no approval store bound.
     """
-    raise NotImplementedError
+    try:
+        store = CURRENT_APPROVAL_STORE.get()
+    except LookupError as exc:
+        msg = "request_approval was called outside a run; no approval store is bound"
+        raise APAgentError(msg) from exc
+
+    requirement = payload.requirement
+    view, created = store.request(
+        approval_id_for(payload.idempotency_key),
+        payload.invoice_id,
+        requirement,
+        amount=requirement.amount,
+        currency=requirement.currency,
+        config_version=payload.config_version,
+    )
+    return RequestApprovalOutput(
+        approval_id=view.approval_id,
+        already_existed=not created,
+        required_approvers=view.required_approvers,
+        approver_role=view.approver_role,
+    )

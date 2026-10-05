@@ -28,8 +28,6 @@ EXPECTED_STUB_EDGES: set[tuple[str, str]] = {
     # which cites no purchase orders - stops dead at NON_PO.
     ("NON_PO", "CODED"),
     ("MATCHED", "CODED"),
-    ("CODED", "PENDING_APPROVAL"),
-    ("PENDING_APPROVAL", "APPROVED"),
     ("APPROVED", "POSTED"),
     ("POSTED", "SCHEDULED"),
     ("SCHEDULED", "PAID"),

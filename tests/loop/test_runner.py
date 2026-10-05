@@ -81,8 +81,8 @@ if TYPE_CHECKING:
     from ap_agent.tools.get_receipts import GetReceiptsInput
     from ap_agent.tools.lookup_vendor import LookupVendorInput
 
-HAPPY_PATH_STEPS = 14
-"""Loop iterations from RECEIVED to CLOSED. One per state change."""
+HAPPY_PATH_STEPS = 8
+"""Loop iterations from RECEIVED to PENDING_APPROVAL, where a clean invoice waits for people."""
 
 HAPPY_PATH_EVENTS = [
     # Intake: the tool, then INPUT-VALIDATE@v1 deciding a model may read it.
@@ -111,7 +111,14 @@ HAPPY_PATH_EVENTS = [
     "received",
     "matched",
     "match",
-    *["stub_ok"] * 8,
+    # GL coding is still a stub.
+    "stub_ok",
+    # APPROVAL-MATRIX@v1: the request, the notification, the decision that
+    # moves the invoice to PENDING_APPROVAL - then it waits for people.
+    "requested",
+    "delivered",
+    "request_approval",
+    "halt_no_tool",
 ]
 
 PO_NUMBER = "AP-TEST-001"
@@ -370,7 +377,9 @@ def ctx(tmp_path: Path) -> RunContext:
         (InvoiceState.EXTRACTED, ActionKind.VALIDATE, "rule"),
         (InvoiceState.VALIDATED, ActionKind.LOOKUP_VENDOR, "rule"),
         (InvoiceState.DUPLICATE_CHECKED, ActionKind.MATCH_PREP, "rule"),
-        (InvoiceState.PENDING_APPROVAL, ActionKind.STUB, "rule"),
+        (InvoiceState.CODED, ActionKind.REQUEST_APPROVAL, "rule"),
+        (InvoiceState.PENDING_APPROVAL, ActionKind.APPROVAL_REFRESH, "rule"),
+        (InvoiceState.APPROVED, ActionKind.STUB, "rule"),
     ],
 )
 def test_decide_routes_by_state(
@@ -472,9 +481,9 @@ def test_the_decision_basis_names_every_load_bearing_field_and_the_date(
 # --- the full run -----------------------------------------------------------
 
 
-def test_a_clean_invoice_reaches_closed(record: InvoiceRecord, ctx: RunContext) -> None:
+def test_a_clean_invoice_waits_for_approval(record: InvoiceRecord, ctx: RunContext) -> None:
     final = run(record, ctx)
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
 
 
 def test_the_event_sequence_is_exactly_the_happy_path(
@@ -512,7 +521,8 @@ def test_only_the_last_row_of_a_step_moves_the_invoice(
         "resolve_vendor",
         "check_duplicates",
         "match",
-        *["stub_ok"] * 8,
+        "stub_ok",
+        "request_approval",
     ]
 
 
@@ -880,7 +890,7 @@ def test_the_receipt_window_settles_the_date_at_validation(
     ctx = _ambiguous_context(tmp_path)
     final = run(record.model_copy(update={"received_at": _received(date(2024, 3, 12))}), ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert final.invoice_date_resolved == MARCH
     assert final.date_resolution_reason is DateResolutionReason.RECEIPT_WINDOW
     assert final.date_is_open is False
@@ -933,7 +943,7 @@ def test_the_vendors_country_settles_what_the_window_could_not(
 
     final = run(started, ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert final.vendor_country == "IN"
     assert final.invoice_date_resolved == MARCH
     assert final.date_resolution_reason is DateResolutionReason.VENDOR_LOCALE
@@ -1004,7 +1014,7 @@ def test_an_unambiguous_invoice_needs_no_resolution_at_all(
     ctx = _context(tmp_path, extraction, purchase_order=_purchase_order(currency="INR"))
     final = run(record.model_copy(update={"received_at": _received(date(2023, 7, 10))}), ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert final.confidence is not None
     assert final.confidence.auto_ok is True
     assert final.confidence.date_verdict is DateVerdict.UNAMBIGUOUS
@@ -1126,7 +1136,7 @@ def test_no_stub_step_does_anything() -> None:
 
 def test_a_stub_step_changes_nothing_on_the_record(record: InvoiceRecord, ctx: RunContext) -> None:
     """Every remaining stub advances the state and touches nothing else."""
-    for state in (InvoiceState.MATCHED, InvoiceState.CODED, InvoiceState.POSTED):
+    for state in (InvoiceState.MATCHED, InvoiceState.APPROVED, InvoiceState.POSTED):
         parked = record.model_copy(update={"state": state, "vendor_country": "IN"})
         updated, result = apply(decide(parked), parked, ctx)
         assert result.event == "stub_ok"
@@ -2017,14 +2027,14 @@ def test_the_store_is_the_truth_and_every_transition_is_saved(tmp_path: Path) ->
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.CLOSED
-    assert store.load(str(record.invoice_id)).state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
+    assert store.load(str(record.invoice_id)).state is InvoiceState.PENDING_APPROVAL
     assert store.runs["run-a"] == {
         "invoice_id": str(record.invoice_id),
         "ended": True,
         "step_count": HAPPY_PATH_STEPS,
-        "last_step": "stub_ok",
-        "last_state": InvoiceState.CLOSED,
+        "last_step": "halt_no_tool",
+        "last_state": InvoiceState.PENDING_APPROVAL,
     }
 
 
@@ -2074,7 +2084,7 @@ def test_a_crash_mid_step_restarts_that_step_and_nothing_before_it(tmp_path: Pat
 
     final = run(store.load(str(record.invoice_id)), _persistent(base, store, dedup, "run-2"))
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert calls == ["ingest", "lookup", "lookup"], "ingest ran once; the lookup step ran twice"
 
 
@@ -2129,7 +2139,7 @@ def test_two_invoices_a_month_apart_are_not_held(tmp_path: Path) -> None:
     ctx = _persistent(_context(tmp_path, february), store, dedup, "run-2")
     final = run(_stored(tmp_path, "feb", store), ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     cleared = next(event for event in ctx.events if event.decision == "check_duplicates")
     # 31 days is outside every window, so January is not even a candidate.
     assert cleared.decision_basis == "rule=none, candidates=0"
@@ -2150,7 +2160,7 @@ def test_the_invoice_s_own_entry_is_written_after_the_check(tmp_path: Path) -> N
     again = _persistent(_context(tmp_path), store, dedup, "run-2")
     final = run(rewound, again)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert next(e for e in again.events if e.decision == "check_duplicates").decision_basis == (
         "rule=none, candidates=0"
     )
@@ -2171,3 +2181,259 @@ def test_a_record_survives_a_round_trip_through_json(record: InvoiceRecord, tmp_
     """The stored form is JSON; what comes back must be what went in."""
     final = run(record, _held(tmp_path))
     assert InvoiceRecord.model_validate_json(final.model_dump_json()) == final
+
+
+# --- the approval gate: APPROVAL-MATRIX@v1, people, APPROVAL-REFRESH@v1 ------
+
+
+def _waiting(tmp_path: Path) -> tuple[InvoiceRecord, RunContext]:
+    """A clean invoice, run to PENDING_APPROVAL. No store: a first invoice, two approvers."""
+    ctx = _context(tmp_path)
+    record = InvoiceRecord(source_path=tmp_path / "invoice.pdf", created_at=utc_now())
+    waiting = run(record, ctx)
+    assert waiting.state is InvoiceState.PENDING_APPROVAL
+    return waiting, ctx
+
+
+def test_a_clean_invoice_asks_the_matrix_s_people_and_waits(tmp_path: Path) -> None:
+    waiting, ctx = _waiting(tmp_path)
+
+    request = next(event for event in ctx.events if event.decision == "request_approval")
+    assert isinstance(request.actor, RuleActor)
+    assert request.actor.rule_id == "APPROVAL-MATRIX@v1"
+    assert (request.from_state, request.to_state) == (
+        InvoiceState.CODED,
+        InvoiceState.PENDING_APPROVAL,
+    )
+    assert request.decision_basis == (
+        "rule=APPROVAL-MATRIX@v1, config_version=guardrails_v1, amount=120.00 USD, "
+        "tier<= 1000.00, role=ap_clerk, required=2, rules=first_invoice_from_vendor, "
+        "hold_for_callback=no, auto_approve=off (auto_approve_max_amount=0.00)"
+    )
+    opened = next(event for event in ctx.events if event.decision == "requested")
+    assert opened.event_type is AuditEventType.APPROVAL_REQUESTED
+    assert waiting.approval_id is not None
+    assert ctx.approvals.get(waiting.approval_id) is not None
+
+    halt = ctx.events[-1]
+    assert halt.decision == HALT_NO_TOOL
+    assert isinstance(halt.actor, RuleActor)
+    assert halt.actor.rule_id == "APPROVAL-REFRESH@v1"
+    assert "awaiting approval" in (halt.decision_basis or "")
+    assert "approvals=0 of 2" in (halt.decision_basis or "")
+
+
+def test_approval_needs_two_different_people_then_the_invoice_moves(tmp_path: Path) -> None:
+    waiting, ctx = _waiting(tmp_path)
+
+    once = apply_human_decision(
+        waiting, ctx, event=InvoiceEvent.APPROVE, user_id="alice", reason="matches PO and GR"
+    )
+    assert once.state is InvoiceState.PENDING_APPROVAL, "one of two is not enough"
+    vote = ctx.events[-1]
+    assert vote.event_type is AuditEventType.HUMAN_DECISION
+    assert vote.to_state is None
+    assert isinstance(vote.actor, HumanActor)
+    assert "approve, approvals=1 of 2, status=pending" in (vote.decision_basis or "")
+
+    rows = len(ctx.events)
+    with pytest.raises(HumanDecisionError, match="alice has already decided"):
+        apply_human_decision(once, ctx, event=InvoiceEvent.APPROVE, user_id="alice", reason="x")
+    assert len(ctx.events) == rows, "a second vote from one person writes nothing"
+
+    approved = apply_human_decision(
+        once, ctx, event=InvoiceEvent.APPROVE, user_id="bob", reason="checked the receipt"
+    )
+    assert approved.state is InvoiceState.APPROVED
+    row = ctx.events[-1]
+    assert isinstance(row.actor, HumanActor)
+    assert row.actor.user_id == "bob"
+    assert (row.from_state, row.to_state) == (InvoiceState.PENDING_APPROVAL, InvoiceState.APPROVED)
+    assert row.decision == "approve"
+    assert "approvals=2 of 2, status=approved, reason=checked the receipt" in (
+        row.decision_basis or ""
+    )
+
+    assert run(approved, ctx).state is InvoiceState.CLOSED, "the stubs after the gate"
+
+
+def test_one_rejection_rejects(tmp_path: Path) -> None:
+    waiting, ctx = _waiting(tmp_path)
+    rejected = apply_human_decision(
+        waiting, ctx, event=InvoiceEvent.REJECT, user_id="alice", reason="not our order"
+    )
+    assert rejected.state is InvoiceState.REJECTED
+
+
+@pytest.mark.parametrize("event", [InvoiceEvent.APPROVE, InvoiceEvent.REJECT])
+def test_an_approval_decision_needs_a_reason(tmp_path: Path, event: InvoiceEvent) -> None:
+    waiting, ctx = _waiting(tmp_path)
+    with pytest.raises(HumanDecisionError, match="needs a written reason"):
+        apply_human_decision(waiting, ctx, event=event, user_id="alice", reason=" ")
+
+
+def test_a_known_vendor_s_small_invoice_needs_one_approver(tmp_path: Path) -> None:
+    """With a store that already holds this vendor's invoices, the first-invoice rule is off."""
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    earlier = _stored(tmp_path, "earlier", store)
+    store.save(earlier.model_copy(update={"vendor_id": VENDOR_ERP_ID}))
+    record = _stored(tmp_path, "now", store)
+    ctx = _persistent(
+        _context(tmp_path, _extraction(invoice_number="INV-2")), store, dedup, "run-1"
+    )
+
+    waiting = run(record, ctx)
+    request = next(event for event in ctx.events if event.decision == "request_approval")
+    assert "required=1, rules=none" in (request.decision_basis or "")
+
+    approved = apply_human_decision(
+        waiting, ctx, event=InvoiceEvent.APPROVE, user_id="alice", reason="ok"
+    )
+    assert approved.state is InvoiceState.APPROVED
+    assert store.load(str(record.invoice_id)).state is InvoiceState.APPROVED
+
+
+def test_a_restarted_request_finds_the_request_it_already_opened(tmp_path: Path) -> None:
+    """The step died after the row was written: the same key, the same request."""
+    waiting, ctx = _waiting(tmp_path)
+    rewound = waiting.model_copy(update={"state": InvoiceState.CODED})
+
+    again = run(rewound, ctx)
+
+    assert again.approval_id == waiting.approval_id
+    assert [e.decision for e in ctx.events].count("already_requested") == 1
+
+
+# --- the duplicate door --------------------------------------------------------
+
+
+def _held_duplicate(tmp_path: Path, number: str) -> tuple[InvoiceRecord, RunContext, str]:
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    first = _stored(tmp_path, "first", store)
+    run(
+        first,
+        _persistent(
+            _context(tmp_path, _extraction(invoice_number="INV-001")), store, dedup, "run-1"
+        ),
+    )
+    ctx = _persistent(
+        _context(tmp_path, _extraction(invoice_number=number, invoice_date=date(2026, 1, 3))),
+        store,
+        dedup,
+        "run-2",
+    )
+    held = run(_stored(tmp_path, "second", store), ctx)
+    assert held.state is InvoiceState.ON_HOLD_DUPLICATE
+    return held, ctx, str(first.invoice_id)
+
+
+def test_confirming_a_duplicate_rejects_it_and_names_the_original(tmp_path: Path) -> None:
+    held, ctx, original = _held_duplicate(tmp_path, "INV-001")
+
+    rejected = apply_human_decision(
+        held, ctx, event=InvoiceEvent.CONFIRM_DUPLICATE, user_id="alice"
+    )
+
+    assert rejected.state is InvoiceState.REJECTED
+    assert ctx.events[-1].decision_basis == (
+        f"candidate={original}, rule=exact_number, reason=none"
+    )
+
+
+def test_an_exact_number_cannot_be_declared_not_a_duplicate(tmp_path: Path) -> None:
+    """The database keeps one invoice per number; one of the two must be rejected."""
+    held, ctx, _original = _held_duplicate(tmp_path, "INV-001")
+    with pytest.raises(HumanDecisionError, match="keeps one invoice per number"):
+        apply_human_decision(
+            held, ctx, event=InvoiceEvent.NOT_DUPLICATE, user_id="alice", reason="different"
+        )
+
+
+def test_a_near_duplicate_can_be_cleared_with_a_reason(tmp_path: Path) -> None:
+    held, ctx, original = _held_duplicate(tmp_path, "INV-001A")
+
+    with pytest.raises(HumanDecisionError, match="needs a written reason"):
+        apply_human_decision(held, ctx, event=InvoiceEvent.NOT_DUPLICATE, user_id="alice")
+    cleared = apply_human_decision(
+        held, ctx, event=InvoiceEvent.NOT_DUPLICATE, user_id="alice", reason="credit re-bill"
+    )
+
+    assert cleared.state is InvoiceState.DUPLICATE_CHECKED
+    assert ctx.events[-1].decision_basis == (
+        f"candidate={original}, rule=near_number, reason=credit re-bill"
+    )
+
+
+# --- APPROVAL-REFRESH@v1 ---------------------------------------------------------
+
+
+def _later(hours: float) -> Callable[[], datetime]:
+    moment = utc_now() + timedelta(hours=hours)
+    return lambda: moment
+
+
+def test_a_fresh_snapshot_just_keeps_waiting(tmp_path: Path) -> None:
+    waiting, ctx = _waiting(tmp_path)
+    again = run(waiting, replace(ctx, now=_later(71)))
+    assert again.state is InvoiceState.PENDING_APPROVAL
+    assert "snapshot age 71.0h < 72h" in (ctx.events[-1].decision_basis or "")
+
+
+def test_a_stale_snapshot_that_still_holds_is_refreshed_and_waits(tmp_path: Path) -> None:
+    waiting, ctx = _waiting(tmp_path)
+    later = replace(ctx, now=_later(73))
+
+    again = run(waiting, later)
+
+    assert again.state is InvoiceState.PENDING_APPROVAL
+    assert "refreshed, still holds" in (ctx.events[-1].decision_basis or "")
+    assert [e.decision for e in ctx.events[-4:-1]] == ["found", "received", "matched"]
+    assert again.snapshot_taken_at is not None
+    assert waiting.snapshot_taken_at is not None
+    assert again.snapshot_taken_at > waiting.snapshot_taken_at
+
+
+def test_a_stale_snapshot_that_no_longer_holds_goes_back_to_a_person(tmp_path: Path) -> None:
+    """The goods were returned while the approval waited: nothing received any more."""
+    waiting, ctx = _waiting(tmp_path)
+    returned = replace(
+        ctx, now=_later(73), get_receipts=_fake_receipts_factory(ReceiptSet(po_number=PO_NUMBER))
+    )
+
+    again = run(waiting, returned)
+
+    assert again.state is InvoiceState.PENDING_HUMAN
+    changed = next(event for event in ctx.events if event.decision == "match_changed")
+    assert isinstance(changed.actor, RuleActor)
+    assert changed.actor.rule_id == "APPROVAL-REFRESH@v1"
+    assert (changed.from_state, changed.to_state) == (
+        InvoiceState.PENDING_APPROVAL,
+        InvoiceState.EXCEPTION,
+    )
+    assert "match changed: new=quantity_over_tolerance|receipt_missing" in (
+        changed.decision_basis or ""
+    )
+    assert waiting.approval_id is not None
+    cancelled = ctx.approvals.get(waiting.approval_id)
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert again.approval_round == 1, "the next request gets a new key"
+
+
+# --- extractions --------------------------------------------------------------
+
+
+def test_the_readings_are_recorded_by_ref_at_extracted(tmp_path: Path) -> None:
+    store, dedup = InMemoryInvoiceStore(), InMemoryDedupIndex()
+    record = _stored(tmp_path, "read", store)
+    ctx = _persistent(_context(tmp_path), store, dedup, "run-1")
+
+    run(record, ctx)
+
+    (row,) = store.extractions
+    assert row["invoice_id"] == str(record.invoice_id)
+    assert row["auto_ok"] is True
+    for key in ("vision_ref", "text_ref", "confidence_ref"):
+        ref = row[key]
+        assert isinstance(ref, str)
+        assert ctx.payloads.get(parse_ref(ref)) is not None, key

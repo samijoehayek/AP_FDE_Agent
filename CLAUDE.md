@@ -83,7 +83,8 @@ Rules are not honour-system. Most of them fail a test if broken:
 `audit/chain.py`, `evals/golden.py`, `PostgresAuditWriter`, and every tool
 except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
 `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`,
-`get_receipts`, `compute_match`, `classify_exception` and `find_duplicates` raise
+`get_receipts`, `compute_match`, `classify_exception`, `find_duplicates`,
+`request_approval` and `notify` raise
 `NotImplementedError` under a docstring describing the responsibility and the
 constraints. `classify_exception` is the second and last model seat: it is shown
 codes and numbers, never document text, and its answer is checked in code.
@@ -105,13 +106,17 @@ Its `expected_match` and `expected_reason_codes` are *assertions about a matcher
 that does not exist yet*, declared per variant — never computed by evaluating a
 tolerance. Do not make the generator grade its own output.
 
-The agent loop (`loop/runner.py`) and the JSONL audit writer are now real. The
-states after `MATCHED` are crossed by `STUB_TRANSITIONS` -
-enumerated in `states/machine.py` and asserted in
-`tests/states/test_stub_transitions.py`. One of them lets a machine approve an
-invoice; delete it the moment `request_approval` exists. That is deliberate: the owner is writing
-those by hand. Do not fill them in speculatively. If a session's task genuinely
-requires one of them, say so and ask.
+The agent loop (`loop/runner.py`) and the JSONL audit writer are now real, and
+invoice state lives in Postgres (`db/store.py`); the record in memory is a
+cache. **The approval gate is real**: `APPROVAL-MATRIX@v1` decides who must
+approve, `request_approval` opens a durable request, and only a person moves an
+invoice past PENDING_APPROVAL - through `apply_human_decision` (`just decide`),
+whose events are all in `HUMAN_ONLY_EVENTS`. No stub edge crosses the gate. The
+states after APPROVED, and GL coding before it, are still crossed by
+`STUB_TRANSITIONS` - enumerated in `states/machine.py` and asserted in
+`tests/states/test_stub_transitions.py`. The owner is writing those by hand. Do
+not fill them in speculatively. If a session's task genuinely requires one of
+them, say so and ask.
 
 ## Working here
 

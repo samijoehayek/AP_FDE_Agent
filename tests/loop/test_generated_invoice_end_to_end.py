@@ -316,7 +316,7 @@ def test_a_clean_generated_invoice_resolves_its_vendor_and_gathers_the_match(
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.CLOSED
+    assert final.state is InvoiceState.PENDING_APPROVAL
     assert final.vendor_id == VENDOR_ERP_ID
     assert final.vendor_country == "US"
     assert final.vendor_match is not None
@@ -357,14 +357,13 @@ def test_the_audit_sequence_for_a_generated_invoice(
         "received",
         "matched",
         "match",
+        # GL coding is still a stub; then APPROVAL-MATRIX@v1 asks people, and
+        # the invoice waits for them.
         "stub_ok",
-        "stub_ok",
-        "stub_ok",
-        "stub_ok",
-        "stub_ok",
-        "stub_ok",
-        "stub_ok",
-        "stub_ok",
+        "requested",
+        "delivered",
+        "request_approval",
+        "halt_no_tool",
     ]
 
 
@@ -383,7 +382,7 @@ def test_only_the_moves_carry_a_destination(record: InvoiceRecord, fixture_root:
         InvoiceState.DUPLICATE_CHECKED,
         InvoiceState.MATCHED,
     ]
-    assert moves[-1] is InvoiceState.CLOSED
+    assert moves[-1] is InvoiceState.PENDING_APPROVAL
 
 
 def test_the_chain_verifies(record: InvoiceRecord, fixture_root: Path) -> None:

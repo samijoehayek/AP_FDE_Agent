@@ -27,16 +27,22 @@ from ap_agent.config import REPO_ROOT
 from ap_agent.contracts.audit import utc_now
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.db.base import create_db_engine, create_session_factory
-from ap_agent.db.store import PostgresDedupIndex, PostgresInvoiceStore
-from ap_agent.errors import APAgentError
+from ap_agent.db.store import PostgresApprovalStore, PostgresDedupIndex, PostgresInvoiceStore
+from ap_agent.errors import APAgentError, HumanDecisionError
 from ap_agent.loop.dates import resolve_date_by_receipt_window
-from ap_agent.loop.runner import DEFAULT_MAX_STEPS, RunContext, invoice_max_age_days
+from ap_agent.loop.runner import (
+    DEFAULT_MAX_STEPS,
+    RunContext,
+    apply_human_decision,
+    invoice_max_age_days,
+)
 from ap_agent.loop.runner import run as loop_run
 from ap_agent.payloads import JSON, PayloadStore, PostgresPayloadStore, parse_ref
-from ap_agent.persistence import DedupIndex, InvoiceStore
+from ap_agent.persistence import ApprovalStore, DedupIndex, InvoiceStore, UnknownInvoiceError
 from ap_agent.states.machine import (
     TERMINAL_STATES,
     TRANSITIONS,
+    InvoiceEvent,
     InvoiceState,
     allowed_events,
     is_terminal,
@@ -491,6 +497,11 @@ def dedup_index() -> DedupIndex:
     return PostgresDedupIndex(_sessions())
 
 
+def approval_store() -> ApprovalStore:
+    """The approval store ``run`` and ``decide`` use: Postgres."""
+    return PostgresApprovalStore(_sessions())
+
+
 @app.command()
 def payload(
     ref: Annotated[str, typer.Argument(help="A sha256, bare or as sha256:<hex>.")],
@@ -597,7 +608,12 @@ def run_invoice(
 
     writer = JsonlAuditWriter(audit_dir)
     ctx = RunContext(
-        run_id=str(ULID()), writer=writer, payloads=payloads, store=store, dedup=dedup_index()
+        run_id=str(ULID()),
+        writer=writer,
+        payloads=payloads,
+        store=store,
+        dedup=dedup_index(),
+        approvals=approval_store(),
     )
 
     loop_run(record, ctx, max_steps=max_steps)
@@ -617,6 +633,113 @@ def run_invoice(
     if final.validation_flags:
         typer.secho(f"validation  : {', '.join(final.validation_flags)}", fg=typer.colors.YELLOW)
     _print_explanation(final)
+    _print_approval(final, ctx.approvals)
+
+
+def _print_approval(final: InvoiceRecord, approvals: ApprovalStore) -> None:
+    """At PENDING_APPROVAL: who must approve, how many have, and how to do it.
+
+    This is ``notify``'s other half for now - the structured log event goes to
+    whatever reads logs, and this goes to the person at the terminal.
+    """
+    if final.state is not InvoiceState.PENDING_APPROVAL or final.approval_id is None:
+        return
+    view = approvals.get(final.approval_id)
+    if view is None:
+        return
+    typer.echo(
+        f"approval    : {len(view.approvals)} of {view.required_approvers} "
+        f"({view.approver_role}), request {view.approval_id}"
+    )
+    typer.secho(
+        f'to decide   : just decide {final.invoice_id} approve|reject --by <you> --reason "<why>"',
+        fg=typer.colors.YELLOW,
+    )
+
+
+DECIDE_ACTIONS: dict[str, InvoiceEvent] = {
+    "approve": InvoiceEvent.APPROVE,
+    "reject": InvoiceEvent.REJECT,
+    "cancel": InvoiceEvent.CANCEL,
+    "rematch": InvoiceEvent.REMATCH,
+    "accept": InvoiceEvent.ACCEPT_WITH_REASON,
+    "confirm-duplicate": InvoiceEvent.CONFIRM_DUPLICATE,
+    "not-duplicate": InvoiceEvent.NOT_DUPLICATE,
+}
+
+
+@app.command()
+def decide(
+    invoice_id: Annotated[str, typer.Argument(help="The invoice, as `just run` printed it.")],
+    action: Annotated[str, typer.Argument(help=f"One of: {', '.join(DECIDE_ACTIONS)}.")],
+    by: Annotated[str, typer.Option("--by", help="Who is deciding. Recorded on the row.")],
+    reason: Annotated[
+        str | None,
+        typer.Option(
+            "--reason",
+            help="Why. Required to approve, reject an approval, accept "
+            "an exception, or clear a duplicate.",
+        ),
+    ] = None,
+    audit_dir: Annotated[
+        Path, typer.Option("--audit-dir", help="Where the JSONL trail is written.")
+    ] = REPO_ROOT / "data" / "audit",
+) -> None:
+    """Record a person's decision on a waiting invoice, then carry on from it.
+
+    The only way a person's decision enters the system: the row's actor is
+    ``--by``. A vote that does not complete an approval is recorded and the
+    invoice keeps waiting. Anything that moves the invoice is followed by a run,
+    so an approved invoice goes on as far as it can - which, until create_bill
+    is real, is the stubs to CLOSED.
+    """
+    event = DECIDE_ACTIONS.get(action)
+    if event is None:
+        typer.secho(
+            f"error: {action!r} is not one of {', '.join(DECIDE_ACTIONS)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    payloads = payload_store()
+    store = invoice_store(payloads)
+    try:
+        record = store.load(invoice_id)
+    except UnknownInvoiceError as exc:
+        typer.secho(f"error: no invoice {invoice_id}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    writer = JsonlAuditWriter(audit_dir)
+    ctx = RunContext(
+        run_id=str(ULID()),
+        writer=writer,
+        payloads=payloads,
+        store=store,
+        dedup=dedup_index(),
+        approvals=approval_store(),
+    )
+    try:
+        decided = apply_human_decision(record, ctx, event=event, user_id=by, reason=reason)
+    except HumanDecisionError as exc:
+        typer.secho(f"refused     : {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    if decided.state is record.state:
+        typer.echo(f"recorded    : {ctx.events[-1].decision_basis}")
+        _print_approval(decided, ctx.approvals)
+        return
+
+    typer.echo(f"decided     : {record.state.value} -> {decided.state.value}")
+    if not is_terminal(decided.state):
+        loop_run(decided, ctx)
+    final = store.load(invoice_id)
+    colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
+    typer.secho(f"final state : {final.state.value}", fg=colour)
+    typer.echo(f"audit trail : {writer.path_for(invoice_id)}")
+    typer.echo(f"chain intact: {writer.verify(invoice_id)}")
+    _print_explanation(final)
+    _print_approval(final, ctx.approvals)
 
 
 def _print_explanation(final: InvoiceRecord) -> None:

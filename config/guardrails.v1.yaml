@@ -84,6 +84,14 @@ approval_matrix:
   # not a default somebody inherited. See DECISIONS.md 2026-09-09.
   auto_approve_max_amount: "0.00"
 
+  # Added 2026-10-05, in place. An approval can sit for days; in that time the
+  # order can be amended or closed and goods returned. A run that resumes from
+  # PENDING_APPROVAL with a snapshot older than this re-fetches the order and
+  # the receipts and re-runs the match before anything is posted; if it no
+  # longer matches, the request is cancelled and the invoice goes back to a
+  # person (APPROVAL-REFRESH@v1).
+  pending_approval_refresh_after_hours: 72
+
   # Bands by invoice total, smallest first. `max_amount: null` is the unbounded
   # top band. These apply when nothing in `rules` below overrides them.
   tiers:

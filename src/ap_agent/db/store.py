@@ -21,21 +21,32 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from ulid import ULID
 
 from ap_agent.contracts.dedup import DedupEntry
 from ap_agent.contracts.run import InvoiceRecord
+from ap_agent.db.models import Approval, ApprovalDecision, Document, Extraction, Invoice, Run
 from ap_agent.db.models import DedupEntry as DedupRow
-from ap_agent.db.models import Document, Invoice, Run
 from ap_agent.payloads import parse_ref, store_ref
-from ap_agent.persistence import NUMBER_CLAIMING_STATES, UnknownInvoiceError
+from ap_agent.persistence import (
+    NUMBER_CLAIMING_STATES,
+    ApprovalDecisionRefusedError,
+    ApprovalView,
+    UnknownInvoiceError,
+    outcome,
+)
 from ap_agent.states.machine import InvoiceState
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+    from typing import Literal
+
     from sqlalchemy.orm import Session, sessionmaker
 
+    from ap_agent.contracts.approval import ApprovalRequirement
     from ap_agent.payloads import PayloadStore
 
-__all__ = ["PostgresDedupIndex", "PostgresInvoiceStore"]
+__all__ = ["PostgresApprovalStore", "PostgresDedupIndex", "PostgresInvoiceStore"]
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,39 @@ class PostgresInvoiceStore:
                     )
                 )
 
+    def record_extraction(
+        self,
+        invoice_id: str,
+        *,
+        vision_ref: str,
+        text_ref: str | None,
+        confidence_ref: str | None,
+        auto_ok: bool | None,
+    ) -> None:
+        """Insert an extractions row. The refs are payloads already stored."""
+        with self.sessions() as session, session.begin():
+            session.execute(
+                insert(Extraction).values(
+                    extraction_id=str(ULID()),
+                    invoice_id=invoice_id,
+                    vision_ref=parse_ref(vision_ref),
+                    text_ref=parse_ref(text_ref) if text_ref else None,
+                    confidence_ref=parse_ref(confidence_ref) if confidence_ref else None,
+                    auto_ok=auto_ok,
+                )
+            )
+
+    def prior_invoice_count(self, vendor_id: str, *, excluding: str) -> int:
+        """Other invoices with this vendor, whatever their state."""
+        with self.sessions() as session:
+            return int(
+                session.execute(
+                    select(func.count())
+                    .select_from(Invoice)
+                    .where(Invoice.vendor_id == vendor_id, Invoice.invoice_id != excluding)
+                ).scalar_one()
+            )
+
     def start_run(self, run_id: str, invoice_id: str) -> None:
         """Insert the run row."""
         with self.sessions() as session, session.begin():
@@ -198,3 +242,143 @@ class PostgresDedupIndex:
                 .values(**entry.model_dump())
                 .on_conflict_do_nothing(index_elements=[DedupRow.invoice_id])
             )
+
+
+@dataclass(frozen=True)
+class PostgresApprovalStore:
+    """``approvals`` and ``approval_decisions`` in Postgres.
+
+    A decision and the status it produces are written in one transaction, with
+    the request row locked: two approvers deciding at once cannot both be the
+    one that "completed" it, and a status can never disagree with the decisions
+    it summarises.
+    """
+
+    sessions: sessionmaker[Session]
+
+    def request(  # noqa: PLR0913 - one keyword per column
+        self,
+        approval_id: str,
+        invoice_id: str,
+        requirement: ApprovalRequirement,
+        *,
+        amount: Decimal,
+        currency: str,
+        config_version: str,
+    ) -> tuple[ApprovalView, bool]:
+        """Insert the request, or find the one already under this id."""
+        with self.sessions() as session, session.begin():
+            created = (
+                session.execute(
+                    insert(Approval)
+                    .values(
+                        approval_id=approval_id,
+                        invoice_id=invoice_id,
+                        required_approvers=requirement.required_approvers,
+                        approver_role=requirement.approver_role,
+                        amount=amount,
+                        currency=currency,
+                        config_version=config_version,
+                        rule_basis=requirement.basis,
+                        status="pending",
+                    )
+                    .on_conflict_do_nothing(index_elements=[Approval.approval_id])
+                    .returning(Approval.approval_id)
+                ).scalar_one_or_none()
+                is not None
+            )
+        view = self.get(approval_id)
+        assert view is not None  # noqa: S101 - inserted or already present, one line up
+        return view, created
+
+    def get(self, approval_id: str) -> ApprovalView | None:
+        """The request and its decisions, or None."""
+        with self.sessions() as session:
+            return _view(session, approval_id)
+
+    def decide(
+        self, approval_id: str, *, user_id: str, decision: Literal["approve", "reject"], reason: str
+    ) -> ApprovalView:
+        """Record the decision and, if it completes the request, the outcome."""
+        with self.sessions() as session, session.begin():
+            row = session.execute(
+                select(Approval).where(Approval.approval_id == approval_id).with_for_update()
+            ).scalar_one()
+            if row.status != "pending":
+                msg = f"approval {approval_id} is {row.status}, not pending"
+                raise ApprovalDecisionRefusedError(msg)
+            already = session.execute(
+                select(ApprovalDecision.decided_by).where(
+                    ApprovalDecision.approval_id == approval_id,
+                    ApprovalDecision.decided_by == user_id,
+                )
+            ).first()
+            if already is not None:
+                msg = f"{user_id} has already decided approval {approval_id}"
+                raise ApprovalDecisionRefusedError(msg)
+            session.execute(
+                insert(ApprovalDecision).values(
+                    decision_id=str(ULID()),
+                    approval_id=approval_id,
+                    decided_by=user_id,
+                    decision=decision,
+                    reason=reason,
+                )
+            )
+            view = _view(session, approval_id)
+            assert view is not None  # noqa: S101 - locked above
+            if view.status != "pending":
+                session.execute(
+                    update(Approval)
+                    .where(Approval.approval_id == approval_id)
+                    .values(
+                        status=view.status,
+                        decided_at=func.now(),
+                        decided_by=user_id,
+                        decision=decision,
+                        reason=reason,
+                    )
+                )
+        final = self.get(approval_id)
+        assert final is not None  # noqa: S101
+        return final
+
+    def cancel(self, approval_id: str, *, by: str, reason: str) -> None:
+        """Withdraw a pending request. ``by`` names the rule that superseded it."""
+        with self.sessions() as session, session.begin():
+            session.execute(
+                update(Approval)
+                .where(Approval.approval_id == approval_id, Approval.status == "pending")
+                .values(status="cancelled", decided_at=func.now(), decided_by=by, reason=reason)
+            )
+
+
+def _view(session: Session, approval_id: str) -> ApprovalView | None:
+    """Build the view from the request row and its decision rows."""
+    row = session.execute(
+        select(Approval).where(Approval.approval_id == approval_id)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    decisions = session.execute(
+        select(ApprovalDecision.decided_by, ApprovalDecision.decision)
+        .where(ApprovalDecision.approval_id == approval_id)
+        .order_by(ApprovalDecision.decided_at, ApprovalDecision.decision_id)
+    ).all()
+    approvals = tuple(user for user, decision in decisions if decision == "approve")
+    rejected_by = next((user for user, decision in decisions if decision == "reject"), None)
+    status = (
+        row.status
+        if row.status == "cancelled"
+        else outcome(row.required_approvers, len(approvals), rejected_by is not None)
+    )
+    return ApprovalView(
+        approval_id=row.approval_id,
+        invoice_id=row.invoice_id,
+        requested_at=row.requested_at,
+        required_approvers=row.required_approvers,
+        approver_role=row.approver_role,
+        status=status,
+        approvals=approvals,
+        rejected_by=rejected_by,
+    )

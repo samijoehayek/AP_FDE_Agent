@@ -13,6 +13,7 @@ details, free-form instructions) from riding into trusted code on a payload.
 
 from __future__ import annotations
 
+from ap_agent.contracts.approval import ApprovalRequirement
 from ap_agent.contracts.audit import (
     GENESIS_HASH,
     Actor,
@@ -117,6 +118,7 @@ __all__ = [
     "ActorKind",
     "AmbiguousNumber",
     "ApprovalMatrix",
+    "ApprovalRequirement",
     "ApprovalRule",
     "ApprovalTier",
     "ArithmeticFlag",

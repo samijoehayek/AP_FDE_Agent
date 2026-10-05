@@ -87,6 +87,11 @@ class ActionKind(StrEnum):
     STUB = "stub"
     """A step whose tool does not exist yet. Advances the state and records that."""
 
+    APPROVAL_REFRESH = "approval_refresh"
+    """Not a tool. The rule that decides whether a waiting approval's snapshot is stale,
+    and re-fetches and re-matches if so. Attributing that to ``compute_match`` would
+    name one of its inputs as the decider."""
+
     HUMAN_DECISION = "human_decision"
     """A person acting on a held invoice. Not a tool and never chosen by ``decide``.
 
@@ -321,6 +326,32 @@ class InvoiceRecord(StrictModel):
         max_length=500,
         description="Why the explanation was refused or never produced, when it was. The "
         "invoice reaches a person either way; this says what the queue item lacks.",
+    )
+    duplicate_of: str | None = Field(
+        default=None,
+        max_length=26,
+        description="The earlier invoice DEDUP@v1 matched, when it held this one.",
+    )
+    duplicate_rule: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Which duplicate rule held it: exact_number, near_number or same_amount.",
+    )
+    approval_id: str | None = Field(
+        default=None,
+        max_length=26,
+        description="The open approvals row, once APPROVAL-MATRIX@v1 has requested one.",
+    )
+    approval_round: int = Field(
+        default=0,
+        ge=0,
+        description="Incremented when a request is cancelled, so the next request for the "
+        "same invoice gets a new idempotency key rather than finding the cancelled one.",
+    )
+    snapshot_taken_at: AwareDatetime | None = Field(
+        default=None,
+        description="When the order and receipts behind the current match were fetched, as of "
+        "the approval request. APPROVAL-REFRESH@v1 measures staleness from here.",
     )
     rematch_count: int = Field(
         default=0,

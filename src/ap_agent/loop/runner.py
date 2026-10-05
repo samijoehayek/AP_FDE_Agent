@@ -57,6 +57,7 @@ from ap_agent.errors import (
     HumanDecisionError,
     IllegalTransition,
 )
+from ap_agent.guardrails.approval import approval_requirement
 from ap_agent.guardrails.config import load_guardrails
 from ap_agent.guardrails.output_filter import screen_extraction
 from ap_agent.logging import get_logger
@@ -67,7 +68,11 @@ from ap_agent.payloads import (
     store_ref,
 )
 from ap_agent.persistence import (
+    CURRENT_APPROVAL_STORE,
+    ApprovalDecisionRefusedError,
+    ApprovalStore,
     DedupIndex,
+    InMemoryApprovalStore,
     InMemoryDedupIndex,
     InvoiceStore,
 )
@@ -133,6 +138,12 @@ from ap_agent.tools.lookup_vendor import (
     LookupVendorOutput,
     lookup_vendor,
 )
+from ap_agent.tools.notify import NotifyInput, NotifyOutput, notify
+from ap_agent.tools.request_approval import (
+    RequestApprovalInput,
+    RequestApprovalOutput,
+    request_approval,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -161,6 +172,8 @@ RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
 MATCH_RULE_ID = "MATCH@v1"
 CLASSIFY_RULE_ID = "CLASSIFY@v1"
 DEDUP_RULE_ID = "DEDUP@v1"
+APPROVAL_RULE_ID = "APPROVAL-MATRIX@v1"
+APPROVAL_REFRESH_RULE_ID = "APPROVAL-REFRESH@v1"
 STUB_RULE_ID = "STUB"
 
 HALT_NO_TOOL = "halt_no_tool"
@@ -189,8 +202,12 @@ MAX_ERROR_CHARS = 2000
 NO_SECOND_READ = "no_second_read"
 """Recorded when the document had no text layer, so only one model read it."""
 
-DEFAULT_MAX_STEPS = 15
-"""Enough for the whole stubbed happy path (14 steps) and no more.
+DEFAULT_MAX_STEPS = 9
+"""Enough for the longest stretch the loop walks on its own (8 steps) and no more.
+
+That stretch is RECEIVED to PENDING_APPROVAL. Approval is a person now, so no
+run goes from intake to CLOSED in one go: the walk after approval is a separate
+run, and a shorter one.
 
 A budget is not optional. An agent that can loop forever will eventually loop
 forever on the invoice that costs the most tokens.
@@ -256,6 +273,16 @@ def _default_find_duplicates(payload: FindDuplicatesInput) -> FindDuplicatesOutp
     return find_duplicates(payload)
 
 
+def _default_request_approval(payload: RequestApprovalInput) -> RequestApprovalOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`."""
+    return request_approval(payload)
+
+
+def _default_notify(payload: NotifyInput) -> NotifyOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`."""
+    return notify(payload)
+
+
 def _default_classify(payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
     """Dispatch through the module attribute. See :func:`_default_ingest`."""
     return classify_exception(payload)
@@ -295,6 +322,12 @@ class RunContext:
     find_duplicates: Callable[[FindDuplicatesInput], FindDuplicatesOutput] = (
         _default_find_duplicates
     )
+    approvals: ApprovalStore = field(default_factory=InMemoryApprovalStore)
+    """Durable approval requests and decisions. ``just run`` passes Postgres."""
+    request_approval: Callable[[RequestApprovalInput], RequestApprovalOutput] = (
+        _default_request_approval
+    )
+    notify: Callable[[NotifyInput], NotifyOutput] = _default_notify
     """Where every ``output_ref`` is stored. In memory unless the caller says
     otherwise; ``just run`` passes the Postgres store."""
     now: Callable[[], datetime] = utc_now
@@ -371,15 +404,16 @@ class StepTrail:
         latency_ms: int | None,
         retry_count: int = 0,
         basis: str | None = None,
-    ) -> None:
-        """Write a model row, priced from the versioned list."""
+    ) -> str:
+        """Write a model row, priced from the versioned list. Returns its output_ref."""
+        ref = self.ref(output)
         self.call(
             ToolCallRecord(
                 kind=kind,
                 by="model",
                 event_type=AuditEventType.MODEL_CALL,
                 summary=summary,
-                output_ref=self.ref(output),
+                output_ref=ref,
                 result_summary=f"pricing={_pricing_version()}",
                 model_id=model_id,
                 prompt_version=prompt_version,
@@ -390,6 +424,7 @@ class StepTrail:
                 basis=basis,
             )
         )
+        return ref
 
     def failed(self, kind: ActionKind, by: Literal["rule", "model"], exc: Exception) -> None:
         """Write the row for a call that raised, naming the tool that raised it."""
@@ -472,6 +507,14 @@ def decide(record: InvoiceRecord) -> Action:  # noqa: PLR0911 - one arm per stat
             return Action(kind=ActionKind.LOOKUP_VENDOR, by="rule", rule_id=RESOLVE_VENDOR_RULE_ID)
         case InvoiceState.VENDOR_RESOLVED:
             return Action(kind=ActionKind.FIND_DUPLICATES, by="rule", rule_id=DEDUP_RULE_ID)
+        case InvoiceState.CODED:
+            return Action(kind=ActionKind.REQUEST_APPROVAL, by="rule", rule_id=APPROVAL_RULE_ID)
+        case InvoiceState.PENDING_APPROVAL:
+            # Waits for people. Each resume checks whether the snapshot they
+            # are approving has gone stale while they waited.
+            return Action(
+                kind=ActionKind.APPROVAL_REFRESH, by="rule", rule_id=APPROVAL_REFRESH_RULE_ID
+            )
         case InvoiceState.EXCEPTION:
             # The one way out of EXCEPTION. The seat explains; the rule routes
             # to a person whatever the seat says, or fails to say.
@@ -620,6 +663,12 @@ def apply(  # noqa: PLR0911 - one arm per action kind
         case ActionKind.FIND_DUPLICATES:
             return _dedup_step(record, ctx, trail)
 
+        case ActionKind.REQUEST_APPROVAL:
+            return _request_approval_step(record, ctx, trail)
+
+        case ActionKind.APPROVAL_REFRESH:
+            return _approval_refresh_step(record, ctx, trail)
+
         case _:
             return _stub_step(record)
 
@@ -712,7 +761,7 @@ def _read_and_score(
     vision = _call(trail, ActionKind.EXTRACT_INVOICE_VISION, "model", ctx.extract)(
         ExtractInvoiceVisionInput(path=record.source_path)
     )
-    trail.model_call(
+    vision_ref = trail.model_call(
         ActionKind.EXTRACT_INVOICE_VISION,
         vision,
         summary="read",
@@ -728,7 +777,7 @@ def _read_and_score(
     text = _call(trail, ActionKind.EXTRACT_INVOICE_TEXT, "model", ctx.extract_text)(
         ExtractInvoiceTextInput(path=record.source_path)
     )
-    trail.model_call(
+    text_ref = trail.model_call(
         ActionKind.EXTRACT_INVOICE_TEXT,
         text,
         summary="read" if text.second_read else NO_SECOND_READ,
@@ -777,6 +826,17 @@ def _read_and_score(
             result_summary=f"fields={len(verdict.fields)}, needs_human={len(verdict.needs_human)}",
         )
     )
+
+    if ctx.store is not None:
+        # Which readings, by payload ref, and what the check made of them. The
+        # text seat's ref is kept only when it actually read something.
+        ctx.store.record_extraction(
+            str(record.invoice_id),
+            vision_ref=vision_ref,
+            text_ref=text_ref if text.second_read is not None else None,
+            confidence_ref=trail.ref(verdict),
+            auto_ok=verdict.auto_ok,
+        )
 
     event = InvoiceEvent.EXTRACT if verdict.auto_ok else InvoiceEvent.EXTRACTION_FAILED
     return (
@@ -1154,6 +1214,12 @@ def _dedup_step(
     ctx.dedup.add(entry)
 
     event = InvoiceEvent.DUPLICATE_SUSPECTED if out.rule else InvoiceEvent.CHECK_DUPLICATES
+    record = record.model_copy(
+        update={
+            "duplicate_of": out.candidate_invoice_id,
+            "duplicate_rule": out.rule.value if out.rule else None,
+        }
+    )
     return record, StepResult(
         event=event.value,
         output_ref=trail.ref(out),
@@ -1170,6 +1236,277 @@ def _dedup_basis(out: FindDuplicatesOutput) -> str:
         f"rule={out.rule.value}, candidate={out.candidate_invoice_id}, "
         f"similarity={out.similarity}, candidates={out.candidates_compared}"
     )[:MAX_BASIS_CHARS]
+
+
+def _request_approval_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """``APPROVAL-MATRIX@v1``: work out who must approve, open the request, tell them.
+
+    The requirement is computed from the matrix and the invoice's facts - its
+    amount and currency, whether the vendor resolved, whether this is the
+    vendor's first invoice, a remit-to mismatch, an exception a person accepted
+    - and recorded as an ``approvals`` row by ``request_approval``. ``notify``
+    tells the role. The decision row's basis is the matrix's working, with the
+    rule id and the amount compared.
+
+    The snapshot the approvers will be signing off - order, receipts, match -
+    is stamped now, so APPROVAL-REFRESH@v1 can tell later whether it has gone
+    stale while they waited.
+
+    Whether this is the vendor's first invoice needs the store; without one
+    (tests) the answer is "unknown", treated as yes - the conservative reading.
+    """
+    config = load_guardrails()
+    extraction = record.extraction
+    if extraction is None:  # unreachable on the real path; held rather than raised
+        return record, StepResult(
+            event=InvoiceEvent.REQUEST_APPROVAL.value, decision_basis="no extraction to approve"
+        )
+    vendor_id = record.vendor_id
+    first_invoice = (
+        ctx.store.prior_invoice_count(vendor_id, excluding=str(record.invoice_id)) == 0
+        if ctx.store is not None and vendor_id is not None
+        else True
+    )
+    requirement = approval_requirement(
+        config.approval_matrix,
+        base_currency=config.base_currency,
+        config_version=config.config_version,
+        amount=extraction.total,
+        currency=extraction.currency,
+        vendor_resolved=vendor_id is not None,
+        first_invoice_from_vendor=first_invoice,
+        remit_to_mismatch=bool(
+            record.vendor_match and record.vendor_match.remit_to_matches_master is False
+        ),
+        match_exception=bool(record.match_result and record.match_result.reason_codes),
+    )
+
+    key = f"{record.invoice_id}:approval:{record.approval_round}"
+    token = CURRENT_APPROVAL_STORE.set(ctx.approvals)
+    try:
+        opened = _call(trail, ActionKind.REQUEST_APPROVAL, "rule", ctx.request_approval)(
+            RequestApprovalInput(
+                idempotency_key=key,
+                invoice_id=str(record.invoice_id),
+                requirement=requirement,
+                config_version=config.config_version,
+            )
+        )
+    finally:
+        CURRENT_APPROVAL_STORE.reset(token)
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.REQUEST_APPROVAL,
+            by="rule",
+            event_type=AuditEventType.APPROVAL_REQUESTED,
+            summary="already_requested" if opened.already_existed else "requested",
+            output_ref=trail.ref(opened),
+            result_summary=f"approval_id={opened.approval_id}",
+            basis=(
+                f"approval_id={opened.approval_id}, required={opened.required_approvers}, "
+                f"role={opened.approver_role}"
+            ),
+        )
+    )
+
+    told = _call(trail, ActionKind.NOTIFY, "rule", ctx.notify)(
+        NotifyInput(
+            idempotency_key=f"{key}:notify",
+            recipient_user_id=requirement.approver_role,
+            template_id="approval_requested",
+            template_vars={
+                "approval_id": opened.approval_id,
+                "required": str(requirement.required_approvers),
+                "amount": f"{requirement.amount} {requirement.currency}",
+            },
+            invoice_id=str(record.invoice_id),
+        )
+    )
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.NOTIFY,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="delivered" if told.delivered else "not_delivered",
+            output_ref=trail.ref(told),
+            result_summary=f"channel={told.channel}, recipient={requirement.approver_role}",
+        )
+    )
+
+    return (
+        record.model_copy(
+            update={"approval_id": opened.approval_id, "snapshot_taken_at": ctx.now()}
+        ),
+        StepResult(
+            event=InvoiceEvent.REQUEST_APPROVAL.value,
+            output_ref=trail.ref(requirement),
+            result_summary=f"approval_id={opened.approval_id}",
+            decision_basis=requirement.basis,
+        ),
+    )
+
+
+def _approval_refresh_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """``APPROVAL-REFRESH@v1``: is the snapshot the approvers are signing still true?
+
+    Fresh enough, and the invoice simply goes on waiting - the row says how many
+    approvals it has and when the snapshot will be checked again. Older than
+    ``pending_approval_refresh_after_hours``: the order and receipts are fetched
+    again and the match re-run.
+
+    * **Still holds** - no reason code the approvers did not already see. The
+      fresher snapshot replaces the old one and the invoice keeps waiting.
+    * **No longer holds** - a new reason code, or the order gone. The request is
+      cancelled (people cannot approve numbers that are no longer true) and the
+      invoice goes to EXCEPTION, where CLASSIFY@v1 hands it back to a person.
+    """
+    matrix = load_guardrails().approval_matrix
+    threshold = timedelta(hours=matrix.pending_approval_refresh_after_hours)
+    view = ctx.approvals.get(record.approval_id) if record.approval_id else None
+    progress = (
+        f"approval_id={record.approval_id}, approvals={len(view.approvals)} of "
+        f"{view.required_approvers}"
+        if view
+        else "approval_id=none"
+    )
+    taken = record.snapshot_taken_at
+    age = ctx.now() - taken if taken is not None else None
+    order = record.purchase_order
+
+    if age is None or age < threshold or order is None:
+        hours = f"{age.total_seconds() / 3600:.1f}h" if age is not None else "unknown"
+        why = (
+            "no purchase order to refresh"
+            if order is None and age is not None and age >= threshold
+            else f"snapshot age {hours} < {matrix.pending_approval_refresh_after_hours}h"
+        )
+        return record, StepResult(
+            event=InvoiceEvent.STUB_OK.value,
+            decision_basis=f"rule={APPROVAL_REFRESH_RULE_ID}, awaiting approval, {progress}, {why}",
+        )
+
+    fresh_order, received, result = _refetch(record, ctx, trail, order.po_number)
+    old_codes: set[ReasonCode] = (
+        set(record.match_result.reason_codes) if record.match_result else set()
+    )
+    new_codes = set(result.reason_codes) if result is not None else {ReasonCode.PO_NOT_FOUND}
+    added = sorted(code.value for code in new_codes - old_codes)
+    hours = f"{age.total_seconds() / 3600:.1f}h"
+    if not added:
+        return (
+            record.model_copy(
+                update={
+                    "purchase_order": fresh_order,
+                    "receipts": received,
+                    "match_result": result,
+                    "snapshot_taken_at": ctx.now(),
+                }
+            ),
+            StepResult(
+                event=InvoiceEvent.STUB_OK.value,
+                output_ref=trail.ref(result) if result else None,
+                decision_basis=(
+                    f"rule={APPROVAL_REFRESH_RULE_ID}, snapshot age {hours} refreshed, "
+                    f"still holds, awaiting approval, {progress}"
+                ),
+            ),
+        )
+
+    if record.approval_id:
+        ctx.approvals.cancel(
+            record.approval_id,
+            by=f"rule:{APPROVAL_REFRESH_RULE_ID}",
+            reason=f"match changed: {'|'.join(added)}",
+        )
+    return (
+        record.model_copy(
+            update={
+                "purchase_order": fresh_order,
+                "receipts": received,
+                "match_result": result,
+                "approval_id": None,
+                "approval_round": record.approval_round + 1,
+                "snapshot_taken_at": None,
+            }
+        ),
+        StepResult(
+            event=InvoiceEvent.MATCH_CHANGED.value,
+            output_ref=trail.ref(result) if result else None,
+            decision_basis=(
+                f"rule={APPROVAL_REFRESH_RULE_ID}, snapshot age {hours}, match changed: "
+                f"new={'|'.join(added)}, approval {record.approval_id} cancelled, "
+                f"back to a person"
+            ),
+        ),
+    )
+
+
+def _refetch(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail, po_number: str
+) -> tuple[PurchaseOrder | None, ReceiptSet | None, MatchResult | None]:
+    """Fetch the order and its receipts again and re-run the match, one row per call.
+
+    The order alone when it is the only thing that can be fetched; no match
+    without an order and an extraction.
+    """
+    fetched = _call(trail, ActionKind.GET_PURCHASE_ORDER, "rule", ctx.get_purchase_order)(
+        GetPurchaseOrderInput(po_number=po_number)
+    )
+    order = fetched.purchase_order
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.GET_PURCHASE_ORDER,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="found" if order else "not_found",
+            output_ref=trail.ref(order) if order else trail.ref(f"po_not_found:{po_number}"),
+            result_summary=f"po_number={po_number}",
+            latency_ms=fetched.latency_ms,
+        )
+    )
+    if order is None or record.extraction is None:
+        return order, None, None
+
+    got = _call(trail, ActionKind.GET_RECEIPTS, "rule", ctx.get_receipts)(
+        GetReceiptsInput(po_number=po_number)
+    )
+    receipts = got.receipts
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.GET_RECEIPTS,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="nothing_received" if receipts.is_empty else "received",
+            output_ref=trail.ref(receipts),
+            result_summary=f"lines={len(receipts.lines)}",
+            latency_ms=got.latency_ms,
+        )
+    )
+    matched = _call(trail, ActionKind.COMPUTE_MATCH, "rule", ctx.compute_match)(
+        ComputeMatchInput(
+            invoice_id=str(record.invoice_id),
+            extraction=record.extraction,
+            purchase_orders=[order],
+            receipts=[receipts],
+            config_version=guardrails_version(),
+        )
+    )
+    result = matched.result
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.COMPUTE_MATCH,
+            by="rule",
+            event_type=AuditEventType.TOOL_CALL,
+            summary="matched" if result.matched else "exception",
+            output_ref=trail.ref(result),
+            result_summary=f"po_number={po_number}, lines={len(result.lines)}",
+        )
+    )
+    return order, receipts, result
 
 
 def _match_prep_step(
@@ -1521,7 +1858,31 @@ def _classify_basis(
     return ", ".join(parts)[:MAX_BASIS_CHARS]
 
 
-def apply_human_decision(
+_HUMAN_DOORS: dict[InvoiceState, frozenset[InvoiceEvent]] = {
+    InvoiceState.PENDING_HUMAN: frozenset(
+        {
+            InvoiceEvent.REMATCH,
+            InvoiceEvent.ACCEPT_WITH_REASON,
+            InvoiceEvent.REJECT,
+            InvoiceEvent.CANCEL,
+        }
+    ),
+    InvoiceState.ON_HOLD_DUPLICATE: frozenset(
+        {InvoiceEvent.CONFIRM_DUPLICATE, InvoiceEvent.NOT_DUPLICATE, InvoiceEvent.CANCEL}
+    ),
+    InvoiceState.PENDING_APPROVAL: frozenset(
+        {InvoiceEvent.APPROVE, InvoiceEvent.REJECT, InvoiceEvent.CANCEL}
+    ),
+}
+"""Which decisions a person may make in which waiting state."""
+
+_REASON_REQUIRED: frozenset[InvoiceEvent] = frozenset(
+    {InvoiceEvent.ACCEPT_WITH_REASON, InvoiceEvent.NOT_DUPLICATE, InvoiceEvent.APPROVE}
+)
+"""Overriding a rule, clearing a duplicate, approving a payment: each needs words."""
+
+
+def apply_human_decision(  # noqa: PLR0912, PLR0915 - one branch per door
     record: InvoiceRecord,
     ctx: RunContext,
     *,
@@ -1529,43 +1890,63 @@ def apply_human_decision(
     user_id: str,
     reason: str | None = None,
 ) -> InvoiceRecord:
-    """Apply a person's decision on a held invoice, and write the row that says so.
+    """Apply a person's decision on a waiting invoice, and write the row that says so.
 
     The only way to fire a ``HUMAN_ONLY_EVENTS`` event; the loop refuses them.
-    Today it serves PENDING_HUMAN, the queue the explanation seat feeds:
+    Three doors:
 
-    * ``rematch`` - back to DUPLICATE_CHECKED after a data refresh, so the next
-      ``run`` fetches the order and receipts again and re-matches. Counted
-      against ``loop_limits.max_rematches``; the stale explanation is cleared.
-    * ``accept_with_reason`` - to MATCHED. The written reason is required and
-      goes on the row: a person overriding the rules must say why, in words
-      the next reviewer can read.
-    * ``reject`` and ``cancel`` - terminal. A reason is optional.
+    * **PENDING_HUMAN** - ``rematch`` (bounded by ``loop_limits.max_rematches``;
+      the stale explanation is cleared), ``accept_with_reason`` to MATCHED
+      (reason required), ``reject``, ``cancel``.
+    * **ON_HOLD_DUPLICATE** - ``confirm_duplicate`` to REJECTED, with the
+      earlier invoice's id on the row; ``not_duplicate`` to DUPLICATE_CHECKED,
+      reason required, refused for an exact number match (the database holds one
+      invoice per number); ``cancel``.
+    * **PENDING_APPROVAL** - ``approve`` (reason required) and ``reject``
+      (reason required, as every decision row needs one), recorded in
+      ``approval_decisions``. The invoice moves only when the request completes:
+      the first reject rejects it, enough distinct approvers approve it. A vote
+      that does not complete it writes a row and leaves the state alone.
+      ``cancel`` withdraws the request.
 
-    The row's actor is the person. Returns the record in its new state; the
+    The row's actor is the person. Returns the record as it now stands; the
     caller runs the loop again if there is more to do.
 
     Raises:
-        HumanDecisionError: Not a human event, not PENDING_HUMAN, no user, an
-            acceptance with no reason, or the re-match limit spent. Raised before
+        HumanDecisionError: Not a human event, not a door it opens, no user, a
+            missing reason, the re-match limit spent, a second vote from one
+            person, or an exact duplicate declared not one. Raised before
             anything is written - nothing changed, so there is nothing to record.
     """
     if event not in HUMAN_ONLY_EVENTS:
         msg = f"{event.value} is not a decision a person makes"
         raise HumanDecisionError(msg)
-    if record.state is not InvoiceState.PENDING_HUMAN:
-        msg = f"a person acts on PENDING_HUMAN; this invoice is {record.state.value}"
+    doors = _HUMAN_DOORS.get(record.state)
+    if doors is None:
+        msg = (
+            "a person acts on PENDING_HUMAN, ON_HOLD_DUPLICATE or PENDING_APPROVAL; "
+            f"this invoice is {record.state.value}"
+        )
         raise HumanDecisionError(msg)
-    if not user_id.strip():
+    if event not in doors:
+        msg = f"{event.value} is not a decision on {record.state.value}"
+        raise HumanDecisionError(msg)
+    user = user_id.strip()
+    if not user:
         msg = "a human decision must name who made it"
         raise HumanDecisionError(msg)
     text = (reason or "").strip()
-    if event is InvoiceEvent.ACCEPT_WITH_REASON and not text:
-        msg = "accept_with_reason needs a written reason"
+    approving_reject = (
+        record.state is InvoiceState.PENDING_APPROVAL and event is InvoiceEvent.REJECT
+    )
+    if (event in _REASON_REQUIRED or approving_reject) and not text:
+        msg = f"{event.value} needs a written reason"
         raise HumanDecisionError(msg)
 
     config = load_guardrails()
     update: dict[str, object] = {}
+    basis = f"reason={text or 'none'}"
+
     if event is InvoiceEvent.REMATCH:
         limit = config.loop_limits.max_rematches
         if record.rematch_count >= limit:
@@ -1574,15 +1955,54 @@ def apply_human_decision(
         count = record.rematch_count + 1
         update = {"rematch_count": count, "classification": None, "classification_rejected": None}
         basis = f"rematch={count} of {limit}, config_version={config.config_version}"
-    else:
-        basis = f"reason={text or 'none'}"
+    elif record.state is InvoiceState.ON_HOLD_DUPLICATE:
+        if event is InvoiceEvent.NOT_DUPLICATE and record.duplicate_rule == "exact_number":
+            msg = (
+                f"same vendor and invoice number as {record.duplicate_of}: the database keeps "
+                "one invoice per number, so confirm one of them as the duplicate"
+            )
+            raise HumanDecisionError(msg)
+        basis = (
+            f"candidate={record.duplicate_of}, rule={record.duplicate_rule}, "
+            f"reason={text or 'none'}"
+        )
+    elif record.state is InvoiceState.PENDING_APPROVAL:
+        if record.approval_id is None:
+            msg = "no approval request on this invoice"
+            raise HumanDecisionError(msg)
+        if event is InvoiceEvent.CANCEL:
+            ctx.approvals.cancel(record.approval_id, by=f"user:{user}", reason=text or "cancelled")
+        else:
+            vote: Literal["approve", "reject"] = (
+                "approve" if event is InvoiceEvent.APPROVE else "reject"
+            )
+            try:
+                view = ctx.approvals.decide(
+                    record.approval_id, user_id=user, decision=vote, reason=text
+                )
+            except ApprovalDecisionRefusedError as exc:
+                raise HumanDecisionError(str(exc)) from exc
+            basis = (
+                f"approval_id={record.approval_id}, {vote}, approvals={len(view.approvals)} of "
+                f"{view.required_approvers}, status={view.status}, reason={text}"
+            )
+            if view.status == "pending":
+                # Counted, but not enough yet: the row is the record of the vote.
+                _write(
+                    ctx,
+                    record,
+                    Action(kind=ActionKind.HUMAN_DECISION, by="human", user_id=user),
+                    StepResult(event=event.value, decision_basis=basis[:MAX_BASIS_CHARS]),
+                    StepTransition(record.state, None, AuditEventType.HUMAN_DECISION),
+                )
+                return record
 
     to_state = transition(record.state, event.value)
     updated = record.model_copy(update=update)
     _write(
         ctx,
         updated,
-        Action(kind=ActionKind.HUMAN_DECISION, by="human", user_id=user_id.strip()),
+        Action(kind=ActionKind.HUMAN_DECISION, by="human", user_id=user),
         StepResult(event=event.value, decision_basis=basis[:MAX_BASIS_CHARS]),
         StepTransition(record.state, to_state),
     )
@@ -1632,6 +2052,8 @@ _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
         ActionKind.INGEST_DOCUMENT,
         ActionKind.CLASSIFY_EXCEPTION,
         ActionKind.FIND_DUPLICATES,
+        ActionKind.REQUEST_APPROVAL,
+        ActionKind.APPROVAL_REFRESH,
         ActionKind.VALIDATE,
         ActionKind.STUB,
         ActionKind.MATCH_PREP,
@@ -1834,6 +2256,10 @@ def _advance(
             to_state = transition(from_state, result.event)
         except IllegalTransition as exc:
             _write(ctx, record, action, *_halt(from_state, result, exc))
+            if ctx.store is not None:
+                # The state does not move, but what the step learned is kept -
+                # a refreshed approval snapshot, for one.
+                ctx.store.save(record)
             progress.last_step = HALT_NO_TOOL
             log.info("awaiting_human", invoice_id=str(record.invoice_id), state=from_state.value)
             return record
@@ -1878,7 +2304,8 @@ def _halt(
             result.model_copy(
                 update={
                     "event": HALT_NO_TOOL,
-                    "decision_basis": f"no tool for the step after {from_state.value}",
+                    "decision_basis": result.decision_basis
+                    or f"no tool for the step after {from_state.value}",
                 }
             ),
             StepTransition(from_state, None, AuditEventType.HALT),

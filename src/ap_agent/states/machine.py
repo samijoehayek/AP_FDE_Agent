@@ -73,7 +73,7 @@ class InvoiceEvent(StrEnum):
     VENDOR_ONBOARDED = "vendor_onboarded"
     CHECK_DUPLICATES = "check_duplicates"
     DUPLICATE_SUSPECTED = "duplicate_suspected"
-    DUPLICATE_CLEARED = "duplicate_cleared"
+    NOT_DUPLICATE = "not_duplicate"
     CONFIRM_DUPLICATE = "confirm_duplicate"
     MATCH = "match"
     MATCH_EXCEPTION = "match_exception"
@@ -83,6 +83,7 @@ class InvoiceEvent(StrEnum):
     NO_PO_REFERENCE = "no_po_reference"
     CODE = "code"
     REQUEST_APPROVAL = "request_approval"
+    MATCH_CHANGED = "match_changed"
     APPROVE = "approve"
     REQUEST_CHANGES = "request_changes"
     POST = "post"
@@ -142,7 +143,9 @@ TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     # --- duplicates -------------------------------------------------------
     (_S.VENDOR_RESOLVED, _E.CHECK_DUPLICATES): _S.DUPLICATE_CHECKED,
     (_S.VENDOR_RESOLVED, _E.DUPLICATE_SUSPECTED): _S.ON_HOLD_DUPLICATE,
-    (_S.ON_HOLD_DUPLICATE, _E.DUPLICATE_CLEARED): _S.DUPLICATE_CHECKED,
+    # A person judges a held duplicate: not a duplicate (with a reason) and it
+    # goes on to the match; a duplicate, and it is rejected.
+    (_S.ON_HOLD_DUPLICATE, _E.NOT_DUPLICATE): _S.DUPLICATE_CHECKED,
     (_S.ON_HOLD_DUPLICATE, _E.CONFIRM_DUPLICATE): _S.REJECTED,
     # --- matching ---------------------------------------------------------
     (_S.DUPLICATE_CHECKED, _E.MATCH): _S.MATCHED,
@@ -166,6 +169,10 @@ TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     (_S.CODED, _E.REQUEST_APPROVAL): _S.PENDING_APPROVAL,
     (_S.PENDING_APPROVAL, _E.APPROVE): _S.APPROVED,
     (_S.PENDING_APPROVAL, _E.REQUEST_CHANGES): _S.EXCEPTION,
+    # APPROVAL-REFRESH@v1: the approval waited long enough for the order or the
+    # receipts to change, and the re-run match no longer holds. The request is
+    # cancelled and the invoice goes back through a person.
+    (_S.PENDING_APPROVAL, _E.MATCH_CHANGED): _S.EXCEPTION,
     (_S.PENDING_APPROVAL, _E.REJECT): _S.REJECTED,
     # --- posting and payment ---------------------------------------------
     (_S.APPROVED, _E.POST): _S.POSTED,
@@ -203,12 +210,21 @@ this pipeline may quietly rewrite.
 TRANSITIONS.update({(state, _E.CANCEL): _S.CANCELLED for state in _CANCELLABLE})
 
 HUMAN_ONLY_EVENTS: frozenset[InvoiceEvent] = frozenset(
-    {_E.REMATCH, _E.ACCEPT_WITH_REASON, _E.REJECT, _E.CANCEL}
+    {
+        _E.REMATCH,
+        _E.ACCEPT_WITH_REASON,
+        _E.REJECT,
+        _E.CANCEL,
+        _E.APPROVE,
+        _E.CONFIRM_DUPLICATE,
+        _E.NOT_DUPLICATE,
+    }
 )
 """Events only a person may fire. The loop refuses them from any rule or model.
 
-These are every way out of PENDING_HUMAN. The table says which moves exist; this
-says who may make them. A rule that emitted ``accept_with_reason`` would be the
+These are every way out of PENDING_HUMAN and ON_HOLD_DUPLICATE, and every way
+out of PENDING_APPROVAL that is a decision. The table says which moves exist;
+this says who may make them. A rule that emitted ``accept_with_reason`` would be the
 system approving its own exception, which the architecture forbids by name.
 """
 
@@ -221,14 +237,6 @@ STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     (_S.NON_PO, _E.STUB_OK): _S.CODED,
     # TEMP STUB: GL coding is not implemented (propose_gl_coding).
     (_S.MATCHED, _E.STUB_OK): _S.CODED,
-    # TEMP STUB: approval routing is not implemented (request_approval).
-    (_S.CODED, _E.STUB_OK): _S.PENDING_APPROVAL,
-    # TEMP STUB: THE DANGEROUS ONE. This lets a machine approve an invoice with
-    # no human anywhere near it, which is the single thing this system exists to
-    # prevent. It is here only so the happy path can be exercised end to end
-    # before request_approval is written. Delete it the moment approvals are
-    # real, and never ship it.
-    (_S.PENDING_APPROVAL, _E.STUB_OK): _S.APPROVED,
     # TEMP STUB: the ERP write is not implemented (create_bill).
     (_S.APPROVED, _E.STUB_OK): _S.POSTED,
     # TEMP STUB: payment scheduling is not implemented (mark_ready_for_payment).

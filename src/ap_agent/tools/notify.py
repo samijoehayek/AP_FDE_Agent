@@ -1,36 +1,41 @@
-"""Send a message to a person.
+"""Tell a person something is waiting for them.
 
 Caller: code. The orchestrator calls this; no model can.
 Side effects: NOTIFICATION.
 
-The only tool that produces something a human outside the system sees, which
-makes it the one worth being careful with. Two constraints follow from that:
+**For now the channel is the log.** A structured ``structlog`` event carrying
+the template, its variables and the idempotency key; `just run` prints the
+matching instruction for a person at the terminal. Email or chat is a delivery
+change behind this same interface, not a change to the loop.
 
-* The body is assembled from templates and typed fields, not passed through
-  from a document or a model. A vendor cannot make this system send a
-  message of their choosing.
-* It is idempotent, because a retry loop that emails an approver forty times
-  is an outage.
-
-Not implemented: the transport, the templates, and the per-recipient rate limit.
-
+Templates are the only message bodies, and their variables are this system's
+own values - ids, amounts, roles. No text from a document is ever sent.
 """
 
 from __future__ import annotations
 
 from pydantic import Field
 
+from ap_agent.logging import get_logger
 from ap_agent.tools.base import IdempotentToolInput, SideEffect, ToolCaller, ToolOutput
 
 CALLER = ToolCaller.CODE
 SIDE_EFFECTS: tuple[SideEffect, ...] = (SideEffect.NOTIFICATION,)
 REQUIRES_IDEMPOTENCY_KEY = True
 
+CHANNEL = "log"
+
+log = get_logger(__name__)
+
 
 class NotifyInput(IdempotentToolInput):
     """Input for :func:`notify`."""
 
-    recipient_user_id: str = Field(min_length=1, max_length=64)
+    recipient_user_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="A person or a role. The approval matrix names roles, so today it is one.",
+    )
     template_id: str = Field(
         min_length=1,
         max_length=64,
@@ -49,9 +54,14 @@ class NotifyOutput(ToolOutput):
 
 
 def notify(payload: NotifyInput) -> NotifyOutput:
-    """Send a message to a person.
-
-    Raises:
-        NotImplementedError: Written by hand in a later session.
-    """
-    raise NotImplementedError
+    """Emit the notification as a structured log event."""
+    log.info(
+        "notify",
+        channel=CHANNEL,
+        recipient=payload.recipient_user_id,
+        template=payload.template_id,
+        invoice_id=payload.invoice_id,
+        idempotency_key=payload.idempotency_key,
+        **payload.template_vars,
+    )
+    return NotifyOutput(delivered=True, channel=CHANNEL)
