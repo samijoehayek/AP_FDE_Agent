@@ -32,6 +32,7 @@ date, which decides a due date - becomes a guess nobody recorded making.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -47,6 +48,8 @@ VENDOR_MASTER_PATH = REPO_ROOT / "config" / "sandbox_vendor_master.yaml"
 """The one definition of the sandbox vendors, committed and reviewable."""
 
 REQUIRED_FIELDS = ("display_name", "erp_id", "currency", "tax_id", "country", "address")
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 COUNTRY_CODE_LENGTH = 2
 """ISO-3166-1 alpha-2. The date-resolution rule reads nothing else."""
@@ -79,6 +82,14 @@ class MasterVendor:
     tax_id: str
     country: str
     address: tuple[str, ...]
+    remit_account_sha256: str | None = None
+    """Fingerprint of the remittance account on file, or None if there is none.
+
+    Never the account itself: ``lookup_vendor`` only needs to know whether a
+    document's remit-to block names the same account, and equality of two
+    fingerprints answers that without this file ever holding a number someone
+    could pay. None means nothing is on file to compare against.
+    """
 
     @property
     def address_block(self) -> tuple[str, ...]:
@@ -107,6 +118,14 @@ def _require(record: dict[str, Any], index: int) -> MasterVendor:
         msg = f"{VENDOR_MASTER_PATH.name}: {record['display_name']} address must be a list of lines"
         raise VendorMasterError(msg)
 
+    fingerprint = record.get("remit_account_sha256")
+    if fingerprint is not None and not _SHA256.fullmatch(str(fingerprint)):
+        msg = (
+            f"{VENDOR_MASTER_PATH.name}: {record['display_name']} remit_account_sha256 "
+            "must be 64 lowercase hex characters"
+        )
+        raise VendorMasterError(msg)
+
     return MasterVendor(
         display_name=str(record["display_name"]),
         erp_id=str(record["erp_id"]),
@@ -114,6 +133,7 @@ def _require(record: dict[str, Any], index: int) -> MasterVendor:
         tax_id=str(record["tax_id"]),
         country=country,
         address=tuple(str(line) for line in cast("list[Any]", address)),
+        remit_account_sha256=str(fingerprint) if fingerprint is not None else None,
     )
 
 

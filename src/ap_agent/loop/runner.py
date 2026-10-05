@@ -930,6 +930,9 @@ def _resolve_vendor_step(
         LookupVendorInput(
             vendor_name=extraction.vendor_name,
             vendor_tax_id=extraction.vendor_tax_id,
+            # Compared server-side to the master's fingerprint; only a boolean
+            # comes back, and nothing here or in the tool echoes the block.
+            remit_to_display=extraction.remit_to_display,
         )
     )
     match = found.match
@@ -964,6 +967,15 @@ def _resolve_vendor_step(
             "vendor_currency": match.currency,
         }
     )
+    if match.remit_to_matches_master is False:
+        # A known supplier asking to be paid somewhere new. Held for a person
+        # before anything else is decided about the invoice; see the edge.
+        return resolved, StepResult(
+            event=InvoiceEvent.REMIT_TO_MISMATCH.value,
+            output_ref=content_ref(match),
+            result_summary=f"vendor_id={match.vendor_id}",
+            decision_basis=_vendor_basis(extraction.vendor_name, match),
+        )
     resolved = _settle_by_vendor_locale(resolved, trail)
 
     return (
@@ -982,6 +994,10 @@ def _vendor_basis(printed_name: str, match: VendorMatch) -> str:
     parts = [f"printed={printed_name!r}", f"basis={match.match_basis.value}"]
     if match.resolved:
         parts.append(f"vendor_id={match.vendor_id}, country={match.country}")
+        remit = match.remit_to_matches_master
+        parts.append(
+            "remit_to=" + ("not_compared" if remit is None else "match" if remit else "mismatch")
+        )
     elif match.candidates:
         parts.append(
             "candidates=" + "|".join(f"{c.vendor_id}:{c.vendor_name}" for c in match.candidates)

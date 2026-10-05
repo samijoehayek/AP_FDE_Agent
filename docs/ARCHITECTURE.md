@@ -160,6 +160,7 @@ stateDiagram-v2
     SCHEDULED --> POSTED: payment_failed
     SCHEDULED --> PAID: stub_ok
     VALIDATED --> CANCELLED: cancel
+    VALIDATED --> NEW_VENDOR: remit_to_mismatch
     VALIDATED --> VENDOR_RESOLVED: resolve_vendor
     VALIDATED --> NEW_VENDOR: vendor_not_found
     VENDOR_RESOLVED --> CANCELLED: cancel

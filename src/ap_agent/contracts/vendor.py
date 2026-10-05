@@ -5,7 +5,7 @@ Read the field list carefully for what is not there.
 
 Bank details do not appear in this contract, in any nested contract, or in any
 model context. The vendor master holds them; a server-side comparison reduces
-them to a single boolean, ``bank_details_match_on_file``; and that boolean is
+them to a single boolean, ``remit_to_matches_master``; and that boolean is
 the only thing that crosses into code the model can influence. Adding an
 account number here would defeat every other control in the repository, and
 ``extra="forbid"`` means a well-meaning ``**payload`` will fail loudly rather
@@ -44,7 +44,7 @@ class VendorRef(StrictModel):
         description="Inactive vendors are an exception, never a straight-through payment.",
     )
     default_currency: CurrencyCode | None = None
-    bank_details_match_on_file: bool = Field(
+    remit_to_matches_master: bool = Field(
         description="Computed server-side by comparing the remittance details already on file "
         "with the ones the document displayed. The comparison happens outside any "
         "model context and only this boolean is returned. False is a hard stop, "
@@ -93,10 +93,9 @@ class VendorMatch(StrictModel):
 
     There is no bank-details field here, and there never will be. Remittance has
     exactly one home - the vendor master, compared server-side - and
-    ``bank_details_match_on_file`` is the single boolean that comparison is
-    allowed to produce. It is ``None`` today because the master holds no
-    remittance details at all, which is a different and more honest answer than
-    ``False``.
+    ``remit_to_matches_master`` is the single boolean that comparison is
+    allowed to produce. ``None`` when nothing could be compared, which is a
+    different and more honest answer than ``False``.
     """
 
     vendor_id: str | None = Field(default=None, max_length=64)
@@ -109,13 +108,13 @@ class VendorMatch(StrictModel):
     )
     currency: CurrencyCode | None = None
     match_basis: VendorMatchBasis
-    bank_details_match_on_file: bool | None = Field(
+    remit_to_matches_master: bool | None = Field(
         default=None,
-        description="Computed server-side by comparing the remittance details on file with "
-        "the ones the document displayed; only the boolean is ever returned. None "
-        "means no comparison was possible - today the master holds no details, so "
-        "it is always None. False would be a hard stop; None is an unanswered "
-        "question, and the two must not be confused.",
+        description="Computed server-side by fingerprinting any IBAN in the document's "
+        "remit-to block and comparing it with the fingerprint on file; only the boolean "
+        "is ever returned. None means no comparison was possible - nothing on file, or "
+        "no account printed. False is a hard stop; None is an unanswered question, and "
+        "the two must not be confused.",
     )
     candidates: list[VendorCandidate] = Field(
         default_factory=list[VendorCandidate],

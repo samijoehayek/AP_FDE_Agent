@@ -12,7 +12,9 @@ rather than incidental.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -78,10 +80,30 @@ def test_the_country_agrees_with_the_tax_identifier() -> None:
 
 
 def test_the_master_holds_no_bank_details() -> None:
-    """Rule 2 of CLAUDE.md. A remit-to block may print an address, nothing more."""
-    body = VENDOR_MASTER_PATH.read_text(encoding="utf-8").lower()
-    for forbidden in ("iban", "swift", "bic:", "sort_code", "account_number", "routing"):
-        assert forbidden not in body, forbidden
+    """Rule 2 of CLAUDE.md. The master holds a fingerprint of the account, never the account.
+
+    Checked on the parsed data rather than the raw file, because the file's own
+    comments explain what an IBAN is. No key may name a bank detail, no value may
+    be IBAN-shaped or an account-length digit run, and the one remittance field is
+    a SHA-256 - equality is all the comparison needs.
+    """
+    raw: Any = yaml.safe_load(VENDOR_MASTER_PATH.read_text(encoding="utf-8"))
+    iban = re.compile(r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}\b")
+    for vendor in cast("list[dict[str, Any]]", raw["vendors"]):
+        for key, value in vendor.items():
+            assert not re.search(r"iban|swift|bic|sort_code|account_number|routing", key), key
+            values = cast("list[Any]", value) if isinstance(value, list) else [value]
+            for text in (str(item) for item in values):
+                if key == "remit_account_sha256":
+                    assert re.fullmatch(r"[0-9a-f]{64}", text)
+                    continue
+                assert not iban.search(text), (key, text)
+                assert not re.search(r"\b[0-9]{8,17}\b", text), (key, text)
+
+
+def test_every_shipped_vendor_has_a_remittance_fingerprint() -> None:
+    """Without one, the remit-to comparison is None for that vendor: nothing to compare."""
+    assert all(vendor.remit_account_sha256 for vendor in load_vendor_master())
 
 
 def test_vendor_order_is_what_numbers_the_purchase_orders() -> None:
@@ -91,6 +113,20 @@ def test_vendor_order_is_what_numbers_the_purchase_orders() -> None:
 
 
 # --- loading ----------------------------------------------------------------
+
+
+def test_a_remittance_fingerprint_must_be_a_sha256(tmp_path: Path) -> None:
+    """Anything else - an account number pasted in by mistake above all - is refused."""
+    body = ONE_VENDOR.replace(
+        '    erp_id: "60"\n',
+        '    erp_id: "60"\n    remit_account_sha256: "GB29NWBK60161331926819"\n',
+    )
+    with pytest.raises(VendorMasterError, match="remit_account_sha256"):
+        load_vendor_master(_write(tmp_path, body))
+
+
+def test_a_vendor_without_a_fingerprint_loads_with_none(tmp_path: Path) -> None:
+    assert load_vendor_master(_write(tmp_path, ONE_VENDOR))[0].remit_account_sha256 is None
 
 
 def test_codes_are_normalised_to_upper_case(tmp_path: Path) -> None:

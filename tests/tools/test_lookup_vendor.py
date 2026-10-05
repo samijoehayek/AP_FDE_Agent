@@ -187,13 +187,77 @@ def test_a_name_that_normalises_to_nothing_matches_nothing() -> None:
 # --- what this tool must never carry ----------------------------------------
 
 
-def test_no_remittance_comparison_is_claimed() -> None:
-    """The master holds no bank details, so the honest answer is None, not False.
+def test_no_remittance_comparison_is_claimed_without_a_remit_block() -> None:
+    """Nothing printed to compare, so the honest answer is None, not False.
 
     False would mean a comparison ran and disagreed, which is a hard stop.
     None means nobody has compared anything, which is an open question.
     """
-    assert _match("Deccan Print and Paper").bank_details_match_on_file is None
+    assert _match("Deccan Print and Paper").remit_to_matches_master is None
+
+
+# --- the remit-to block, compared and never returned ------------------------
+
+ON_FILE = "XX00APAGENT0000000059"
+"""Meridian's fictional account; the shipped master holds only its fingerprint."""
+
+
+def _remit(display: str | None) -> bool | None:
+    return lookup_vendor(
+        LookupVendorInput(vendor_name="Meridian Office Supplies", remit_to_display=display)
+    ).match.remit_to_matches_master
+
+
+@pytest.mark.parametrize(
+    "display",
+    [
+        "Meridian Office Supplies, IBAN XX00 APAG ENT0 0000 0005 9",
+        "IBAN: xx00apagent0000000059",
+        "Pay to IBAN XX00APAGENT0000000059 BIC MERIUS33",
+    ],
+)
+def test_the_account_on_file_matches_however_it_is_spaced(display: str) -> None:
+    assert _remit(display) is True
+
+
+def test_a_different_account_is_a_mismatch() -> None:
+    """The published test IBAN, standing in for "we have changed banks"."""
+    assert _remit("Meridian Office Supplies, IBAN GB29 NWBK 6016 1331 9268 19") is False
+
+
+def test_the_right_account_beside_a_second_one_is_still_a_mismatch() -> None:
+    """A block that names the real account and another is asking to be paid elsewhere."""
+    assert _remit(f"IBAN {ON_FILE} or IBAN GB29NWBK60161331926819") is False
+
+
+@pytest.mark.parametrize("display", [None, "", "2140 Larkspur Commerce Way, Denver, CO 80216"])
+def test_a_block_with_no_account_compares_nothing(display: str | None) -> None:
+    """A postal address names no account. Nothing to compare is None, not a pass."""
+    assert _remit(display) is None
+
+
+def test_nothing_on_file_compares_nothing(two_acmes: Path) -> None:
+    """A master record with no fingerprint cannot say a printed account is wrong."""
+    match = lookup_vendor(
+        LookupVendorInput(
+            vendor_name="x",
+            vendor_tax_id="11-1111111",
+            remit_to_display="IBAN GB29 NWBK 6016 1331 9268 19",
+            master_path=two_acmes,
+        )
+    ).match
+    assert match.resolved
+    assert match.remit_to_matches_master is None
+
+
+def test_the_printed_account_never_leaves_the_tool() -> None:
+    """Only the boolean crosses back. The result carries no trace of the block."""
+    printed = "IBAN GB29 NWBK 6016 1331 9268 19"
+    dumped = lookup_vendor(
+        LookupVendorInput(vendor_name="Meridian Office Supplies", remit_to_display=printed)
+    ).model_dump_json()
+    assert "GB29" not in dumped
+    assert "NWBK" not in dumped
 
 
 def test_the_tool_records_how_long_it_took() -> None:

@@ -1607,6 +1607,42 @@ def test_one_flagged_reading_is_enough(record: InvoiceRecord, tmp_path: Path) ->
     assert "text:pay_to(payment_terms)" in (decision.decision_basis or "")
 
 
+# --- remit-to ----------------------------------------------------------------
+
+
+def test_a_remit_to_account_that_is_not_on_file_holds_the_invoice(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    """A known supplier asking to be paid somewhere new. A person calls them back."""
+    mismatched = RESOLVED_VENDOR.model_copy(update={"remit_to_matches_master": False})
+    ctx = _context(tmp_path, vendor_match=mismatched)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.NEW_VENDOR
+    assert final.vendor_id == VENDOR_ERP_ID, "the vendor resolved; its bank did not"
+    decision = next(event for event in ctx.events if event.decision == "remit_to_mismatch")
+    assert "remit_to=mismatch" in (decision.decision_basis or "")
+
+
+def test_the_remit_to_block_is_passed_to_the_lookup_and_nowhere_else(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    seen: list[str | None] = []
+
+    def _lookup(payload: LookupVendorInput) -> LookupVendorOutput:
+        seen.append(payload.remit_to_display)
+        return LookupVendorOutput(match=RESOLVED_VENDOR, latency_ms=1)
+
+    printed = "Acme Ltd, IBAN GB29 NWBK 6016 1331 9268 19"
+    ctx = replace(_context(tmp_path, _extraction(remit_to_display=printed)), lookup_vendor=_lookup)
+
+    run(record, ctx)
+
+    assert seen == [printed]
+    assert all("GB29" not in event.model_dump_json() for event in ctx.events)
+
+
 def test_a_halt_for_a_missing_tool_is_not_an_error(record: InvoiceRecord, tmp_path: Path) -> None:
     """An invoice parked where a tool is unwritten is the design, not a defect.
 

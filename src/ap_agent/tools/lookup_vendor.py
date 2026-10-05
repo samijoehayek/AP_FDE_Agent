@@ -20,9 +20,15 @@ taking the top one is the tempting move and the wrong one: the ranking would be
 a number nobody calibrated deciding who gets paid. Adjudicating that middle is a
 later seat's job.
 
-Nothing about remittance is read here. ``bank_details_match_on_file`` is
-``None`` because the master holds no remittance details - a comparison that did
-not happen, which is a different answer from one that failed.
+**Remittance is compared, never returned.** The caller passes the document's
+``remit_to_display`` - the one field where a document is *expected* to print
+payment details. Any IBAN in it is fingerprinted and compared with the
+fingerprint on file, and ``remit_to_matches_master`` is the only thing that
+leaves: true, false, or None when there was nothing to compare. The master's
+value never enters model context because no model is anywhere near this, and
+the master holds only a fingerprint in the first place. IBAN-shaped accounts
+only, today: a US routing-and-account pair in the block is not recognised and
+compares as None.
 
 The master is loaded once per process and cached. It is a committed config file
 of ten records, not a query: putting a network call in this step would make the
@@ -31,6 +37,7 @@ loop's routing depend on something that can be slow or down.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from functools import lru_cache
@@ -68,6 +75,12 @@ class LookupVendorInput(ToolInput):
 
     vendor_name: str = Field(min_length=1, max_length=200)
     vendor_tax_id: str | None = Field(default=None, max_length=64)
+    remit_to_display: str | None = Field(
+        default=None,
+        max_length=400,
+        description="The remit-to block as the document printed it. Compared server-side "
+        "with the master's fingerprint; never stored, logged or returned.",
+    )
     address_country: str | None = Field(
         default=None,
         min_length=2,
@@ -105,7 +118,38 @@ def _master(path: Path | None) -> tuple[MasterVendor, ...]:
     return load_vendor_master(path or get_settings().vendor_master_path)
 
 
-def _matched(vendor: MasterVendor, basis: VendorMatchBasis) -> VendorMatch:
+_IBAN = re.compile(r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b")
+"""An IBAN as printed: grouped in fours with single spaces, or run together."""
+
+
+def remit_fingerprint(account: str) -> str:
+    """SHA-256 of an account, upper-cased with all whitespace removed.
+
+    The form the vendor master stores. ``GB29 NWBK 6016...`` and
+    ``gb29nwbk6016...`` are one account and must fingerprint the same.
+    """
+    return hashlib.sha256(re.sub(r"\s", "", account).upper().encode()).hexdigest()
+
+
+def remit_matches(display: str | None, fingerprint: str | None) -> bool | None:
+    """Whether every IBAN in a remit-to block is the account on file.
+
+    None when there is nothing to compare: no fingerprint on file, or no IBAN in
+    the block (a postal address alone names no account). False if *any* printed
+    IBAN differs - a block that names the real account and a second one is a
+    block asking to be paid somewhere else.
+    """
+    if fingerprint is None or not display:
+        return None
+    printed = _IBAN.findall(display.upper())
+    if not printed:
+        return None
+    return all(remit_fingerprint(account) == fingerprint for account in printed)
+
+
+def _matched(
+    vendor: MasterVendor, basis: VendorMatchBasis, remit_to_display: str | None
+) -> VendorMatch:
     """Build a resolved match from one master record."""
     return VendorMatch(
         vendor_id=vendor.erp_id,
@@ -113,8 +157,7 @@ def _matched(vendor: MasterVendor, basis: VendorMatchBasis) -> VendorMatch:
         country=vendor.country,
         currency=vendor.currency,
         match_basis=basis,
-        # The master holds no remittance details, so no comparison happened.
-        bank_details_match_on_file=None,
+        remit_to_matches_master=remit_matches(remit_to_display, vendor.remit_account_sha256),
     )
 
 
@@ -155,7 +198,10 @@ def lookup_vendor(payload: LookupVendorInput) -> LookupVendorOutput:
         if wanted:
             hits = [v for v in master if normalise_tax_id(v.tax_id) == wanted]
             if len(hits) == 1:
-                return _out(_matched(hits[0], VendorMatchBasis.TAX_ID_EXACT), started)
+                return _out(
+                    _matched(hits[0], VendorMatchBasis.TAX_ID_EXACT, payload.remit_to_display),
+                    started,
+                )
             if len(hits) > 1:
                 # Two master records sharing a tax id is a master-data problem,
                 # not an invoice problem, and it is not this tool's to resolve.
@@ -165,7 +211,10 @@ def lookup_vendor(payload: LookupVendorInput) -> LookupVendorOutput:
     if wanted_name:
         hits = [v for v in master if normalise_vendor_name(v.display_name) == wanted_name]
         if len(hits) == 1:
-            return _out(_matched(hits[0], VendorMatchBasis.NAME_EXACT), started)
+            return _out(
+                _matched(hits[0], VendorMatchBasis.NAME_EXACT, payload.remit_to_display),
+                started,
+            )
         if len(hits) > 1:
             return _out(_ambiguous(hits), started)
 
@@ -187,4 +236,6 @@ __all__ = [
     "lookup_vendor",
     "normalise_tax_id",
     "normalise_vendor_name",
+    "remit_fingerprint",
+    "remit_matches",
 ]

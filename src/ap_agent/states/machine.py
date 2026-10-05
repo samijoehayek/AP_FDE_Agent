@@ -68,6 +68,7 @@ class InvoiceEvent(StrEnum):
     VALIDATION_FAILED = "validation_failed"
     RESOLVE_VENDOR = "resolve_vendor"
     VENDOR_NOT_FOUND = "vendor_not_found"
+    REMIT_TO_MISMATCH = "remit_to_mismatch"
     VENDOR_ONBOARDED = "vendor_onboarded"
     CHECK_DUPLICATES = "check_duplicates"
     DUPLICATE_SUSPECTED = "duplicate_suspected"
@@ -126,6 +127,13 @@ TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     # --- vendor -----------------------------------------------------------
     (_S.VALIDATED, _E.RESOLVE_VENDOR): _S.VENDOR_RESOLVED,
     (_S.VALIDATED, _E.VENDOR_NOT_FOUND): _S.NEW_VENDOR,
+    # The vendor resolved, but the remit-to block names an account that is not the
+    # one on file. That is the most common AP fraud - "we have changed banks" -
+    # and the approval matrix's remit_to_mismatch rule says a person calls the
+    # vendor on a number already on file. NEW_VENDOR is the state where a
+    # person establishes who a supplier is and how they are paid, which is that
+    # question exactly; it is left only by a person onboarding or rejecting.
+    (_S.VALIDATED, _E.REMIT_TO_MISMATCH): _S.NEW_VENDOR,
     (_S.NEW_VENDOR, _E.VENDOR_ONBOARDED): _S.VENDOR_RESOLVED,
     (_S.NEW_VENDOR, _E.REJECT): _S.REJECTED,
     # --- duplicates -------------------------------------------------------

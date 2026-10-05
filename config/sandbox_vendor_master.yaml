@@ -37,12 +37,21 @@
 # invoice carries a postal address and nothing more, and rule 2 of CLAUDE.md
 # means the only authority for remittance is this vendor master, compared
 # server-side. Adding an account number to this file would defeat that.
+#
+# `remit_account_sha256` is what the master holds instead (added 2026-10-05):
+# the SHA-256 of the vendor's remittance account, upper-cased with spaces
+# removed. `lookup_vendor` fingerprints any IBAN printed in a document's remit-to
+# block the same way and compares the two, so the comparison is server-side and
+# the account itself is never stored. Every account behind these fingerprints
+# is FICTIONAL: `XX00APAGENT` followed by the vendor's erp_id zero-padded to ten
+# digits. `XX` is not an ISO country code, so none of them can be a real IBAN.
 
 version: "v1"
 
 vendors:
   - display_name: "TechVision Distributors Pvt Ltd"
     erp_id: "58"
+    remit_account_sha256: "1467f94472f3e2a68614cec5d716cbeebcae64c7c3580d8b761de08bc73b6f0d"
     currency: "INR"
     tax_id: "27AABCT1234F1Z5"      # GSTIN state 27, Maharashtra
     country: "IN"
@@ -54,6 +63,7 @@ vendors:
 
   - display_name: "Meridian Office Supplies"
     erp_id: "59"
+    remit_account_sha256: "72d035cb9fcfa8fb27fb4744720ad83ecba52599c524199169fe24a252061bb7"
     currency: "USD"
     tax_id: "84-1938472"
     country: "US"
@@ -64,6 +74,7 @@ vendors:
 
   - display_name: "Kestrel Components Ltd"
     erp_id: "60"
+    remit_account_sha256: "bd57a3ad08d95def5a658304d3883ae8e1f17f8dc1ac6ac84142dbefe610a4b1"
     currency: "USD"
     tax_id: "91-2274618"
     country: "US"
@@ -74,6 +85,7 @@ vendors:
 
   - display_name: "Sundar Electronics Trading"
     erp_id: "61"
+    remit_account_sha256: "581fa18fadb609527b9ee4c473451848128cdd81909851d62980b05725f93182"
     currency: "INR"
     tax_id: "29AAGCS8842K1ZP"      # GSTIN state 29, Karnataka
     country: "IN"
@@ -85,6 +97,7 @@ vendors:
 
   - display_name: "Northwind Peripherals Inc"
     erp_id: "62"
+    remit_account_sha256: "3f4f41b6ece69dc2432586dd4c6ac96f95ecba0d38c91ab46fdc6a873632dba5"
     currency: "USD"
     tax_id: "27-6653019"
     country: "US"
@@ -94,6 +107,7 @@ vendors:
 
   - display_name: "Anand Cables and Connectors"
     erp_id: "63"
+    remit_account_sha256: "929fe11509a4b848c1fb42f85246dfd1794b807ace511a231feaac0a1c94c976"
     currency: "INR"
     tax_id: "07AACCA5521M1Z8"      # GSTIN state 07, Delhi
     country: "IN"
@@ -104,6 +118,7 @@ vendors:
 
   - display_name: "Blue Harbour Furniture Co"
     erp_id: "64"
+    remit_account_sha256: "65a4e2df3f3f55697261dd0d8095126cea532bd5ace8a4466019a7ae8d90236a"
     currency: "USD"
     tax_id: "45-8871223"
     country: "US"
@@ -113,6 +128,7 @@ vendors:
 
   - display_name: "Deccan Print and Paper"
     erp_id: "65"
+    remit_account_sha256: "03a57f59b9609d7e38a3385942dd1d3d4e9009d3b977d0f32268b3006a410940"
     currency: "INR"
     tax_id: "36AADCD7719L1ZQ"      # GSTIN state 36, Telangana
     country: "IN"
@@ -123,6 +139,7 @@ vendors:
 
   - display_name: "Orion Networking Supplies"
     erp_id: "66"
+    remit_account_sha256: "e46ef0faa273205547a33ebcb8f2ed27997dc9426cdcebc0087a076d4b4f716a"
     currency: "USD"
     tax_id: "13-4429087"
     country: "US"
@@ -133,6 +150,7 @@ vendors:
 
   - display_name: "Vasanth Industrial Tools"
     erp_id: "67"
+    remit_account_sha256: "b18080d661a014fdc607531ab58d044da871f53bb63b8a62dd4922380bbf034d"
     currency: "INR"
     tax_id: "33AAHCV2298N1ZR"      # GSTIN state 33, Tamil Nadu
     country: "IN"
