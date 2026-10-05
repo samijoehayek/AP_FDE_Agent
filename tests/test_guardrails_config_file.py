@@ -169,6 +169,11 @@ def test_hidden_text_thresholds_sit_well_clear_of_real_documents(
     assert hidden.near_white_min >= 230
 
 
+def test_the_rematch_limit_is_the_architecture_report_s(config: GuardrailConfig) -> None:
+    """Max 2 re-match attempts after a data refresh. A third is a loop, not a refresh."""
+    assert config.loop_limits.max_rematches == 2
+
+
 def test_the_output_filter_routes_and_never_rewrites(config: GuardrailConfig) -> None:
     """Stripping an IBAN would destroy the evidence that somebody put one there."""
     assert config.output_filter.action is FilterAction.ROUTE_TO_HUMAN

@@ -68,7 +68,7 @@ def test_no_stub_walks_past_a_state_that_needs_a_human() -> None:
     human_required = {
         InvoiceState.NEEDS_HUMAN_EXTRACTION,
         InvoiceState.ON_HOLD_DUPLICATE,
-        InvoiceState.EXCEPTION,
+        InvoiceState.PENDING_HUMAN,
         InvoiceState.NEW_VENDOR,
     }
     escapes = {src.value for (src, _event) in STUB_TRANSITIONS if src in human_required}

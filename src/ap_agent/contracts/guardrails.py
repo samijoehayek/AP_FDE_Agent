@@ -240,6 +240,17 @@ class OutputFilter(StrictModel):
     patterns: list[OutputFilterPattern] = Field(min_length=1, max_length=50)
 
 
+class LoopLimits(StrictModel):
+    """Bounds on how often a person may send an invoice round again."""
+
+    max_rematches: int = Field(
+        ge=0,
+        le=10,
+        description="Re-match attempts a person may request from PENDING_HUMAN after a data "
+        "refresh. Counted per invoice, across runs.",
+    )
+
+
 class HardProhibitions(StrictModel):
     """Tools that must not exist. Not thresholds - absences.
 
@@ -273,6 +284,7 @@ class GuardrailConfig(StrictModel):
     approval_matrix: ApprovalMatrix
     input_validation: InputValidation
     output_filter: OutputFilter
+    loop_limits: LoopLimits
     hard_prohibitions: HardProhibitions
 
 

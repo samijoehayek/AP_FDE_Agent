@@ -236,6 +236,16 @@ output_filter:
       why: "A payment destination stated outside the remit-to block, where nothing compares it to the master."
       skip_fields: []
 
+# --- Loop limits -----------------------------------------------------------
+# Added 2026-10-05, in place - see the note under input_validation.
+
+loop_limits:
+  # How many times a person may send a held invoice back through the match
+  # after a data refresh - a receipt posted, an order amended. From the
+  # architecture report. A third attempt is not a refresh, it is a loop, and
+  # the invoice should be accepted with a reason or rejected instead.
+  max_rematches: 2
+
 # --- Hard prohibitions -----------------------------------------------------
 # Not thresholds. These tools do not exist, and this section is the written
 # statement of that - `tests/tools/test_tool_contracts.py` walks the package and

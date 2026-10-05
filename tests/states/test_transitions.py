@@ -12,6 +12,7 @@ import pytest
 from ap_agent.errors import IllegalTransition
 from ap_agent.states.machine import (
     APPROVAL_GATE,
+    HUMAN_ONLY_EVENTS,
     TERMINAL_STATES,
     TRANSITIONS,
     InvoiceEvent,
@@ -167,7 +168,9 @@ def test_exception_loop_returns_to_the_approval_gate() -> None:
     state = InvoiceState.PENDING_APPROVAL
     state = transition(state, InvoiceEvent.REQUEST_CHANGES)
     assert state is InvoiceState.EXCEPTION
-    state = transition(state, InvoiceEvent.EXCEPTION_RESOLVED)
+    state = transition(state, InvoiceEvent.CLASSIFY)
+    assert state is InvoiceState.PENDING_HUMAN
+    state = transition(state, InvoiceEvent.ACCEPT_WITH_REASON)
     state = transition(state, InvoiceEvent.CODE)
     state = transition(state, InvoiceEvent.REQUEST_APPROVAL)
     assert state is InvoiceState.PENDING_APPROVAL
@@ -179,3 +182,46 @@ def test_mermaid_renders_every_state_and_edge() -> None:
     for state in InvoiceState:
         assert state.value in diagram
     assert diagram.count("-->") >= len(TRANSITIONS)
+
+
+def _exits(state: InvoiceState) -> set[str]:
+    return {event for (source, event) in TRANSITIONS if source is state}
+
+
+def test_an_exception_is_left_only_by_being_explained() -> None:
+    """No resolve, no reject, no cancel: CLASSIFY@v1 is the only way out of EXCEPTION.
+
+    So every queue item a person sees has been through the explanation step,
+    whether or not the explanation came back.
+    """
+    assert _exits(InvoiceState.EXCEPTION) == {InvoiceEvent.CLASSIFY.value}
+    assert transition(InvoiceState.EXCEPTION, InvoiceEvent.CLASSIFY) is InvoiceState.PENDING_HUMAN
+
+
+def test_pending_human_is_left_only_by_a_person() -> None:
+    exits = _exits(InvoiceState.PENDING_HUMAN)
+    assert exits == {
+        InvoiceEvent.REMATCH.value,
+        InvoiceEvent.ACCEPT_WITH_REASON.value,
+        InvoiceEvent.REJECT.value,
+        InvoiceEvent.CANCEL.value,
+    }
+    assert exits <= {event.value for event in HUMAN_ONLY_EVENTS}
+
+
+@pytest.mark.parametrize(
+    ("event", "target"),
+    [
+        (InvoiceEvent.REMATCH, InvoiceState.DUPLICATE_CHECKED),
+        (InvoiceEvent.ACCEPT_WITH_REASON, InvoiceState.MATCHED),
+        (InvoiceEvent.REJECT, InvoiceState.REJECTED),
+        (InvoiceEvent.CANCEL, InvoiceState.CANCELLED),
+    ],
+)
+def test_where_each_human_decision_leads(event: InvoiceEvent, target: InvoiceState) -> None:
+    assert transition(InvoiceState.PENDING_HUMAN, event) is target
+
+
+def test_accepting_an_exception_still_has_to_pass_the_approval_gate() -> None:
+    """MATCHED is before the gate, so a person overriding the rules does not approve."""
+    assert APPROVAL_GATE in reachable_from(InvoiceState.MATCHED)

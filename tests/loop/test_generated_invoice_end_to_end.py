@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pymupdf
 import pytest
+from tests.loop.conftest import fake_classify
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import RuleActor, utc_now
@@ -279,6 +280,7 @@ def _context(
         lookup_vendor=_lookup,
         get_purchase_order=_get_po,
         get_receipts=_get_receipts,
+        classify=fake_classify,
     )
 
 
@@ -399,7 +401,7 @@ def test_a_po_belonging_to_another_vendor_is_refused(
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     assert final.receipts is None
 
 
@@ -543,7 +545,7 @@ def test_the_price_variant_reaches_exception_with_the_price_code(
     ctx = _context(fixture_root, truth, variant=GeneratedVariant.PRICE_PLUS_3PCT)
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     assert final.match_result is not None
     assert ReasonCode.PRICE_OVER_TOLERANCE in final.match_result.reason_codes
 
@@ -558,18 +560,18 @@ def test_the_price_variant_reaches_exception_with_the_price_code(
 def test_the_exception_run_stops_at_exception_and_says_why(
     record: InvoiceRecord, fixture_root: Path
 ) -> None:
-    """EXCEPTION is a state no stub may leave, so the run halts there.
+    """EXCEPTION is left only through CLASSIFY@v1, to PENDING_HUMAN, where the run halts.
 
-    That is the correct outcome and not a gap: the invoice is waiting for a
-    person, and the row it stopped on carries what they need to see - the code,
-    and the ruleset that raised it.
+    The match decision still moves the invoice to EXCEPTION and still carries
+    the code and the ruleset that raised it; the next row explains it and hands
+    it to a person.
     """
     truth = _truth(fixture_root, GeneratedVariant.PRICE_PLUS_3PCT)
     ctx = _context(fixture_root, truth, variant=GeneratedVariant.PRICE_PLUS_3PCT)
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     decision = next(event for event in ctx.events if event.decision == "match_exception")
     basis = decision.decision_basis or ""
     assert ReasonCode.PRICE_OVER_TOLERANCE.value in basis

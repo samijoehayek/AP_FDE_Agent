@@ -691,13 +691,15 @@ def test_every_adversarial_variant_declares_where_it_stops_and_why(generated: Pa
             assert truth.expected_flag is None, path
 
 
-def test_a_held_match_stops_at_exception_and_a_clean_one_does_not_stop(generated: Path) -> None:
+def test_a_held_match_stops_for_a_person_and_a_clean_one_does_not_stop(
+    generated: Path,
+) -> None:
     for path in _truth_files(generated):
         truth = _load_truth(path)
         if truth.variant in ADVERSARIAL:
             continue
         if truth.expected_match is ExpectedMatch.EXCEPTION:
-            assert truth.expected_halt_state is InvoiceState.EXCEPTION, path
+            assert truth.expected_halt_state is InvoiceState.PENDING_HUMAN, path
         else:
             assert truth.expected_halt_state is None, path
 

@@ -42,6 +42,7 @@ from ap_agent.contracts.audit import (
     utc_now,
 )
 from ap_agent.contracts.enums import AuditEventType, MatchLineOutcome, ReasonCode
+from ap_agent.contracts.exceptions import HeaderNumbers, PoSnapshot, VendorSummary
 from ap_agent.contracts.matching import MatchResult
 from ap_agent.contracts.run import (
     Action,
@@ -50,13 +51,29 @@ from ap_agent.contracts.run import (
     StepResult,
     ToolCallRecord,
 )
-from ap_agent.errors import APAgentError, IllegalTransition
+from ap_agent.errors import (
+    APAgentError,
+    ClassificationError,
+    HumanDecisionError,
+    IllegalTransition,
+)
 from ap_agent.guardrails.config import load_guardrails
 from ap_agent.guardrails.output_filter import screen_extraction
 from ap_agent.logging import get_logger
 from ap_agent.loop.dates import resolve_date_by_locale, resolve_date_by_receipt_window
 from ap_agent.pricing import UNKNOWN_PRICING_VERSION, cost_usd, pricing_version
-from ap_agent.states.machine import InvoiceEvent, InvoiceState, is_terminal, transition
+from ap_agent.states.machine import (
+    HUMAN_ONLY_EVENTS,
+    InvoiceEvent,
+    InvoiceState,
+    is_terminal,
+    transition,
+)
+from ap_agent.tools.classify_exception import (
+    ClassifyExceptionInput,
+    ClassifyExceptionOutput,
+    classify_exception,
+)
 from ap_agent.tools.compute_extraction_confidence import (
     LOAD_BEARING_FIELDS,
     ComputeExtractionConfidenceInput,
@@ -109,6 +126,7 @@ if TYPE_CHECKING:
 
     from ap_agent.audit.writer import AuditWriter
     from ap_agent.contracts.audit import Actor
+    from ap_agent.contracts.exceptions import ExceptionClassification
     from ap_agent.contracts.invoice import InvoiceExtraction
     from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
     from ap_agent.contracts.vendor import VendorMatch
@@ -125,6 +143,7 @@ EXTRACT_CONF_RULE_ID = "EXTRACT-CONF@v1"
 DATE_RESOLVE_RULE_ID = "DATE-RESOLVE@v1"
 RESOLVE_VENDOR_RULE_ID = "RESOLVE-VENDOR@v1"
 MATCH_RULE_ID = "MATCH@v1"
+CLASSIFY_RULE_ID = "CLASSIFY@v1"
 STUB_RULE_ID = "STUB"
 
 HALT_NO_TOOL = "halt_no_tool"
@@ -215,6 +234,11 @@ def _default_compute_match(payload: ComputeMatchInput) -> ComputeMatchOutput:
     return compute_match(payload)
 
 
+def _default_classify(payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`."""
+    return classify_exception(payload)
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Everything the loop needs from the outside world.
@@ -240,6 +264,7 @@ class RunContext:
     )
     get_receipts: Callable[[GetReceiptsInput], GetReceiptsOutput] = _default_get_receipts
     compute_match: Callable[[ComputeMatchInput], ComputeMatchOutput] = _default_compute_match
+    classify: Callable[[ClassifyExceptionInput], ClassifyExceptionOutput] = _default_classify
     now: Callable[[], datetime] = utc_now
     events: list[AuditEvent] = field(default_factory=list[AuditEvent])
     """Every event written this run, in order. Convenience for callers and tests."""
@@ -303,6 +328,7 @@ class StepTrail:
         output_tokens: int | None,
         latency_ms: int | None,
         retry_count: int = 0,
+        basis: str | None = None,
     ) -> None:
         """Write a model row, priced from the versioned list."""
         self.call(
@@ -319,6 +345,7 @@ class StepTrail:
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
                 retry_count=retry_count,
+                basis=basis,
             )
         )
 
@@ -373,7 +400,7 @@ def _pricing_version() -> str:
 # ---------------------------------------------------------------------------
 
 
-def decide(record: InvoiceRecord) -> Action:
+def decide(record: InvoiceRecord) -> Action:  # noqa: PLR0911 - one arm per state
     """Choose the next step. Calls nothing, reads only the record.
 
     The default arm is the important one: any state whose tool is unwritten gets
@@ -401,6 +428,10 @@ def decide(record: InvoiceRecord) -> Action:
             return Action(kind=ActionKind.VALIDATE, by="rule", rule_id=VALIDATE_RULE_ID)
         case InvoiceState.VALIDATED:
             return Action(kind=ActionKind.LOOKUP_VENDOR, by="rule", rule_id=RESOLVE_VENDOR_RULE_ID)
+        case InvoiceState.EXCEPTION:
+            # The one way out of EXCEPTION. The seat explains; the rule routes
+            # to a person whatever the seat says, or fails to say.
+            return Action(kind=ActionKind.CLASSIFY_EXCEPTION, by="rule", rule_id=CLASSIFY_RULE_ID)
         case InvoiceState.DUPLICATE_CHECKED:
             # One step, up to two calls: the order and what arrived against it.
             # The rule decides whether to ask at all, and what to do with the
@@ -511,7 +542,7 @@ def validate_extraction(record: InvoiceRecord, now: datetime) -> tuple[list[str]
     return flags, event.value
 
 
-def apply(
+def apply(  # noqa: PLR0911 - one arm per action kind
     action: Action, record: InvoiceRecord, ctx: RunContext, trail: StepTrail
 ) -> tuple[InvoiceRecord, StepResult]:
     """Carry out ``action`` and return the new record and what happened.
@@ -538,6 +569,9 @@ def apply(
 
         case ActionKind.MATCH_PREP:
             return _match_prep_step(record, ctx, trail)
+
+        case ActionKind.CLASSIFY_EXCEPTION:
+            return _classify_step(record, ctx, trail)
 
         case _:
             return _stub_step(record)
@@ -1293,6 +1327,184 @@ def _plain(value: Decimal) -> str:
     return f"{value.normalize():f}"
 
 
+def _classify_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """Explain the exception, then hand it to a person - always.
+
+    ``CLASSIFY@v1`` moves EXCEPTION to PENDING_HUMAN on every path, and that is
+    the point of putting the seat here rather than on the route: the reason
+    codes already decided that a person must look, and the explanation only
+    makes the look quicker. So the move does not wait on the model:
+
+    * **Accepted** - the classification goes on the record, and the decision
+      row carries the lead reason, the resolver and the action.
+    * **Rejected by the checks in code** - the model row records why; the
+      record keeps no classification; the person sees the codes.
+    * **Failed** - an API error, refusal or truncation. The seat's own failure
+      row is already on the trail; the invoice moves on without prose.
+    * **Nothing to explain** - no match result, or one with no codes (a PO that
+      was never found, or an exception reached from posting). No call is made.
+
+    The seat is given codes, numbers and ids built by the snapshot contracts'
+    ``from_...`` constructors, which drop every string a vendor wrote.
+    """
+    config = load_guardrails()
+    result = record.match_result
+    extraction = record.extraction
+    if result is None or not result.reason_codes or extraction is None:
+        why = "not_run: no reason codes to explain"
+        return (
+            record.model_copy(update={"classification": None, "classification_rejected": why}),
+            StepResult(
+                event=InvoiceEvent.CLASSIFY.value,
+                decision_basis=_classify_basis(config.config_version, result, None, why),
+            ),
+        )
+
+    payload = ClassifyExceptionInput(
+        match_result=result,
+        header_numbers=HeaderNumbers.from_extraction(extraction),
+        po_snapshot=(
+            PoSnapshot.from_purchase_order(record.purchase_order) if record.purchase_order else None
+        ),
+        vendor_summary=(
+            VendorSummary.from_match(record.vendor_match) if record.vendor_match else None
+        ),
+        config=config,
+    )
+    try:
+        out = _call(trail, ActionKind.CLASSIFY_EXCEPTION, "model", ctx.classify)(payload)
+    except ClassificationError as exc:
+        # The seat's own failure row is already written; this one routes.
+        why = f"failed: {type(exc).__name__}"
+        return (
+            record.model_copy(update={"classification": None, "classification_rejected": why}),
+            StepResult(
+                event=InvoiceEvent.CLASSIFY.value,
+                decision_basis=_classify_basis(config.config_version, result, None, why),
+            ),
+        )
+
+    trail.model_call(
+        ActionKind.CLASSIFY_EXCEPTION,
+        out.classification if out.classification is not None else out,
+        summary="classified" if out.classification is not None else "rejected",
+        model_id=out.model_id,
+        prompt_version=out.prompt_version,
+        input_tokens=out.input_tokens,
+        output_tokens=out.output_tokens,
+        latency_ms=out.latency_ms,
+        retry_count=out.retry_count,
+        basis=f"rejected: {out.rejected}" if out.rejected else None,
+    )
+    why = f"rejected: {out.rejected}" if out.rejected else None
+    return (
+        record.model_copy(
+            update={"classification": out.classification, "classification_rejected": why}
+        ),
+        StepResult(
+            event=InvoiceEvent.CLASSIFY.value,
+            output_ref=content_ref(out.classification) if out.classification else None,
+            result_summary=f"codes={len(result.reason_codes)}",
+            decision_basis=_classify_basis(config.config_version, result, out.classification, why),
+        ),
+    )
+
+
+def _classify_basis(
+    config_version: str,
+    result: MatchResult | None,
+    classification: ExceptionClassification | None,
+    why: str | None,
+) -> str:
+    """The decision row: what the rules found, and how it was handed to a person.
+
+    Resolver and action are on the row because they are what the queue routes
+    on. The summary is not: it is prose, it is on the record, and the trail
+    keeps its hash rather than its words.
+    """
+    codes = "|".join(code.value for code in result.reason_codes) if result else ""
+    parts = [f"config_version={config_version}", f"codes={codes or 'none'}"]
+    if classification is not None:
+        parts += [
+            f"lead={classification.reason_code.value}",
+            f"resolver={classification.suggested_resolver.value}",
+            f"action={classification.suggested_action.value}",
+        ]
+    else:
+        parts += ["resolver=none", "action=none", f"classification={why}"]
+    return ", ".join(parts)[:MAX_BASIS_CHARS]
+
+
+def apply_human_decision(
+    record: InvoiceRecord,
+    ctx: RunContext,
+    *,
+    event: InvoiceEvent,
+    user_id: str,
+    reason: str | None = None,
+) -> InvoiceRecord:
+    """Apply a person's decision on a held invoice, and write the row that says so.
+
+    The only way to fire a ``HUMAN_ONLY_EVENTS`` event; the loop refuses them.
+    Today it serves PENDING_HUMAN, the queue the explanation seat feeds:
+
+    * ``rematch`` - back to DUPLICATE_CHECKED after a data refresh, so the next
+      ``run`` fetches the order and receipts again and re-matches. Counted
+      against ``loop_limits.max_rematches``; the stale explanation is cleared.
+    * ``accept_with_reason`` - to MATCHED. The written reason is required and
+      goes on the row: a person overriding the rules must say why, in words
+      the next reviewer can read.
+    * ``reject`` and ``cancel`` - terminal. A reason is optional.
+
+    The row's actor is the person. Returns the record in its new state; the
+    caller runs the loop again if there is more to do.
+
+    Raises:
+        HumanDecisionError: Not a human event, not PENDING_HUMAN, no user, an
+            acceptance with no reason, or the re-match limit spent. Raised before
+            anything is written - nothing changed, so there is nothing to record.
+    """
+    if event not in HUMAN_ONLY_EVENTS:
+        msg = f"{event.value} is not a decision a person makes"
+        raise HumanDecisionError(msg)
+    if record.state is not InvoiceState.PENDING_HUMAN:
+        msg = f"a person acts on PENDING_HUMAN; this invoice is {record.state.value}"
+        raise HumanDecisionError(msg)
+    if not user_id.strip():
+        msg = "a human decision must name who made it"
+        raise HumanDecisionError(msg)
+    text = (reason or "").strip()
+    if event is InvoiceEvent.ACCEPT_WITH_REASON and not text:
+        msg = "accept_with_reason needs a written reason"
+        raise HumanDecisionError(msg)
+
+    config = load_guardrails()
+    update: dict[str, object] = {}
+    if event is InvoiceEvent.REMATCH:
+        limit = config.loop_limits.max_rematches
+        if record.rematch_count >= limit:
+            msg = f"re-match limit reached: {record.rematch_count} of {limit}"
+            raise HumanDecisionError(msg)
+        count = record.rematch_count + 1
+        update = {"rematch_count": count, "classification": None, "classification_rejected": None}
+        basis = f"rematch={count} of {limit}, config_version={config.config_version}"
+    else:
+        basis = f"reason={text or 'none'}"
+
+    to_state = transition(record.state, event.value)
+    updated = record.model_copy(update=update)
+    _write(
+        ctx,
+        updated,
+        Action(kind=ActionKind.HUMAN_DECISION, by="human", user_id=user_id.strip()),
+        StepResult(event=event.value, decision_basis=basis[:MAX_BASIS_CHARS]),
+        StepTransition(record.state, to_state),
+    )
+    return updated.model_copy(update={"state": to_state})
+
+
 def _stub_step(record: InvoiceRecord) -> tuple[InvoiceRecord, StepResult]:
     """A step whose tool is unwritten. Succeeds vacuously and says so.
 
@@ -1331,6 +1543,7 @@ class StepTransition:
 _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
     {
         ActionKind.INGEST_DOCUMENT,
+        ActionKind.CLASSIFY_EXCEPTION,
         ActionKind.VALIDATE,
         ActionKind.STUB,
         ActionKind.MATCH_PREP,
@@ -1382,7 +1595,7 @@ def actor_for(
             prompt_version=result.prompt_version or "unknown",
         )
     if action.by == "human":
-        return HumanActor(user_id="unknown")
+        return HumanActor(user_id=action.user_id or "unknown")
     if event_type is AuditEventType.RULE_EVALUATION:
         return RuleActor(rule_id=action.rule_id or STUB_RULE_ID, config_version=RULE_CONFIG_VERSION)
     if action.rule_id is None or action.kind not in _RULE_STEP_KINDS:
@@ -1476,6 +1689,21 @@ def run(
             log.exception("step_failed", invoice_id=str(record.invoice_id))
             return record
 
+        if result.event in _HUMAN_ONLY_VALUES:
+            # A rule or a model emitted a decision only a person may make. That
+            # is a defect, not a route - the system must never approve its own
+            # exception - so it is recorded as an error and the run stops.
+            refused = result.model_copy(
+                update={
+                    "error": f"{result.event} is human-only; the loop may not fire it",
+                    "error_class": "HumanOnlyEvent",
+                }
+            )
+            _write(
+                ctx, record, action, refused, StepTransition(from_state, None, AuditEventType.ERROR)
+            )
+            return record
+
         try:
             to_state = transition(from_state, result.event)
         except IllegalTransition as exc:
@@ -1491,6 +1719,9 @@ def run(
         _escalate(ctx, record, max_steps)
 
     return record
+
+
+_HUMAN_ONLY_VALUES: frozenset[str] = frozenset(event.value for event in HUMAN_ONLY_EVENTS)
 
 
 def _halt(

@@ -117,9 +117,7 @@ stateDiagram-v2
     DUPLICATE_CHECKED --> MATCHED: match
     DUPLICATE_CHECKED --> EXCEPTION: match_exception
     DUPLICATE_CHECKED --> NON_PO: no_po_reference
-    EXCEPTION --> CANCELLED: cancel
-    EXCEPTION --> MATCHED: exception_resolved
-    EXCEPTION --> REJECTED: reject
+    EXCEPTION --> PENDING_HUMAN: classify
     EXTRACTED --> CANCELLED: cancel
     EXTRACTED --> VALIDATED: validate
     EXTRACTED --> NEEDS_HUMAN_EXTRACTION: validation_failed
@@ -149,6 +147,10 @@ stateDiagram-v2
     PENDING_APPROVAL --> REJECTED: reject
     PENDING_APPROVAL --> EXCEPTION: request_changes
     PENDING_APPROVAL --> APPROVED: stub_ok
+    PENDING_HUMAN --> MATCHED: accept_with_reason
+    PENDING_HUMAN --> CANCELLED: cancel
+    PENDING_HUMAN --> REJECTED: reject
+    PENDING_HUMAN --> DUPLICATE_CHECKED: rematch
     POSTED --> SCHEDULED: schedule_payment
     POSTED --> SCHEDULED: stub_ok
     RECEIVED --> CANCELLED: cancel

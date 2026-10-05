@@ -38,6 +38,7 @@ class InvoiceState(StrEnum):
     ON_HOLD_DUPLICATE = "ON_HOLD_DUPLICATE"
     MATCHED = "MATCHED"
     EXCEPTION = "EXCEPTION"
+    PENDING_HUMAN = "PENDING_HUMAN"
     NON_PO = "NON_PO"
     CODED = "CODED"
     PENDING_APPROVAL = "PENDING_APPROVAL"
@@ -76,7 +77,9 @@ class InvoiceEvent(StrEnum):
     CONFIRM_DUPLICATE = "confirm_duplicate"
     MATCH = "match"
     MATCH_EXCEPTION = "match_exception"
-    EXCEPTION_RESOLVED = "exception_resolved"
+    CLASSIFY = "classify"
+    REMATCH = "rematch"
+    ACCEPT_WITH_REASON = "accept_with_reason"
     NO_PO_REFERENCE = "no_po_reference"
     CODE = "code"
     REQUEST_APPROVAL = "request_approval"
@@ -145,8 +148,16 @@ TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     (_S.DUPLICATE_CHECKED, _E.MATCH): _S.MATCHED,
     (_S.DUPLICATE_CHECKED, _E.MATCH_EXCEPTION): _S.EXCEPTION,
     (_S.DUPLICATE_CHECKED, _E.NO_PO_REFERENCE): _S.NON_PO,
-    (_S.EXCEPTION, _E.EXCEPTION_RESOLVED): _S.MATCHED,
-    (_S.EXCEPTION, _E.REJECT): _S.REJECTED,
+    # EXCEPTION is left one way: CLASSIFY@v1 explains it and hands it to a
+    # person. Nothing else - not even a person - acts on an unexplained
+    # exception, so the queue item always carries the explanation.
+    (_S.EXCEPTION, _E.CLASSIFY): _S.PENDING_HUMAN,
+    # PENDING_HUMAN is left only by a person, and every edge out is in
+    # HUMAN_ONLY_EVENTS. Re-match after a data refresh (bounded by
+    # loop_limits.max_rematches), accept with a written reason, or reject.
+    (_S.PENDING_HUMAN, _E.REMATCH): _S.DUPLICATE_CHECKED,
+    (_S.PENDING_HUMAN, _E.ACCEPT_WITH_REASON): _S.MATCHED,
+    (_S.PENDING_HUMAN, _E.REJECT): _S.REJECTED,
     # --- coding -----------------------------------------------------------
     (_S.MATCHED, _E.CODE): _S.CODED,
     (_S.NON_PO, _E.CODE): _S.CODED,
@@ -177,7 +188,7 @@ _CANCELLABLE: tuple[InvoiceState, ...] = (
     _S.DUPLICATE_CHECKED,
     _S.ON_HOLD_DUPLICATE,
     _S.MATCHED,
-    _S.EXCEPTION,
+    _S.PENDING_HUMAN,
     _S.NON_PO,
     _S.CODED,
     _S.PENDING_APPROVAL,
@@ -190,6 +201,16 @@ this pipeline may quietly rewrite.
 """
 
 TRANSITIONS.update({(state, _E.CANCEL): _S.CANCELLED for state in _CANCELLABLE})
+
+HUMAN_ONLY_EVENTS: frozenset[InvoiceEvent] = frozenset(
+    {_E.REMATCH, _E.ACCEPT_WITH_REASON, _E.REJECT, _E.CANCEL}
+)
+"""Events only a person may fire. The loop refuses them from any rule or model.
+
+These are every way out of PENDING_HUMAN. The table says which moves exist; this
+says who may make them. A rule that emitted ``accept_with_reason`` would be the
+system approving its own exception, which the architecture forbids by name.
+"""
 
 
 STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
@@ -236,7 +257,7 @@ MATCHED regardless of what its numbers said, which is the shape of a system that
 pays whatever it is sent.
 
 Note what is deliberately absent: no stub edge leaves NEEDS_HUMAN_EXTRACTION,
-ON_HOLD_DUPLICATE, EXCEPTION or NEW_VENDOR. Those states exist because a human
+ON_HOLD_DUPLICATE, PENDING_HUMAN or NEW_VENDOR. Those states exist because a human
 is required, and a stub that walked past them would be simulating the approval
 this system is built to insist on. The loop asks for a stub step there, the
 table refuses, and the run halts - which is the correct outcome.

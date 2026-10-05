@@ -53,3 +53,12 @@ class ClassificationError(APAgentError):
     recorded with its reason, and is not an error. Either way the exception
     still reaches a person - the reason codes do not depend on the prose.
     """
+
+
+class HumanDecisionError(APAgentError):
+    """A person's decision on a held invoice could not be applied.
+
+    Raised before anything is written: the invoice was not in a state a person
+    acts on, the event is not one a person may fire, an acceptance carried no
+    reason, or the re-match limit is spent. Nothing changed, so there is no row.
+    """

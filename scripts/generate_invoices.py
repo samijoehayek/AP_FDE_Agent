@@ -616,14 +616,14 @@ def expected_halt(
     """Declare where the loop must stop for a person, and which flag stops it.
 
     An adversarial variant stops before the match, so its halt wins over the
-    order's state. Otherwise a held match stops at EXCEPTION with its reason
-    codes as the evidence, and a clean one is not expected to stop before the
-    approval step.
+    order's state. Otherwise a held match passes through EXCEPTION, is
+    explained, and stops at PENDING_HUMAN with its reason codes as the evidence;
+    a clean one is not expected to stop before the approval step.
     """
     if variant in ADVERSARIAL_HALTS:
         return ADVERSARIAL_HALTS[variant]
     if match is ExpectedMatch.EXCEPTION:
-        return InvoiceState.EXCEPTION, None
+        return InvoiceState.PENDING_HUMAN, None
     return None, None
 
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from tests.loop.conftest import fake_classify
 
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.contracts.audit import HumanActor, ModelActor, RuleActor, ToolActor, utc_now
@@ -32,7 +33,8 @@ from ap_agent.contracts.purchase_order import (
 from ap_agent.contracts.run import Action, ActionKind, InvoiceRecord, StepResult
 from ap_agent.contracts.screening import InputFlag
 from ap_agent.contracts.vendor import VendorCandidate, VendorMatch, VendorMatchBasis
-from ap_agent.errors import ExtractionError
+from ap_agent.errors import ClassificationError, ExtractionError, HumanDecisionError
+from ap_agent.loop import runner as runner_module
 from ap_agent.loop.runner import (
     DEFAULT_MAX_STEPS,
     HALT_NO_TOOL,
@@ -42,14 +44,17 @@ from ap_agent.loop.runner import (
     RunContext,
     StepTrail,
     actor_for,
+    apply_human_decision,
+    content_ref,
     decide,
     run,
     validate_extraction,
 )
 from ap_agent.loop.runner import apply as _apply_step
 from ap_agent.pricing import cost_usd, pricing_version
-from ap_agent.states.machine import InvoiceState
+from ap_agent.states.machine import InvoiceEvent, InvoiceState
 from ap_agent.tools import TOOL_MODULE_NAMES
+from ap_agent.tools.classify_exception import ClassifyExceptionInput, ClassifyExceptionOutput
 from ap_agent.tools.compute_extraction_confidence import DateResolutionReason, DateVerdict
 from ap_agent.tools.extract_invoice_text import ExtractInvoiceTextInput, ExtractInvoiceTextOutput
 from ap_agent.tools.extract_invoice_vision import ExtractInvoiceVisionOutput
@@ -319,6 +324,7 @@ def _context(  # noqa: PLR0913 - one keyword per injected seam reads better here
         lookup_vendor=_fake_lookup_factory(vendor_match),
         get_purchase_order=_fake_po_factory(purchase_order, found=po_found),
         get_receipts=_fake_receipts_factory(receipts),
+        classify=fake_classify,
     )
 
 
@@ -1270,7 +1276,7 @@ def test_a_missing_purchase_order_routes_to_exception(
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     assert final.receipts is None, "no point asking what arrived against an order nobody has"
     decision = next(event for event in ctx.events if event.decision == "match_exception")
     assert "po_not_found" in (decision.decision_basis or "")
@@ -1289,7 +1295,7 @@ def test_a_po_belonging_to_another_vendor_never_reaches_the_matcher(
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     assert final.receipts is None, "nothing was even fetched"
 
     assert final.match_result is not None
@@ -1309,7 +1315,7 @@ def test_the_identity_check_compares_ids_not_names(record: InvoiceRecord, tmp_pa
     )
     ctx = _context(tmp_path, purchase_order=impostor)
 
-    assert run(record, ctx).state is InvoiceState.EXCEPTION
+    assert run(record, ctx).state is InvoiceState.PENDING_HUMAN
 
 
 def test_nothing_received_still_reaches_the_matcher(record: InvoiceRecord, tmp_path: Path) -> None:
@@ -1325,7 +1331,7 @@ def test_nothing_received_still_reaches_the_matcher(record: InvoiceRecord, tmp_p
 
     final = run(record, ctx)
 
-    assert final.state is InvoiceState.EXCEPTION
+    assert final.state is InvoiceState.PENDING_HUMAN
     assert final.receipts is not None
     assert final.receipts.is_empty is True
     assert final.match_result is not None
@@ -1658,3 +1664,228 @@ def test_a_halt_for_a_missing_tool_is_not_an_error(record: InvoiceRecord, tmp_pa
     assert halt.decision == HALT_NO_TOOL
     assert halt.error_class is None
     assert halt.error_message is None
+
+
+# --- CLASSIFY@v1: EXCEPTION -> PENDING_HUMAN --------------------------------
+
+
+def _held(tmp_path: Path) -> RunContext:
+    """A context whose invoice is held: nothing was received against the order."""
+    return _context(tmp_path, receipts=ReceiptSet(po_number=PO_NUMBER))
+
+
+def test_an_exception_is_explained_and_handed_to_a_person(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    ctx = _held(tmp_path)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    assert final.classification is not None
+    assert final.classification.reason_code is ReasonCode.RECEIPT_MISSING
+    assert final.classification_rejected is None
+
+    seat = next(event for event in ctx.events if event.decision == "classified")
+    assert isinstance(seat.actor, ModelActor)
+    assert seat.tool_name == "classify_exception"
+    assert (seat.model_id, seat.prompt_version) == ("claude-sonnet-5", "classify_v1")
+    assert (seat.input_tokens, seat.output_tokens) == (1500, 120)
+    assert seat.cost_usd is not None
+    assert seat.output_ref == content_ref(final.classification)
+
+    move = next(event for event in ctx.events if event.decision == "classify")
+    assert isinstance(move.actor, RuleActor)
+    assert move.actor.rule_id == "CLASSIFY@v1"
+    assert (move.from_state, move.to_state) == (InvoiceState.EXCEPTION, InvoiceState.PENDING_HUMAN)
+    assert move.decision_basis == (
+        "config_version=guardrails_v1, codes=receipt_missing|quantity_over_tolerance, "
+        "lead=receipt_missing, resolver=ap_clerk, action=hold_for_manual_review"
+    )
+    assert "Review before paying" not in move.model_dump_json(), "the prose stays off the trail"
+    assert ctx.events[-1].decision == "halt_no_tool", "PENDING_HUMAN has no tool; it waits"
+
+
+def test_a_rejected_classification_still_reaches_a_person(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    def _rejecting(_payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
+        return ClassifyExceptionOutput(
+            classification=None,
+            rejected="reason_code=duplicate_suspected is not one the match reported (x)",
+            model_id="claude-sonnet-5",
+            prompt_version="classify_v1",
+            input_tokens=1500,
+            output_tokens=120,
+            latency_ms=900,
+        )
+
+    ctx = replace(_held(tmp_path), classify=_rejecting)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    assert final.classification is None
+    assert final.classification_rejected is not None
+    seat = next(event for event in ctx.events if event.decision == "rejected")
+    assert (seat.decision_basis or "").startswith("rejected: reason_code=duplicate_suspected")
+    assert seat.input_tokens == 1500, "a refused answer is still a paid call"
+    move = next(event for event in ctx.events if event.decision == "classify")
+    assert "resolver=none, action=none, classification=rejected:" in (move.decision_basis or "")
+
+
+def test_a_failed_classification_still_reaches_a_person(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    def _failing(_payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
+        msg = "classification API call failed: connection reset"
+        raise ClassificationError(msg)
+
+    ctx = replace(_held(tmp_path), classify=_failing)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    failure = next(event for event in ctx.events if event.event_type is AuditEventType.ERROR)
+    assert failure.tool_name == "classify_exception"
+    move = next(event for event in ctx.events if event.decision == "classify")
+    assert "classification=failed: ClassificationError" in (move.decision_basis or "")
+
+
+def test_nothing_to_explain_makes_no_call(record: InvoiceRecord, tmp_path: Path) -> None:
+    """A PO that was never found carries no match result. Codes only; no seat."""
+    ctx = replace(_context(tmp_path, po_found=False), classify=_never_classify)
+
+    final = run(record, ctx)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    move = next(event for event in ctx.events if event.decision == "classify")
+    assert "classification=not_run: no reason codes to explain" in (move.decision_basis or "")
+
+
+def _never_classify(_payload: ClassifyExceptionInput) -> ClassifyExceptionOutput:
+    msg = "the seat must not be called when there is nothing to explain"
+    raise AssertionError(msg)
+
+
+# --- PENDING_HUMAN: a person decides ----------------------------------------
+
+
+def _pending(record: InvoiceRecord, tmp_path: Path) -> tuple[InvoiceRecord, RunContext]:
+    ctx = _held(tmp_path)
+    held = run(record, ctx)
+    assert held.state is InvoiceState.PENDING_HUMAN
+    return held, ctx
+
+
+def test_acceptance_needs_a_written_reason(record: InvoiceRecord, tmp_path: Path) -> None:
+    held, ctx = _pending(record, tmp_path)
+    rows = len(ctx.events)
+
+    for reason in (None, "", "   "):
+        with pytest.raises(HumanDecisionError, match="needs a written reason"):
+            apply_human_decision(
+                held, ctx, event=InvoiceEvent.ACCEPT_WITH_REASON, user_id="u-7", reason=reason
+            )
+    assert len(ctx.events) == rows, "a refused decision writes nothing"
+
+
+def test_acceptance_moves_to_matched_under_the_person_s_name(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    held, ctx = _pending(record, tmp_path)
+
+    accepted = apply_human_decision(
+        held,
+        ctx,
+        event=InvoiceEvent.ACCEPT_WITH_REASON,
+        user_id="u-7",
+        reason="Receipt posted late in the warehouse system; goods confirmed on site.",
+    )
+
+    assert accepted.state is InvoiceState.MATCHED
+    row = ctx.events[-1]
+    assert isinstance(row.actor, HumanActor)
+    assert row.actor.user_id == "u-7"
+    assert (row.from_state, row.to_state) == (InvoiceState.PENDING_HUMAN, InvoiceState.MATCHED)
+    assert row.decision == "accept_with_reason"
+    assert row.decision_basis == (
+        "reason=Receipt posted late in the warehouse system; goods confirmed on site."
+    )
+    assert JsonlAuditWriter(tmp_path / "audit").verify(str(accepted.invoice_id)) is True
+
+
+def test_a_rematch_goes_back_through_the_match_and_is_counted(
+    record: InvoiceRecord, tmp_path: Path
+) -> None:
+    held, ctx = _pending(record, tmp_path)
+
+    sent_back = apply_human_decision(held, ctx, event=InvoiceEvent.REMATCH, user_id="u-7")
+
+    assert sent_back.state is InvoiceState.DUPLICATE_CHECKED
+    assert sent_back.rematch_count == 1
+    assert sent_back.classification is None, "the old explanation is for the old match"
+    assert ctx.events[-1].decision_basis == "rematch=1 of 2, config_version=guardrails_v1"
+
+    again = run(sent_back, ctx)
+    assert again.state is InvoiceState.PENDING_HUMAN, "nothing arrived, so it is held again"
+    assert again.classification is not None
+
+
+def test_the_rematch_limit_holds(record: InvoiceRecord, tmp_path: Path) -> None:
+    held, ctx = _pending(record, tmp_path)
+    for _ in range(2):
+        held = run(apply_human_decision(held, ctx, event=InvoiceEvent.REMATCH, user_id="u"), ctx)
+    rows = len(ctx.events)
+
+    with pytest.raises(HumanDecisionError, match="re-match limit reached: 2 of 2"):
+        apply_human_decision(held, ctx, event=InvoiceEvent.REMATCH, user_id="u")
+    assert len(ctx.events) == rows
+
+
+@pytest.mark.parametrize(
+    ("event", "terminal"),
+    [(InvoiceEvent.REJECT, InvoiceState.REJECTED), (InvoiceEvent.CANCEL, InvoiceState.CANCELLED)],
+)
+def test_reject_and_cancel_end_it(
+    record: InvoiceRecord, tmp_path: Path, event: InvoiceEvent, terminal: InvoiceState
+) -> None:
+    held, ctx = _pending(record, tmp_path)
+
+    ended = apply_human_decision(held, ctx, event=event, user_id="u-7")
+
+    assert ended.state is terminal
+    assert ctx.events[-1].decision_basis == "reason=none"
+
+
+def test_a_person_acts_only_on_pending_human(record: InvoiceRecord, tmp_path: Path) -> None:
+    ctx = _held(tmp_path)
+    with pytest.raises(HumanDecisionError, match="this invoice is RECEIVED"):
+        apply_human_decision(record, ctx, event=InvoiceEvent.REJECT, user_id="u")
+
+
+def test_only_human_events_go_through_the_human_door(record: InvoiceRecord, tmp_path: Path) -> None:
+    held, ctx = _pending(record, tmp_path)
+    with pytest.raises(HumanDecisionError, match="not a decision a person makes"):
+        apply_human_decision(held, ctx, event=InvoiceEvent.CLASSIFY, user_id="u")
+    with pytest.raises(HumanDecisionError, match="must name who"):
+        apply_human_decision(held, ctx, event=InvoiceEvent.REJECT, user_id="  ")
+
+
+def test_the_loop_refuses_a_human_only_event_from_a_rule(
+    record: InvoiceRecord, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The system must never approve its own exception - not even by a bug."""
+    held, ctx = _pending(record, tmp_path)
+
+    def _rogue(state_record: InvoiceRecord) -> tuple[InvoiceRecord, StepResult]:
+        return state_record, StepResult(event=InvoiceEvent.ACCEPT_WITH_REASON.value)
+
+    monkeypatch.setattr(runner_module, "_stub_step", _rogue)
+
+    final = run(held, ctx)
+
+    assert final.state is InvoiceState.PENDING_HUMAN
+    refused = ctx.events[-1]
+    assert refused.event_type is AuditEventType.ERROR
+    assert refused.error_class == "HumanOnlyEvent"

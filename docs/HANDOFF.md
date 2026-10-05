@@ -1,6 +1,6 @@
 # HANDOFF — ap-agent
 
-_Last updated: 2026-10-05. Last code change 2026-10-05 (Day 3 step 3: the guardrails applied - Phase 1 closed); verified live 2026-10-05. Update this file at the end of every working day._
+_Last updated: 2026-10-05. Last code change 2026-10-05 (the second LLM seat: classify_exception, CLASSIFY@v1, PENDING_HUMAN). Update this file at the end of every working day._
 
 ## Start here — catching up a new session
 
@@ -21,7 +21,7 @@ Read these four files, in this order, before changing anything:
    divergence is recorded in DECISIONS.md with a reason.
 
 Then run `just lint && just typecheck && just test` once. It should be green at
-**1624 tests**. If it is not, that is the first thing to fix and nothing below is
+**1692 tests**. If it is not, that is the first thing to fix and nothing below is
 trustworthy until it is.
 
 **Gap in the record:** there was a ~3-week pause between 2026-09-16 and
@@ -371,13 +371,17 @@ input validation at intake and the output filter on every reading,
 the arithmetic validator, ambiguous-date resolution (receipt window, then vendor
 locale), vendor resolution against the master (`lookup_vendor`), the purchase
 order from QuickBooks (`get_purchase_order`), the goods receipts
-(`get_receipts`), and **the three-way match** (`compute_match`). The state
-machine, the transition table, and the hash-chained JSONL audit trail are real
-throughout.
+(`get_receipts`), **the three-way match** (`compute_match`), and **the
+explanation of a held invoice** (`classify_exception`) handing it to a person at
+`PENDING_HUMAN`. The state machine, the transition table, and the hash-chained
+JSONL audit trail are real throughout.
 
-**8 of 16 tools are real.** Stubs: `find_duplicates`, `propose_gl_coding`,
-`request_approval`, `create_bill`, `classify_exception`, `notify`,
-`mark_ready_for_payment`, `verify_vendor_external`.
+**Both LLM seats are real**: reading documents (two readings) and explaining
+exceptions. The second is shown codes and numbers only, never document text.
+
+**9 of 16 tools are real.** Stubs: `find_duplicates`, `propose_gl_coding`,
+`request_approval`, `create_bill`, `notify`, `mark_ready_for_payment`,
+`verify_vendor_external`.
 
 **10 stub edges remain** in `STUB_TRANSITIONS`, all after `MATCHED`. They are
 enumerated in `states/machine.py` and asserted in
@@ -396,10 +400,38 @@ with a failing test to confirm it.
 2. ~~**A configured guardrail with no consumer.**~~ **Closed 2026-10-05.**
    `input_validation` and `output_filter` are applied; five adversarial
    documents stop for a person, tested end to end and two of them live.
-3. **The second LLM seat does not exist.** The architecture says a model sits in
-   exactly two chairs - reading documents, and explaining exceptions in prose.
-   Only the first is occupied; `classify_exception` is a stub. As of 2026-09-16
-   there are finally real `MatchResult`s for it to explain, so its input exists.
+3. ~~**The second LLM seat does not exist.**~~ **Closed 2026-10-05.**
+   `classify_exception` explains every held invoice at `CLASSIFY@v1` and hands
+   it to a person at `PENDING_HUMAN`. See *The second seat* below.
+
+### The second seat, and the human queue (2026-10-05)
+
+- **`classify_exception`** - Sonnet 5, structured outputs into
+  `ExceptionClassification`, no tools, prompt `prompts/classify_v1.md`. Shown the
+  `MatchResult`, `HeaderNumbers`, `PoSnapshot`, `VendorSummary`, the tolerances
+  and the config version - **codes, numbers and ERP ids; never document text**.
+  The snapshots' `from_...` constructors drop every vendor-written string. Code
+  then checks the answer: the lead `reason_code` must be one the match reported,
+  the summary is at most 120 words, and it goes through the output filter. A
+  refused answer is a result with a reason, not an error. Schema probed live
+  2026-10-05: **accepted** (4 properties, 3,336 bytes, 4.1 s).
+- **`CLASSIFY@v1`: `EXCEPTION -> PENDING_HUMAN`, always.** Accepted, rejected,
+  failed, or nothing to explain (no match result, e.g. PO not found), the
+  invoice moves on; the route never waits on the model. Rows: the seat's model
+  row (model, prompt, tokens, `cost_usd`, `output_ref` = sha256 of the
+  classification, and the rejection reason when refused), then the decision row
+  with `codes`, `lead`, `resolver` and `action`. The summary itself is on the
+  record, not the trail. `EXCEPTION` has no other exit.
+- **`PENDING_HUMAN` is left only by a person**, through
+  `apply_human_decision(record, ctx, event=..., user_id=..., reason=...)`:
+  `rematch` -> `DUPLICATE_CHECKED` (at most `loop_limits.max_rematches` = 2;
+  clears the stale explanation; the next `run` fetches and re-matches),
+  `accept_with_reason` -> `MATCHED` (written reason required, on the row),
+  `reject`, `cancel`. All four are `HUMAN_ONLY_EVENTS`; the loop refuses them
+  from any rule or model and records the attempt as an error. A refused human
+  decision raises `HumanDecisionError` and writes nothing.
+- **Accepting is not approving.** `MATCHED` sits before the approval gate - which
+  today is still the dangerous stub edge, so hole 1 is now the whole story.
 
 ### Known limitations of the match
 
@@ -423,10 +455,10 @@ fix in passing.
 The guardrails are done. Next is `request_approval` and the deletion of the
 dangerous edge, which deserves a session of its own - and now has more to
 consult: the approval matrix's `remit_to_mismatch` rule (two approvers, callback
-hold) can key off `remit_to_matches_master`. Then `classify_exception`, which is the one that spends
-tokens and is better done once approval exists so the explanation has somewhere
-to land. `find_duplicates` is cheap and deterministic and would delete another
-stub edge whenever it fits.
+hold) can key off `remit_to_matches_master`, and its `match_exception` rule off
+the codes `CLASSIFY@v1` hands over. `find_duplicates` is cheap and
+deterministic and would delete another stub edge whenever it fits. The
+explanation seat has had one live schema probe and no live classification yet.
 
 `request_approval` needs no live API call.
 

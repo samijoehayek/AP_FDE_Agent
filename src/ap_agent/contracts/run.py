@@ -30,6 +30,7 @@ from ulid import ULID
 
 from ap_agent.contracts.common import StrictModel
 from ap_agent.contracts.enums import AuditEventType
+from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.matching import MatchResult
 from ap_agent.contracts.purchase_order import PurchaseOrder, ReceiptSet
@@ -86,6 +87,13 @@ class ActionKind(StrEnum):
     STUB = "stub"
     """A step whose tool does not exist yet. Advances the state and records that."""
 
+    HUMAN_DECISION = "human_decision"
+    """A person acting on a held invoice. Not a tool and never chosen by ``decide``.
+
+    The only way to fire a :data:`~ap_agent.states.machine.HUMAN_ONLY_EVENTS`
+    event, through ``apply_human_decision``. Its row's actor is the person.
+    """
+
 
 class Action(StrictModel):
     """The decision, before anything is called.
@@ -102,6 +110,11 @@ class Action(StrictModel):
         max_length=64,
         description="Required when `by` is 'rule'. Names the rule version that decided, so a "
         "past decision stays explainable under the rules that made it.",
+    )
+    user_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Required when `by` is 'human': who acted. Becomes the HumanActor.",
     )
 
 
@@ -297,6 +310,23 @@ class InvoiceRecord(StrictModel):
         "citing no purchase order, or citing one that belongs to another vendor. "
         "The reason codes here are the matcher's alone; a later stage's codes do "
         "not join them.",
+    )
+    classification: ExceptionClassification | None = Field(
+        default=None,
+        description="The explanation seat's reading of the exception, once CLASSIFY@v1 has "
+        "run and accepted it. Display only: no rule reads it.",
+    )
+    classification_rejected: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Why the explanation was refused or never produced, when it was. The "
+        "invoice reaches a person either way; this says what the queue item lacks.",
+    )
+    rematch_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many times a person has sent this invoice back through the match "
+        "from PENDING_HUMAN. Bounded by loop_limits.max_rematches.",
     )
 
     @property

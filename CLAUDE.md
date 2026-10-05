@@ -83,8 +83,10 @@ Rules are not honour-system. Most of them fail a test if broken:
 `audit/chain.py`, `evals/golden.py`, `PostgresAuditWriter`, and every tool
 except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
 `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`,
-`get_receipts` and `compute_match` raise `NotImplementedError` under a docstring
-describing the responsibility and the constraints.
+`get_receipts`, `compute_match` and `classify_exception` raise
+`NotImplementedError` under a docstring describing the responsibility and the
+constraints. `classify_exception` is the second and last model seat: it is shown
+codes and numbers, never document text, and its answer is checked in code.
 
 `guardrails/config.py`, `guardrails/output_filter.py` and `src/ap_agent/matching/`
 are real. The output filter screens every model reading before anything reads
