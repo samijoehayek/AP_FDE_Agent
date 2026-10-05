@@ -63,14 +63,20 @@ class Settings(BaseSettings):
         default="extract_text_v2",
         description="The same, for the text seat.",
     )
+    classification_model: str = Field(
+        default="claude-sonnet-5",
+        description="Model id for the exception-explanation seat - the second and last seat a "
+        "model occupies. It has no tools and is shown codes and numbers, never document text.",
+    )
+    classification_prompt_version: str = Field(
+        default="classify_v1",
+        description="Selects prompts/<version>.md for the explanation seat. Versioned for the "
+        "same reason as the extraction prompts.",
+    )
     model_pricing_path: Path = Field(
         default=REPO_ROOT / "config" / "model_pricing.yaml",
         description="Per-model token prices, versioned. What an audit row's cost_usd was "
         "computed from, so a cost can be re-explained after list prices change.",
-    )
-    reasoning_model: str = Field(
-        default="claude-opus-5",
-        description="Model id for the exception-explanation seat.",
     )
 
     # --- Storage ---------------------------------------------------------

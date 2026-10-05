@@ -49,7 +49,13 @@ from ap_agent.contracts.enums import (
     SuggestedAction,
     SuggestedResolver,
 )
-from ap_agent.contracts.exceptions import ExceptionClassification
+from ap_agent.contracts.exceptions import (
+    ExceptionClassification,
+    HeaderNumbers,
+    PoLineSnapshot,
+    PoSnapshot,
+    VendorSummary,
+)
 from ap_agent.contracts.generated import (
     GENERATOR_VERSION,
     TRUTH_VERSION,
@@ -127,6 +133,7 @@ __all__ = [
     "GeneratedVariant",
     "GuardrailConfig",
     "HardProhibitions",
+    "HeaderNumbers",
     "HiddenTextLimits",
     "HumanActor",
     "InputCheck",
@@ -143,6 +150,8 @@ __all__ = [
     "OutputFilterPattern",
     "OutputFlag",
     "Percentage",
+    "PoLineSnapshot",
+    "PoSnapshot",
     "PurchaseOrder",
     "PurchaseOrderLine",
     "PurchaseOrderStatus",
@@ -165,6 +174,7 @@ __all__ = [
     "VendorMatch",
     "VendorMatchBasis",
     "VendorRef",
+    "VendorSummary",
     "is_allowed_currency",
     "normalise_decimal_text",
     "utc_now",

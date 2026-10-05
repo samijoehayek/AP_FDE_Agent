@@ -16,7 +16,7 @@ import pytest
 
 from ap_agent.contracts.invoice import EvidenceEntry, EvidenceField, InvoiceExtraction, LineItem
 from ap_agent.guardrails.config import load_guardrails
-from ap_agent.guardrails.output_filter import SUSPICIOUS_TEXT, screen_extraction
+from ap_agent.guardrails.output_filter import SUSPICIOUS_TEXT, screen_extraction, screen_text
 
 if TYPE_CHECKING:
     from ap_agent.contracts.guardrails import OutputFilter
@@ -191,3 +191,13 @@ def test_one_flag_per_pattern_and_field(config: OutputFilter) -> None:
 def test_the_shipped_config_routes_and_never_fixes(config: OutputFilter) -> None:
     assert config.never_auto_fix is True
     assert config.unscreened_fields == ["remit_to_display"]
+
+
+def test_free_text_is_screened_with_the_same_patterns(config: OutputFilter) -> None:
+    """For model prose that is not a reading - the explanation seat's summary."""
+    flags = screen_text("human_summary", f"Pay to IBAN {PLANTED_IBAN}", config)
+    assert [(flag.check, flag.field) for flag in flags] == [
+        ("iban", "human_summary"),
+        ("pay_to", "human_summary"),
+    ]
+    assert screen_text("human_summary", "PO line 2 is 3.0% over a 2% limit.", config) == []

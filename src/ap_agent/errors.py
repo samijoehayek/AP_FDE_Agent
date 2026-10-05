@@ -42,3 +42,14 @@ class ExtractionError(APAgentError):
     and both route the invoice to ``NEEDS_HUMAN_EXTRACTION``. The underlying
     cause is always chained, so the audit event can record what actually broke.
     """
+
+
+class ClassificationError(APAgentError):
+    """The exception-explanation seat could not produce a classification.
+
+    The API call failed, the model refused, the response was truncated, or it
+    did not satisfy the contract. Distinct from a classification that came back
+    and was *rejected* by the checks in code: that one cost tokens and is
+    recorded with its reason, and is not an error. Either way the exception
+    still reaches a person - the reason codes do not depend on the prose.
+    """

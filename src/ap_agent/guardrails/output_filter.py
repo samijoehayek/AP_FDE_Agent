@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from ap_agent.contracts.guardrails import OutputFilter
     from ap_agent.contracts.invoice import InvoiceExtraction
 
-__all__ = ["SUSPICIOUS_TEXT", "screen_extraction"]
+__all__ = ["SUSPICIOUS_TEXT", "screen_extraction", "screen_text"]
 
 SUSPICIOUS_TEXT = "suspicious_text"
 """The check name when the reader itself reported instruction-like text.
@@ -110,9 +110,24 @@ def screen_extraction(extraction: InvoiceExtraction, config: OutputFilter) -> li
     flags: list[OutputFlag] = []
     if any(text.strip() for text in extraction.suspicious_text):
         flags.append(OutputFlag(check=SUSPICIOUS_TEXT, field=SUSPICIOUS_TEXT))
+    return flags + _screen(list(_string_fields(extraction)), config)
 
+
+def screen_text(field: str, text: str, config: OutputFilter) -> list[OutputFlag]:
+    """Screen one piece of model-written prose, filed under ``field``.
+
+    For a model output that is not a reading - the explanation seat's
+    ``human_summary``. The same patterns and the same rules: a hit is reported
+    by pattern and field, and the text is never changed.
+    """
+    return _screen([(field, text)], config)
+
+
+def _screen(fields: list[tuple[str, str]], config: OutputFilter) -> list[OutputFlag]:
+    """Run every configured pattern over ``(path, value)`` pairs, honouring the skips."""
+    flags: list[OutputFlag] = []
     unscreened = set(config.unscreened_fields)
-    fields = [(path, value) for path, value in _string_fields(extraction) if path not in unscreened]
+    fields = [(path, value) for path, value in fields if path not in unscreened]
     for pattern in config.patterns:
         compiled = _compiled(pattern.pattern)
         skipped = set(pattern.skip_fields)
