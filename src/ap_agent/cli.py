@@ -502,6 +502,33 @@ def run_invoice(
     _print_staleness(final)
     if final.validation_flags:
         typer.secho(f"validation  : {', '.join(final.validation_flags)}", fg=typer.colors.YELLOW)
+    _print_explanation(final)
+
+
+def _print_explanation(final: InvoiceRecord) -> None:
+    """Show what the person at PENDING_HUMAN will read.
+
+    The trail keeps the classification's hash, not its words - prose belongs on
+    the record - and this command does not save the record. So this is the one
+    place a run's summary can be seen, and a held invoice that printed nothing
+    would hide the very thing the explanation seat exists to produce. Labelled
+    as model-written, as the architecture asks of anywhere it is displayed.
+    """
+    if final.state is not InvoiceState.PENDING_HUMAN:
+        return
+    explained = final.classification
+    if explained is None:
+        typer.secho(
+            f"explanation : none ({final.classification_rejected or 'not recorded'})",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    typer.echo(
+        f"explanation : lead={explained.reason_code.value}, "
+        f"resolver={explained.suggested_resolver.value}, "
+        f"action={explained.suggested_action.value}"
+    )
+    typer.echo(f"summary     : [AI-generated] {explained.human_summary}")
 
 
 def _print_staleness(final: InvoiceRecord) -> None:

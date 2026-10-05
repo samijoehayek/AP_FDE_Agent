@@ -11,8 +11,12 @@ import pytest
 from typer.testing import CliRunner
 
 from ap_agent import __version__
+from ap_agent import cli as cli_module
 from ap_agent.cli import app
+from ap_agent.contracts.enums import ReasonCode, SuggestedAction, SuggestedResolver
+from ap_agent.contracts.exceptions import ExceptionClassification
 from ap_agent.contracts.invoice import InvoiceExtraction
+from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.loop import runner as runner_module
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.compute_extraction_confidence import ComputeExtractionConfidenceInput
@@ -280,3 +284,59 @@ def test_a_missing_readings_file_fails_cleanly(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert "could not read saved readings" in result.output
+
+
+@pytest.mark.parametrize(
+    ("classification", "rejected", "expected"),
+    [
+        (
+            ExceptionClassification(
+                reason_code=ReasonCode.PRICE_OVER_TOLERANCE,
+                suggested_resolver=SuggestedResolver.BUYER,
+                human_summary="PO line 2 is billed 3.0% above the order price, against a 2% limit.",
+                suggested_action=SuggestedAction.REQUEST_PO_AMENDMENT,
+            ),
+            None,
+            [
+                (
+                    "explanation : lead=price_over_tolerance, resolver=buyer, "
+                    "action=request_po_amendment"
+                ),
+                (
+                    "summary     : [AI-generated] PO line 2 is billed 3.0% above the order "
+                    "price, against a 2% limit."
+                ),
+            ],
+        ),
+        (None, "failed: ClassificationError", ["explanation : none (failed: ClassificationError)"]),
+    ],
+)
+def test_run_shows_what_the_person_at_pending_human_will_read(  # noqa: PLR0913, PLR0917 - three fixtures, three cases
+    born_digital_pdf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    classification: ExceptionClassification | None,
+    rejected: str | None,
+    expected: list[str],
+) -> None:
+    """The summary is on the record, not the trail - so a held run must print it."""
+
+    def _held(record: InvoiceRecord, _ctx: object, **_kwargs: object) -> InvoiceRecord:
+        return record.model_copy(
+            update={
+                "state": InvoiceState.PENDING_HUMAN,
+                "classification": classification,
+                "classification_rejected": rejected,
+            }
+        )
+
+    monkeypatch.setattr(cli_module, "loop_run", _held)
+
+    result = runner.invoke(
+        app, ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "final state : PENDING_HUMAN" in result.output
+    for line in expected:
+        assert line in result.output
