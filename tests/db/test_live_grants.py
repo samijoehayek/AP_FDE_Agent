@@ -141,6 +141,32 @@ def test_the_application_deletes_nothing(app: sa.Connection, table: str) -> None
     assert _denied(app, f"DELETE FROM {table} WHERE false")  # noqa: S608 - fixed table names
 
 
+def test_the_only_deletes_the_application_holds_are_in_dbos_own_schema(
+    app: sa.Connection,
+) -> None:
+    """The structural form of the test above: every table, not a list that can go stale.
+
+    DBOS's migration grants the application role all privileges on its own
+    bookkeeping tables, DELETE among them; that is the one exception, and it is
+    confined to the ``dbos`` schema. Anything the business owns - ``public`` -
+    has no DELETE grant at all. Checked before the grant was made; see
+    DECISIONS.md 2026-10-12.
+    """
+    schemas = app.execute(
+        sa.text(
+            "SELECT DISTINCT table_schema FROM information_schema.role_table_grants "
+            "WHERE grantee = current_user AND privilege_type IN ('DELETE', 'TRUNCATE')"
+        )
+    ).scalars()
+    assert set(schemas) <= {"dbos"}
+
+
+def test_the_application_cannot_create_anything(app: sa.Connection) -> None:
+    """DBOS launches with run_migrations off: the application role runs no DDL anywhere."""
+    for schema in ("public", "dbos"):
+        assert _denied(app, f"CREATE TABLE {schema}.ddl_probe (x int)")
+
+
 @pytest.mark.parametrize("table", ["dedup_index", "approval_decisions", "audit_events"])
 def test_insert_only_tables_cannot_be_updated(app: sa.Connection, table: str) -> None:
     column = {

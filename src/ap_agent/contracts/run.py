@@ -232,6 +232,51 @@ class StepResult(StrictModel):
     )
 
 
+class StepOutcome(StrictModel):
+    """One loop iteration, decided but not yet committed - what a durable run checkpoints.
+
+    The loop splits each iteration in two: *decide* runs the step's tools and
+    works out the move, *commit* writes the row that records it and saves the
+    state. This is what passes between them, and what DBOS stores as the decide
+    step's output. A run that dies during commit is recovered from here, without
+    calling the step's tools - or its model - a second time.
+
+    ``step_seq`` is fixed at decide time, after the step's own call rows, so the
+    row commit writes has one position however many times commit is tried. A
+    second try finds that ``(run_id, step_seq)`` taken and writes nothing.
+
+    The record travels as ``record_ref``, a payload reference, never inline: a
+    checkpoint is another table, and the invoice's contents belong in one place.
+    """
+
+    kind: Literal["terminal", "transition", "halt", "error", "refused", "escalated"]
+    from_state: InvoiceState
+    to_state: InvoiceState | None = Field(
+        default=None, description="Set for a transition only; the row that moves the invoice."
+    )
+    event_type: AuditEventType = AuditEventType.STATE_TRANSITION
+    action: Action | None = None
+    result: StepResult | None = None
+    step_seq: int | None = Field(
+        default=None, ge=0, description="The position of the row commit writes. None: no row."
+    )
+    record_ref: str = Field(
+        max_length=128,
+        description="The record as the step left it, as a payload reference. The row is "
+        "written about it; it is saved only if ``save``.",
+    )
+    save: bool = Field(
+        default=False,
+        description="Whether commit saves the record. False for an errored or refused step, "
+        "which leaves the invoice where the step began so a re-run restarts it.",
+    )
+
+    @property
+    def stops(self) -> bool:
+        """Whether the run ends after this iteration."""
+        return self.kind != "transition"
+
+
 class InvoiceRecord(StrictModel):
     """One invoice, and everything known about it so far.
 

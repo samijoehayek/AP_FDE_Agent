@@ -62,3 +62,14 @@ class HumanDecisionError(APAgentError):
     acts on, the event is not one a person may fire, an acceptance carried no
     reason, or the re-match limit is spent. Nothing changed, so there is no row.
     """
+
+
+class DuplicateAuditRowError(APAgentError):
+    """A row is already on the trail at this ``(run_id, step_seq)``.
+
+    Raised by the writer, before anything is appended. A loop step that is tried
+    twice - DBOS runs steps at least once - meets this on its second try and
+    writes nothing; that is how a repeat becomes harmless rather than a second
+    copy of the same transition. In ``audit_events`` the same rule is a unique
+    constraint.
+    """

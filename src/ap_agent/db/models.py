@@ -44,6 +44,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -198,7 +199,9 @@ class AuditEventRow(Base):
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("invoice_id", "run_id", "step_seq"),
+        # One row per position in a run. A durable run's steps are tried at least
+        # once; this is what makes the second try write nothing (revision 0006).
+        UniqueConstraint("run_id", "step_seq"),
         Index("ix_audit_events_invoice_id_step_seq", "invoice_id", "step_seq"),
         Index("ix_audit_events_ts_utc", "ts_utc"),
         CheckConstraint("step_seq >= 0", name="step_seq_non_negative"),
@@ -349,6 +352,15 @@ class Run(Base):
 
     __table_args__ = (
         Index("ix_runs_invoice_id", "invoice_id"),
+        # At most one unfinished run per invoice: `just run` on a document whose
+        # run never finished attaches to that run instead of starting a second
+        # one that would drive the same invoice (revision 0006).
+        Index(
+            "uq_runs_invoice_id_unfinished",
+            "invoice_id",
+            unique=True,
+            postgresql_where=text("ended_at IS NULL"),
+        ),
         CheckConstraint("step_count >= 0", name="step_count_non_negative"),
     )
 

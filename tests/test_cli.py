@@ -21,6 +21,7 @@ from ap_agent.contracts.invoice import InvoiceExtraction
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.loop import runner as runner_module
 from ap_agent.loop.runner import RunContext
+from ap_agent.loop.runner import run as loop_run
 from ap_agent.payloads import InMemoryPayloadStore
 from ap_agent.persistence import (
     InMemoryApprovalStore,
@@ -53,6 +54,17 @@ def in_memory_stores(monkeypatch: pytest.MonkeyPatch) -> InMemoryInvoiceStore:
     monkeypatch.setattr(cli_module, "dedup_index", lambda: dedup)
     approvals = InMemoryApprovalStore()
     monkeypatch.setattr(cli_module, "approval_store", lambda: approvals)
+
+    def _in_process(invoice_id: str, ctx: RunContext, max_steps: int) -> None:
+        loop_run(store.load(invoice_id), ctx, max_steps=max_steps)
+
+    # No DBOS without a database: the same driver, in process.
+    monkeypatch.setattr(cli_module, "run_durably", _in_process)
+
+    def _never_started(_run_id: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(cli_module, "workflow_status", _never_started)
     return store
 
 
@@ -363,19 +375,18 @@ def test_run_shows_what_the_person_at_pending_human_will_read(  # noqa: PLR0913,
 ) -> None:
     """The summary is on the record, not the trail - so a held run must print it."""
 
-    def _held(record: InvoiceRecord, ctx: RunContext, **_kwargs: object) -> InvoiceRecord:
-        held = record.model_copy(
+    def _held(invoice_id: str, ctx: RunContext, _max_steps: int) -> None:
+        assert ctx.store is not None
+        held = ctx.store.load(invoice_id).model_copy(
             update={
                 "state": InvoiceState.PENDING_HUMAN,
                 "classification": classification,
                 "classification_rejected": rejected,
             }
         )
-        assert ctx.store is not None
         ctx.store.save(held)  # what the CLI prints is what was stored
-        return held
 
-    monkeypatch.setattr(cli_module, "loop_run", _held)
+    monkeypatch.setattr(cli_module, "run_durably", _held)
 
     result = runner.invoke(
         app, ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")]
@@ -422,7 +433,7 @@ def test_a_finished_invoice_is_reported_and_left_alone(
         msg = "a finished invoice must not be run again"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(cli_module, "loop_run", _never)
+    monkeypatch.setattr(cli_module, "run_durably", _never)
 
     result = runner.invoke(
         app, ["run", str(born_digital_pdf), "--audit-dir", str(tmp_path / "audit")]

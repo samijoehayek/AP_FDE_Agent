@@ -19,6 +19,7 @@ What this does not do: decide anything. It stores and returns.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -27,6 +28,8 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from ap_agent.states.machine import InvoiceState, reachable_from
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+    from contextlib import AbstractContextManager
     from decimal import Decimal
 
     from ap_agent.contracts.approval import ApprovalRequirement
@@ -119,7 +122,26 @@ class InvoiceStore(Protocol):
         ...
 
     def start_run(self, run_id: str, invoice_id: str) -> None:
-        """Record that a run began."""
+        """Record that a run began. A second call for the same run changes nothing."""
+        ...
+
+    def unfinished_run(self, invoice_id: str) -> str | None:
+        """The run that began on this invoice and never ended, if there is one."""
+        ...
+
+    def unfinished_runs(self) -> list[tuple[str, str]]:
+        """Every ``(run_id, invoice_id)`` that began and never ended."""
+        ...
+
+    def abandon_run(self, run_id: str) -> None:
+        """Close a run nothing will ever finish, as ``abandoned``. Its counts stand."""
+        ...
+
+    def lock(self, invoice_id: str) -> AbstractContextManager[bool]:
+        """Hold the invoice for one process while the block runs. Yields False if taken.
+
+        Not a wait: a second process is told the invoice is busy and stops.
+        """
         ...
 
     def record_extraction(
@@ -243,8 +265,36 @@ class InMemoryInvoiceStore:
         self.records[str(record.invoice_id)] = record
 
     def start_run(self, run_id: str, invoice_id: str) -> None:
-        """Note the run."""
-        self.runs[run_id] = {"invoice_id": invoice_id, "ended": False}
+        """Note the run, once."""
+        self.runs.setdefault(run_id, {"invoice_id": invoice_id, "ended": False})
+
+    def unfinished_runs(self) -> list[tuple[str, str]]:
+        """Every run not yet ended."""
+        return [
+            (run_id, str(run["invoice_id"]))
+            for run_id, run in self.runs.items()
+            if not run["ended"]
+        ]
+
+    def abandon_run(self, run_id: str) -> None:
+        """Close it as abandoned."""
+        self.runs[run_id].update(ended=True, last_step="abandoned")
+
+    @contextmanager
+    def lock(self, invoice_id: str) -> Generator[bool]:  # noqa: ARG002 - one process, no contention
+        """Always held: an in-memory store has one process."""
+        yield True
+
+    def unfinished_run(self, invoice_id: str) -> str | None:
+        """The run on this invoice that has not ended, or None."""
+        return next(
+            (
+                run_id
+                for run_id, run in self.runs.items()
+                if run["invoice_id"] == invoice_id and not run["ended"]
+            ),
+            None,
+        )
 
     def finish_run(
         self, run_id: str, *, step_count: int, last_step: str | None, last_state: InvoiceState

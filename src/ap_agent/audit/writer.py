@@ -19,14 +19,24 @@ The contract this honours:
 One file per invoice. The chain is per-invoice, so a single file keeps the whole
 of one invoice's history in one place and makes concurrent work on different
 invoices independent.
+
+* **One row per position.** ``(run_id, step_seq)`` is unique: a second row at a
+  taken position is refused before anything is written. A durable run's steps
+  are tried at least once, and this is what makes the second try write nothing.
+  ``audit_events`` holds the same rule as a unique constraint (revision 0006).
+  The check here is a read followed by an append, so it is only as strong as
+  "one process writes an invoice's trail at a time" - which the run's
+  per-invoice lock provides.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import TYPE_CHECKING, Protocol
 
 from ap_agent.contracts.audit import GENESIS_HASH, AuditEvent
+from ap_agent.errors import DuplicateAuditRowError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -53,6 +63,10 @@ class AuditWriter(Protocol):
 
     def head(self, invoice_id: str) -> AuditEvent | None:
         """Return the most recent event for ``invoice_id``, or None."""
+        ...
+
+    def next_seq(self, invoice_id: str, run_id: str) -> int:
+        """Return the first free ``step_seq`` for ``run_id`` on ``invoice_id``'s trail."""
         ...
 
 
@@ -86,6 +100,9 @@ class JsonlAuditWriter:
         """
         invoice_id = event.invoice_id
         existing = self._lines(invoice_id)
+        if (event.run_id, event.step_seq) in self._positions(existing):
+            msg = f"{invoice_id}: a row is already at run {event.run_id}, step {event.step_seq}"
+            raise DuplicateAuditRowError(msg)
         previous = chain_hash(existing[-1]) if existing else GENESIS_HASH
 
         chained = event.model_copy(update={"prev_event_hash": previous})
@@ -94,6 +111,24 @@ class JsonlAuditWriter:
         with self.path_for(invoice_id).open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
         return chained
+
+    def next_seq(self, invoice_id: str, run_id: str) -> int:
+        """One past the highest ``step_seq`` this run has on the trail; 0 for a new run.
+
+        Read from the file rather than counted in memory, because a recovered run
+        is a new process: a count that started again at zero would hand out
+        positions the crashed process had already used.
+        """
+        taken = [seq for run, seq in self._positions(self._lines(invoice_id)) if run == run_id]
+        return max(taken) + 1 if taken else 0
+
+    @staticmethod
+    def _positions(lines: list[str]) -> set[tuple[str, int]]:
+        positions: set[tuple[str, int]] = set()
+        for line in lines:
+            row = json.loads(line)
+            positions.add((str(row["run_id"]), int(row["step_seq"])))
+        return positions
 
     def head(self, invoice_id: str) -> AuditEvent | None:
         """Return the last event written for ``invoice_id``."""
@@ -165,6 +200,14 @@ class PostgresAuditWriter:
 
     def head(self, invoice_id: str) -> AuditEvent | None:
         """Return the chain head for ``invoice_id``.
+
+        Raises:
+            NotImplementedError: Written by hand in a later session.
+        """
+        raise NotImplementedError
+
+    def next_seq(self, invoice_id: str, run_id: str) -> int:
+        """Return the first free ``step_seq`` for ``run_id``.
 
         Raises:
             NotImplementedError: Written by hand in a later session.

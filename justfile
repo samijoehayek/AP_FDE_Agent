@@ -52,8 +52,11 @@ db-reset:
     just db-up
     just db-migrate
 
+# Alembic for our tables, then DBOS's own tables in the `dbos` schema - both as
+# the owner. The application role never runs DDL.
 db-migrate:
     uv run alembic upgrade head
+    uv run python scripts/migrate_dbos.py
 
 # Fail if the models and the migrated database disagree. Part of `just test`:
 # drift is how 0001 shipped without five of its indexes.
@@ -116,6 +119,11 @@ po PO:
 #   just decide <invoice_id> approve --by alice --reason "checked against PO"
 decide ID ACTION *ARGS:
     uv run ap-agent decide {{ID}} {{ACTION}} {{ARGS}}
+
+# Finish every run a stopped process left unfinished. Skips any invoice another
+# live process holds. `just run <document>` does the same for one document.
+recover *ARGS:
+    uv run ap-agent recover {{ARGS}}
 
 # Print what an audit row's output_ref points at. Reads Postgres; no network.
 payload SHA:

@@ -21,13 +21,14 @@ just typecheck    # pyright, strict
 just test         # lint + typecheck + pytest with coverage
 just test-fast    # pytest only, for a tight loop
 just db-up        # Postgres 18 via docker compose
-just db-migrate   # alembic upgrade head
+just db-migrate   # alembic upgrade head, then DBOS's tables in the dbos schema (as the owner)
 just db-revision "message"
 just ingest       # walk data/ and write data/index.csv
 just generate     # render the labelled invoice fixture into data/generated/invoices/
 just seed         # seed the QuickBooks sandbox from config/sandbox_vendor_master.yaml
 just pull-data    # stream sample corpora from Hugging Face
 just docs-diagram # regenerate the state diagram from the transition table
+just recover      # finish every run a stopped process left unfinished
 ```
 
 ## Conventions
@@ -73,7 +74,7 @@ Rules are not honour-system. Most of them fail a test if broken:
 | 1 | `tests/tools/test_tool_contracts.py::test_no_tool_is_exposed_to_a_model` |
 | 2 | `tests/contracts/test_strictness.py::test_no_contract_carries_bank_details`, plus `extra="forbid"` on every contract |
 | 3 | `tests/tools/test_tool_contracts.py::test_no_forbidden_tool_exists` and its siblings |
-| 4 | `IllegalTransition` from `transition()`; `audit_events` is append-only in the schema (revision `0002`, verified against a live database) and the audit write is the loop's job |
+| 4 | `IllegalTransition` from `transition()`; `audit_events` is append-only in the schema (revision `0002`, verified against a live database) and the audit write is the loop's job; one row per `(run_id, step_seq)` (revision `0006`, and the JSONL writer), so a recovered run cannot record a transition twice - `tests/db/test_durable_live.py` kills a run between its row and its save |
 | 5 | `tests/tools/test_tool_contracts.py::test_external_writes_require_an_idempotency_key`; `erp_writes` table |
 | 6 | `.gitignore`, the `no-data-committed` pre-commit hook, gitleaks in CI |
 | 7 | Nothing automated. This one is on you. |
@@ -111,7 +112,11 @@ invoice state lives in Postgres (`db/store.py`); the record in memory is a
 cache. **The approval gate is real**: `APPROVAL-MATRIX@v1` decides who must
 approve, `request_approval` opens a durable request, and only a person moves an
 invoice past PENDING_APPROVAL - through `apply_human_decision` (`just decide`),
-whose events are all in `HUMAN_ONLY_EVENTS`. No stub edge crosses the gate. The
+whose events are all in `HUMAN_ONLY_EVENTS`. No stub edge crosses the gate.
+**Runs are durable** (`loop/durable.py`): a run is a DBOS workflow and each loop
+iteration is two steps, *decide* and *commit*. DBOS steps are at least once, not
+exactly once, so commit is written to be repeated: its row's `(run_id,
+step_seq)` is fixed by decide and a second write there is refused. The
 states after APPROVED, and GL coding before it, are still crossed by
 `STUB_TRANSITIONS` - enumerated in `states/machine.py` and asserted in
 `tests/states/test_stub_transitions.py`. The owner is writing those by hand. Do

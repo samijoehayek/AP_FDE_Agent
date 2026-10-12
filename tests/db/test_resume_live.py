@@ -78,6 +78,22 @@ def stores() -> Iterator[tuple[PostgresInvoiceStore, PostgresDedupIndex, list[st
     with _engine("database_migration_url").begin() as owner:
         for invoice_id in created:
             params = {"i": invoice_id}
+            # `ap-agent run` is a DBOS workflow now: its checkpoints go too.
+            for table in ("operation_outputs", "workflow_input", "workflow_output"):
+                owner.execute(
+                    sa.text(
+                        f"DELETE FROM dbos.{table} WHERE workflow_uuid IN "  # noqa: S608 - fixed names
+                        "(SELECT run_id FROM runs WHERE invoice_id = :i)"
+                    ),
+                    params,
+                )
+            owner.execute(
+                sa.text(
+                    "DELETE FROM dbos.workflow_status WHERE workflow_uuid IN "
+                    "(SELECT run_id FROM runs WHERE invoice_id = :i)"
+                ),
+                params,
+            )
             owner.execute(sa.text("DELETE FROM runs WHERE invoice_id = :i"), params)
             owner.execute(sa.text("DELETE FROM dedup_index WHERE invoice_id = :i"), params)
             sha = owner.execute(

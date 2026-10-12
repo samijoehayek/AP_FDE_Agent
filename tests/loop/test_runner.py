@@ -1930,6 +1930,9 @@ class _CheckingWriter:
             assert self.store.get(parse_ref(event.output_ref)) is not None, event.output_ref
         return self.inner.append(event)
 
+    def next_seq(self, invoice_id: str, run_id: str) -> int:
+        return self.inner.next_seq(invoice_id, run_id)
+
 
 def _resolving(ctx: RunContext) -> tuple[RunContext, InMemoryPayloadStore]:
     store = InMemoryPayloadStore()
@@ -2437,3 +2440,16 @@ def test_the_readings_are_recorded_by_ref_at_extracted(tmp_path: Path) -> None:
         ref = row[key]
         assert isinstance(ref, str)
         assert ctx.payloads.get(parse_ref(ref)) is not None, key
+
+
+# --- shared with test_decide_commit and the durable crash test --------------
+
+
+def happy_context(tmp_path: Path, extraction: InvoiceExtraction | None = None) -> RunContext:
+    """A context whose seats agree all the way to PENDING_APPROVAL. No network, no database."""
+    return _context(tmp_path, extraction)
+
+
+def make_extraction(**overrides: object) -> InvoiceExtraction:
+    """The clean reading the happy path is built on, with ``overrides`` applied."""
+    return _extraction(**overrides)

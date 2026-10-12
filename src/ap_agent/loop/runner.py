@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ap_agent.contracts.audit import (
     AuditEvent,
@@ -48,12 +48,14 @@ from ap_agent.contracts.run import (
     Action,
     ActionKind,
     InvoiceRecord,
+    StepOutcome,
     StepResult,
     ToolCallRecord,
 )
 from ap_agent.errors import (
     APAgentError,
     ClassificationError,
+    DuplicateAuditRowError,
     HumanDecisionError,
     IllegalTransition,
 )
@@ -65,6 +67,7 @@ from ap_agent.loop.dates import resolve_date_by_locale, resolve_date_by_receipt_
 from ap_agent.payloads import (
     InMemoryPayloadStore,
     PayloadStore,
+    parse_ref,
     store_ref,
 )
 from ap_agent.persistence import (
@@ -2112,12 +2115,14 @@ def actor_for(
     return RuleActor(rule_id=action.rule_id or STUB_RULE_ID, config_version=RULE_CONFIG_VERSION)
 
 
-def make_event(
+def make_event(  # noqa: PLR0913 - the step, plus the position a commit reserved
     record: InvoiceRecord,
     action: Action,
     result: StepResult,
     step: StepTransition,
     ctx: RunContext,
+    *,
+    step_seq: int | None = None,
 ) -> AuditEvent:
     """Build the audit event for one step.
 
@@ -2126,12 +2131,16 @@ def make_event(
     decorative.
 
     ``step_seq`` is this event's position in the run's trail - one row per thing
-    that happened, which is what the audit contract asks for.
+    that happened, which is what the audit contract asks for. The writer hands
+    out the next free one, from the trail rather than from this process's memory:
+    a recovered run is a new process. A commit passes the position its decide
+    step reserved instead, so that a second try lands on the same one.
     """
+    invoice_id = str(record.invoice_id)
     return AuditEvent(
-        invoice_id=str(record.invoice_id),
+        invoice_id=invoice_id,
         run_id=ctx.run_id,
-        step_seq=len(ctx.events),
+        step_seq=ctx.writer.next_seq(invoice_id, ctx.run_id) if step_seq is None else step_seq,
         ts_utc=ctx.now(),
         actor=actor_for(action, result, step.event_type),
         event_type=step.event_type,
@@ -2160,11 +2169,79 @@ def make_event(
 
 
 @dataclass
-class _Progress:
+class Progress:
     """How far a run got, for its ``runs`` row."""
 
     steps: int = 0
     last_step: str | None = None
+
+
+class Iterations(Protocol):
+    """The two halves of a loop iteration, as the driver sees them.
+
+    In process they are plain calls (:class:`InProcess`). In a durable run each
+    is a DBOS step (``loop/durable.py``), checkpointed when it returns. The
+    driver is the same code either way, so the control flow a recovered run
+    replays is the control flow every test exercises.
+    """
+
+    def decide(self) -> StepOutcome:
+        """Run the step for the state the invoice is in; reserve its row's position."""
+        ...
+
+    def commit(self, outcome: StepOutcome) -> None:
+        """Write the row, then save the state. Harmless to repeat."""
+        ...
+
+    def escalate(self, max_steps: int) -> None:
+        """Record that the budget ran out, once."""
+        ...
+
+
+def drive(iterations: Iterations, max_steps: int, progress: Progress) -> InvoiceState | None:
+    """The loop: decide, commit, until something stops it. Returns the last state seen."""
+    state: InvoiceState | None = None
+    while progress.steps < max_steps:
+        outcome = iterations.decide()
+        state = outcome.to_state or outcome.from_state
+        if outcome.kind == "terminal":
+            return state
+        iterations.commit(outcome)
+        progress.last_step = _last_step(outcome)
+        if outcome.stops:
+            return state
+        progress.steps += 1
+    if state is None or not is_terminal(state):
+        iterations.escalate(max_steps)
+    return state
+
+
+def _last_step(outcome: StepOutcome) -> str:
+    if outcome.kind == "transition" and outcome.result is not None:
+        return outcome.result.event
+    if outcome.kind == "halt":
+        return HALT_NO_TOOL
+    return "error"
+
+
+@dataclass
+class InProcess:
+    """Both halves called directly, carrying the record between them."""
+
+    record: InvoiceRecord
+    ctx: RunContext
+
+    def decide(self) -> StepOutcome:
+        """See :func:`decide_iteration`."""
+        return decide_iteration(self.record, self.ctx)
+
+    def commit(self, outcome: StepOutcome) -> None:
+        """See :func:`commit_iteration`; keeps the record for the next decide."""
+        self.record = commit_iteration(self.ctx, outcome)
+
+    def escalate(self, max_steps: int) -> None:
+        """See :func:`escalation`."""
+        self.commit(escalation(self.record, self.ctx, max_steps))
 
 
 def run(
@@ -2183,101 +2260,172 @@ def run(
     invoice in the state the step began in, so running it again restarts that
     step and nothing before it.
 
+    In process, and so not durable: this is what tests and the in-memory path
+    use. ``loop/durable.py`` runs the same driver with each half a DBOS step.
+
     Never raises. A failed invoice is a routing outcome, not a crash: the caller
     gets a record whose state says where it stopped.
     """
-    progress = _Progress()
+    progress = Progress()
+    iterations = InProcess(record, ctx)
     if ctx.store is not None:
         ctx.store.start_run(ctx.run_id, str(record.invoice_id))
     try:
-        record = _advance(record, ctx, max_steps, progress)
+        drive(iterations, max_steps, progress)
     finally:
         if ctx.store is not None:
             ctx.store.finish_run(
                 ctx.run_id,
                 step_count=progress.steps,
                 last_step=progress.last_step,
-                last_state=record.state,
+                last_state=iterations.record.state,
             )
+    return iterations.record
+
+
+def decide_iteration(record: InvoiceRecord, ctx: RunContext) -> StepOutcome:
+    """The first half of an iteration: run the step, work out the move. Writes no decision row.
+
+    The step's tools write their own call rows as they return (:class:`StepTrail`)
+    - a model call that was paid for is on the trail even if everything after it
+    dies. What this does *not* do is write the row that records the decision, or
+    save the state: it reserves that row's position and stores the record as a
+    payload, and :func:`commit_iteration` does the rest.
+
+    With a store the record is reloaded first: the database, not this process's
+    memory, says where the invoice is.
+    """
+    if ctx.store is not None:
+        record = ctx.store.load(str(record.invoice_id))
+    from_state = record.state
+    if is_terminal(from_state):
+        return StepOutcome(
+            kind="terminal", from_state=from_state, record_ref=store_ref(ctx.payloads, record)
+        )
+
+    action = decide(record)
+    trail = StepTrail(ctx, record, from_state)
+    try:
+        record, result = apply(action, record, ctx, trail)
+    except Exception as exc:
+        # The failing tool has already written its own row through the trail.
+        # This one records that the *step* stopped, and why. Nothing is saved:
+        # the invoice stays where the step began, so a re-run restarts it.
+        log.exception("step_failed", invoice_id=str(record.invoice_id))
+        failed = StepResult(
+            event="error",
+            error=f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS],
+            error_class=type(exc).__name__,
+        )
+        step = StepTransition(from_state, None, AuditEventType.ERROR)
+        return _outcome(ctx, record, "error", action=action, result=failed, step=step, save=False)
+
+    if result.event in _HUMAN_ONLY_VALUES:
+        # A rule or a model emitted a decision only a person may make. That is a
+        # defect, not a route - the system must never approve its own exception -
+        # so it is recorded as an error and the run stops.
+        refused = result.model_copy(
+            update={
+                "error": f"{result.event} is human-only; the loop may not fire it",
+                "error_class": "HumanOnlyEvent",
+            }
+        )
+        step = StepTransition(from_state, None, AuditEventType.ERROR)
+        return _outcome(
+            ctx, record, "refused", action=action, result=refused, step=step, save=False
+        )
+
+    try:
+        to_state = transition(from_state, result.event)
+    except IllegalTransition as exc:
+        # The state does not move, but what the step learned is kept - a
+        # refreshed approval snapshot, for one.
+        halted, step = _halt(from_state, result, exc)
+        log.info("awaiting_human", invoice_id=str(record.invoice_id), state=from_state.value)
+        return _outcome(ctx, record, "halt", action=action, result=halted, step=step, save=True)
+
+    moved = record.model_copy(update={"state": to_state})
+    step = StepTransition(from_state, to_state)
+    return _outcome(ctx, moved, "transition", action=action, result=result, step=step, save=True)
+
+
+def escalation(record: InvoiceRecord, ctx: RunContext, max_steps: int) -> StepOutcome:
+    """The outcome that records a run stopped by its budget, not because it finished."""
+    log.warning(
+        "max_steps_reached",
+        invoice_id=str(record.invoice_id),
+        state=record.state.value,
+        max_steps=max_steps,
+    )
+    action = Action(kind=ActionKind.STUB, by="rule", rule_id="MAX_STEPS")
+    result = StepResult(
+        event="escalated",
+        error=f"stopped after {max_steps} steps in {record.state.value}",
+    )
+    step = StepTransition(record.state, None, AuditEventType.ERROR)
+    return _outcome(ctx, record, "escalated", action=action, result=result, step=step, save=False)
+
+
+def _outcome(  # noqa: PLR0913 - the parts of one iteration, named
+    ctx: RunContext,
+    record: InvoiceRecord,
+    kind: Literal["transition", "halt", "error", "refused", "escalated"],
+    *,
+    action: Action,
+    result: StepResult,
+    step: StepTransition,
+    save: bool,
+) -> StepOutcome:
+    """Reserve the decision row's position and store the record; nothing else."""
+    return StepOutcome(
+        kind=kind,
+        from_state=step.from_state,
+        to_state=step.to_state,
+        event_type=step.event_type,
+        action=action,
+        result=result,
+        step_seq=ctx.writer.next_seq(str(record.invoice_id), ctx.run_id),
+        record_ref=store_ref(ctx.payloads, record),
+        save=save,
+    )
+
+
+def commit_iteration(ctx: RunContext, outcome: StepOutcome) -> InvoiceRecord:
+    """The second half: write the decision row, then save the state. Safe to repeat.
+
+    The row first, then the state, as before - a crash between them must not
+    leave a move nobody recorded. What changed is what a second try does. The
+    row's position was fixed by :func:`decide_iteration`, so a repeat finds it
+    taken and writes nothing (:class:`DuplicateAuditRowError`); the save is an
+    upsert of the same record. The double transition row that a crash here used
+    to leave behind cannot be written.
+    """
+    record = _load_record(ctx, outcome.record_ref)
+    if outcome.action is not None and outcome.result is not None and outcome.step_seq is not None:
+        step = StepTransition(outcome.from_state, outcome.to_state, outcome.event_type)
+        event = make_event(
+            record, outcome.action, outcome.result, step, ctx, step_seq=outcome.step_seq
+        )
+        try:
+            ctx.events.append(ctx.writer.append(event))
+        except DuplicateAuditRowError:
+            log.info(
+                "audit_row_already_written",
+                invoice_id=str(record.invoice_id),
+                run_id=ctx.run_id,
+                step_seq=outcome.step_seq,
+            )
+    if outcome.save and ctx.store is not None:
+        ctx.store.save(record)
     return record
 
 
-def _advance(
-    record: InvoiceRecord, ctx: RunContext, max_steps: int, progress: _Progress
-) -> InvoiceRecord:
-    """The loop body. See :func:`run`."""
-    while progress.steps < max_steps:
-        if ctx.store is not None:
-            # The database, not this process's memory, says where the invoice is.
-            record = ctx.store.load(str(record.invoice_id))
-        if is_terminal(record.state):
-            break
-
-        from_state = record.state
-        action = decide(record)
-        trail = StepTrail(ctx, record, from_state)
-
-        try:
-            record, result = apply(action, record, ctx, trail)
-        except Exception as exc:
-            # The failing tool has already written its own row through the trail.
-            # This one records that the *step* stopped, and why. Nothing is
-            # saved: the invoice stays where the step began, so a re-run restarts it.
-            result = StepResult(
-                event="error",
-                error=f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS],
-                error_class=type(exc).__name__,
-            )
-            _write(
-                ctx, record, action, result, StepTransition(from_state, None, AuditEventType.ERROR)
-            )
-            progress.last_step = "error"
-            log.exception("step_failed", invoice_id=str(record.invoice_id))
-            return record
-
-        if result.event in _HUMAN_ONLY_VALUES:
-            # A rule or a model emitted a decision only a person may make. That
-            # is a defect, not a route - the system must never approve its own
-            # exception - so it is recorded as an error and the run stops.
-            refused = result.model_copy(
-                update={
-                    "error": f"{result.event} is human-only; the loop may not fire it",
-                    "error_class": "HumanOnlyEvent",
-                }
-            )
-            _write(
-                ctx, record, action, refused, StepTransition(from_state, None, AuditEventType.ERROR)
-            )
-            progress.last_step = "error"
-            return record
-
-        try:
-            to_state = transition(from_state, result.event)
-        except IllegalTransition as exc:
-            _write(ctx, record, action, *_halt(from_state, result, exc))
-            if ctx.store is not None:
-                # The state does not move, but what the step learned is kept -
-                # a refreshed approval snapshot, for one.
-                ctx.store.save(record)
-            progress.last_step = HALT_NO_TOOL
-            log.info("awaiting_human", invoice_id=str(record.invoice_id), state=from_state.value)
-            return record
-
-        # The row first, then the state. A crash between them repeats the step's
-        # row on resume rather than losing it - rule 4 says every transition is
-        # recorded, and a duplicate is visible where a gap is not. Piece 4's
-        # checkpointing removes the duplicate.
-        _write(ctx, record, action, result, StepTransition(from_state, to_state))
-        record = record.model_copy(update={"state": to_state})
-        if ctx.store is not None:
-            ctx.store.save(record)
-        progress.steps += 1
-        progress.last_step = result.event
-
-    if not is_terminal(record.state):
-        _escalate(ctx, record, max_steps)
-
-    return record
+def _load_record(ctx: RunContext, ref: str) -> InvoiceRecord:
+    stored = ctx.payloads.get(parse_ref(ref))
+    if stored is None:  # stored by decide_iteration before the ref existed
+        msg = f"record payload {ref} is missing"
+        raise APAgentError(msg)
+    return InvoiceRecord.model_validate_json(stored.content)
 
 
 _HUMAN_ONLY_VALUES: frozenset[str] = frozenset(event.value for event in HUMAN_ONLY_EVENTS)
@@ -2344,20 +2492,3 @@ def _emit(
 ) -> None:
     """Build, write and remember one audit event."""
     ctx.events.append(ctx.writer.append(make_event(record, action, result, step, ctx)))
-
-
-def _escalate(ctx: RunContext, record: InvoiceRecord, max_steps: int) -> None:
-    """Record that the run stopped because it ran out of budget, not because it finished."""
-    action = Action(kind=ActionKind.STUB, by="rule", rule_id="MAX_STEPS")
-    result = StepResult(
-        event="escalated",
-        error=f"stopped after {max_steps} steps in {record.state.value}",
-    )
-    step = StepTransition(record.state, None, AuditEventType.ERROR)
-    _write(ctx, record, action, result, step)
-    log.warning(
-        "max_steps_reached",
-        invoice_id=str(record.invoice_id),
-        state=record.state.value,
-        max_steps=max_steps,
-    )

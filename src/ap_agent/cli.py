@@ -24,11 +24,12 @@ from ulid import ULID
 from ap_agent import __version__
 from ap_agent.audit.writer import JsonlAuditWriter
 from ap_agent.config import REPO_ROOT
-from ap_agent.contracts.audit import utc_now
+from ap_agent.contracts.audit import AuditEvent, utc_now
 from ap_agent.contracts.run import InvoiceRecord
 from ap_agent.db.base import create_db_engine, create_session_factory
 from ap_agent.db.store import PostgresApprovalStore, PostgresDedupIndex, PostgresInvoiceStore
 from ap_agent.errors import APAgentError, HumanDecisionError
+from ap_agent.loop import durable
 from ap_agent.loop.dates import resolve_date_by_receipt_window
 from ap_agent.loop.runner import (
     DEFAULT_MAX_STEPS,
@@ -36,7 +37,6 @@ from ap_agent.loop.runner import (
     apply_human_decision,
     invoice_max_age_days,
 )
-from ap_agent.loop.runner import run as loop_run
 from ap_agent.payloads import JSON, PayloadStore, PostgresPayloadStore, parse_ref
 from ap_agent.persistence import ApprovalStore, DedupIndex, InvoiceStore, UnknownInvoiceError
 from ap_agent.states.machine import (
@@ -502,6 +502,51 @@ def approval_store() -> ApprovalStore:
     return PostgresApprovalStore(_sessions())
 
 
+def run_durably(invoice_id: str, ctx: RunContext, max_steps: int) -> None:
+    """How ``run``, ``decide`` and ``recover`` drive the loop: as a DBOS workflow.
+
+    A function rather than a direct call so a test without a database can run
+    the loop in process instead.
+    """
+    durable.execute(invoice_id, ctx, max_steps)
+
+
+def workflow_status(run_id: str) -> str | None:
+    """DBOS's status for a run. Substituted alongside :func:`run_durably`."""
+    return durable.workflow_status(run_id)
+
+
+def _choose_run(store: InvoiceStore, invoice_id: str) -> tuple[str, bool]:
+    """The run to drive this invoice: the unfinished one if DBOS can finish it, else a new one.
+
+    Returns ``(run_id, recovering)``. A run left unfinished whose workflow DBOS
+    no longer drives - it never started, or it ended without closing its row -
+    is closed as ``abandoned``: the invoices table still says where the invoice
+    is, so a new run starts from there and loses nothing.
+    """
+    unfinished = store.unfinished_run(invoice_id)
+    if unfinished is not None:
+        status = workflow_status(unfinished)
+        if status in durable.UNFINISHED:
+            return unfinished, True
+        store.abandon_run(unfinished)
+    return str(ULID()), False
+
+
+def _trail_rows(writer: JsonlAuditWriter, invoice_id: str, run_id: str) -> list[AuditEvent]:
+    """This run's rows, from the trail: a recovered run's earlier rows were written elsewhere."""
+    return [event for event in writer.read(invoice_id) if event.run_id == run_id]
+
+
+def _busy(invoice_id: str) -> typer.Exit:
+    typer.secho(
+        f"busy        : invoice {invoice_id} is being run by another process",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    return typer.Exit(code=1)
+
+
 @app.command()
 def payload(
     ref: Annotated[str, typer.Argument(help="A sha256, bare or as sha256:<hex>.")],
@@ -606,28 +651,35 @@ def run_invoice(
             storage_uri=path.resolve().as_uri(),
         )
 
+    invoice_id = str(record.invoice_id)
     writer = JsonlAuditWriter(audit_dir)
-    ctx = RunContext(
-        run_id=str(ULID()),
-        writer=writer,
-        payloads=payloads,
-        store=store,
-        dedup=dedup_index(),
-        approvals=approval_store(),
-    )
+    with store.lock(invoice_id) as held:
+        if not held:
+            raise _busy(invoice_id)
+        run_id, recovering = _choose_run(store, invoice_id)
+        if recovering:
+            typer.echo(f"recovering  : run {run_id}, left unfinished by a process that stopped")
+        ctx = RunContext(
+            run_id=run_id,
+            writer=writer,
+            payloads=payloads,
+            store=store,
+            dedup=dedup_index(),
+            approvals=approval_store(),
+        )
+        run_durably(invoice_id, ctx, max_steps)
+    # Printed from the store and the trail, not from this process's memory: what
+    # is shown is what a fresh process resuming this invoice would see.
+    final = store.load(invoice_id)
+    rows = _trail_rows(writer, invoice_id, run_id)
 
-    loop_run(record, ctx, max_steps=max_steps)
-    # Printed from the store, not from this process's memory: what is shown is
-    # what a fresh process resuming this invoice would see.
-    final = store.load(str(record.invoice_id))
-
-    moves = [event for event in ctx.events if event.to_state is not None]
+    moves = [event for event in rows if event.to_state is not None]
     colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
     typer.secho(f"final state : {final.state.value}", fg=colour)
     typer.echo(f"steps       : {len(moves)}")
-    typer.echo(f"audit rows  : {len(ctx.events)}")
-    typer.echo(f"audit trail : {writer.path_for(str(record.invoice_id))}")
-    typer.echo(f"chain intact: {writer.verify(str(record.invoice_id))}")
+    typer.echo(f"audit rows  : {len(rows)}")
+    typer.echo(f"audit trail : {writer.path_for(invoice_id)}")
+    typer.echo(f"chain intact: {writer.verify(invoice_id)}")
     _print_run_date(final)
     _print_staleness(final)
     if final.validation_flags:
@@ -711,28 +763,42 @@ def decide(
         raise typer.Exit(code=1) from exc
 
     writer = JsonlAuditWriter(audit_dir)
-    ctx = RunContext(
-        run_id=str(ULID()),
-        writer=writer,
-        payloads=payloads,
-        store=store,
-        dedup=dedup_index(),
-        approvals=approval_store(),
-    )
-    try:
-        decided = apply_human_decision(record, ctx, event=event, user_id=by, reason=reason)
-    except HumanDecisionError as exc:
-        typer.secho(f"refused     : {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
+    with store.lock(invoice_id) as held:
+        if not held:
+            raise _busy(invoice_id)
+        unfinished = store.unfinished_run(invoice_id)
+        if unfinished is not None:
+            typer.secho(
+                f"refused     : run {unfinished} never finished on this invoice; "
+                "`just run <document>` or `just recover` finishes it first",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        ctx = RunContext(
+            run_id=str(ULID()),
+            writer=writer,
+            payloads=payloads,
+            store=store,
+            dedup=dedup_index(),
+            approvals=approval_store(),
+        )
+        try:
+            decided = apply_human_decision(record, ctx, event=event, user_id=by, reason=reason)
+        except HumanDecisionError as exc:
+            typer.secho(f"refused     : {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
 
-    if decided.state is record.state:
-        typer.echo(f"recorded    : {ctx.events[-1].decision_basis}")
-        _print_approval(decided, ctx.approvals)
-        return
+        if decided.state is record.state:
+            typer.echo(f"recorded    : {ctx.events[-1].decision_basis}")
+            _print_approval(decided, ctx.approvals)
+            return
 
-    typer.echo(f"decided     : {record.state.value} -> {decided.state.value}")
-    if not is_terminal(decided.state):
-        loop_run(decided, ctx)
+        typer.echo(f"decided     : {record.state.value} -> {decided.state.value}")
+        if not is_terminal(decided.state):
+            # The same run id: the person's row and the rows that follow it are
+            # one run on the trail.
+            run_durably(invoice_id, ctx, DEFAULT_MAX_STEPS)
     final = store.load(invoice_id)
     colour = typer.colors.GREEN if final.state is InvoiceState.CLOSED else typer.colors.YELLOW
     typer.secho(f"final state : {final.state.value}", fg=colour)
@@ -740,6 +806,47 @@ def decide(
     typer.echo(f"chain intact: {writer.verify(invoice_id)}")
     _print_explanation(final)
     _print_approval(final, ctx.approvals)
+
+
+@app.command()
+def recover(
+    audit_dir: Annotated[
+        Path, typer.Option("--audit-dir", help="Where the JSONL trail is written.")
+    ] = REPO_ROOT / "data" / "audit",
+) -> None:
+    """Finish every run a stopped process left unfinished, one invoice at a time.
+
+    The explicit form of what ``just run <document>`` does for one document. A
+    run another live process is driving is skipped - its invoice's lock is
+    taken - so this can never become a second process running the same steps.
+    """
+    payloads = payload_store()
+    store = invoice_store(payloads)
+    pending = store.unfinished_runs()
+    if not pending:
+        typer.echo("nothing to recover")
+        return
+    writer = JsonlAuditWriter(audit_dir)
+    for run_id, invoice_id in pending:
+        with store.lock(invoice_id) as held:
+            if not held:
+                typer.secho(f"skipped     : {invoice_id} (run {run_id}) is live elsewhere")
+                continue
+            if workflow_status(run_id) not in durable.UNFINISHED:
+                store.abandon_run(run_id)
+                typer.secho(f"abandoned   : run {run_id} on {invoice_id}; DBOS cannot finish it")
+                continue
+            ctx = RunContext(
+                run_id=run_id,
+                writer=writer,
+                payloads=payloads,
+                store=store,
+                dedup=dedup_index(),
+                approvals=approval_store(),
+            )
+            run_durably(invoice_id, ctx, DEFAULT_MAX_STEPS)
+        final = store.load(invoice_id)
+        typer.echo(f"recovered   : run {run_id} on {invoice_id} -> {final.state.value}")
 
 
 def _print_explanation(final: InvoiceRecord) -> None:

@@ -15,6 +15,7 @@ What it does not do: delete. The role cannot.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -38,6 +39,7 @@ from ap_agent.persistence import (
 from ap_agent.states.machine import InvoiceState
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from decimal import Decimal
     from typing import Literal
 
@@ -181,9 +183,59 @@ class PostgresInvoiceStore:
             )
 
     def start_run(self, run_id: str, invoice_id: str) -> None:
-        """Insert the run row."""
+        """Insert the run row, once. A recovered run's start step may run twice."""
         with self.sessions() as session, session.begin():
-            session.execute(insert(Run).values(run_id=run_id, invoice_id=invoice_id, step_count=0))
+            session.execute(
+                insert(Run)
+                .values(run_id=run_id, invoice_id=invoice_id, step_count=0)
+                .on_conflict_do_nothing(index_elements=[Run.run_id])
+            )
+
+    def unfinished_runs(self) -> list[tuple[str, str]]:
+        """Every run with no ``ended_at``, oldest first."""
+        with self.sessions() as session:
+            rows = session.execute(
+                select(Run.run_id, Run.invoice_id)
+                .where(Run.ended_at.is_(None))
+                .order_by(Run.started_at)
+            ).all()
+        return [(row.run_id, row.invoice_id) for row in rows]
+
+    def abandon_run(self, run_id: str) -> None:
+        """End an unfinished run as ``abandoned``, leaving its counts as they were."""
+        with self.sessions() as session, session.begin():
+            session.execute(
+                update(Run)
+                .where(Run.run_id == run_id, Run.ended_at.is_(None))
+                .values(ended_at=func.now(), last_step="abandoned")
+            )
+
+    @contextmanager
+    def lock(self, invoice_id: str) -> Generator[bool]:
+        """A session-level advisory lock on the invoice, for as long as the block runs.
+
+        Held on its own connection in autocommit, so it is not an open
+        transaction, and Postgres releases it when the connection goes - a
+        process that dies cannot leave an invoice locked. That is what makes
+        "the lock is free" mean "nobody is running this invoice", which is the
+        fact recovering a run depends on.
+        """
+        key = func.hashtextextended(invoice_id, 0)
+        with self.sessions() as session:
+            connection = session.connection(execution_options={"isolation_level": "AUTOCOMMIT"})
+            held = bool(connection.execute(select(func.pg_try_advisory_lock(key))).scalar())
+            try:
+                yield held
+            finally:
+                if held:
+                    connection.execute(select(func.pg_advisory_unlock(key)))
+
+    def unfinished_run(self, invoice_id: str) -> str | None:
+        """The run on this invoice with no ``ended_at``. At most one: revision 0006."""
+        with self.sessions() as session:
+            return session.execute(
+                select(Run.run_id).where(Run.invoice_id == invoice_id, Run.ended_at.is_(None))
+            ).scalar_one_or_none()
 
     def finish_run(
         self, run_id: str, *, step_count: int, last_step: str | None, last_state: InvoiceState
