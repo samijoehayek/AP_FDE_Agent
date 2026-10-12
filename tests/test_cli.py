@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from tests.qbo_fake import FakeQbo
 from typer.testing import CliRunner
 
 from ap_agent import __version__
@@ -494,7 +495,7 @@ def _run_to_approval(pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def test_decide_records_votes_until_the_approval_completes_then_carries_on(
-    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    born_digital_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_qbo: FakeQbo
 ) -> None:
     """A first invoice from this vendor: two approvers. One vote waits; two move it."""
     invoice_id = _run_to_approval(born_digital_pdf, tmp_path, monkeypatch)
@@ -518,7 +519,11 @@ def test_decide_records_votes_until_the_approval_completes_then_carries_on(
     )
     assert second.exit_code == 0, second.output
     assert "decided     : PENDING_APPROVAL -> APPROVED" in second.output
-    assert "final state : CLOSED" in second.output, "the stubs after the gate"
+    # The invoice cites no purchase order, so nothing names a QuickBooks item
+    # for its line: POST@v1 refuses before calling anything, and a person looks.
+    assert "final state : PENDING_HUMAN" in second.output
+    assert not fake_qbo.queries
+    assert not fake_qbo.created
     assert "chain intact: True" in second.output
 
 

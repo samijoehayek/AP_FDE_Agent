@@ -182,6 +182,65 @@ def test_a_transport_failure_is_retried_then_reported() -> None:
     assert len(slept) == MAX_ATTEMPTS - 1
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_create_is_not_retried_after_a_fault_it_may_have_survived(status: int) -> None:
+    """A 500 on a POST does not say whether the bill was made. A retry could make two."""
+    client, transport, _ = _client([httpx.Response(status), httpx.Response(200, json={})])
+    with pytest.raises(QboError) as caught:
+        client.create("bill", {"DocNumber": "INV1"})
+    assert caught.value.status_code == status
+    assert len(transport.requests) == 1
+
+
+def test_a_create_is_retried_after_throttling() -> None:
+    """A 429 is QuickBooks refusing before it did anything: safe to send again."""
+    client, transport, _ = _client(
+        [httpx.Response(429), httpx.Response(200, json={"Bill": {"Id": "9"}})]
+    )
+    assert client.create("bill", {"DocNumber": "INV1"}) == {"Bill": {"Id": "9"}}
+    assert len(transport.requests) == 2
+
+
+class _Raising(httpx.BaseTransport):
+    def __init__(self, error: httpx.HTTPError) -> None:
+        self.error = error
+        self.calls = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        self.calls += 1
+        raise self.error
+
+
+def _no_wait(_seconds: float) -> None:
+    pass
+
+
+def _raising_client(error: httpx.HTTPError) -> tuple[QboClient, _Raising]:
+    transport = _Raising(error)
+    client = QboClient(
+        settings=Settings(_env_file=None, qbo_realm_id="1"),  # type: ignore[call-arg]
+        tokens=StubTokens(),  # type: ignore[arg-type]
+        http=httpx.Client(transport=transport),
+        sleep=_no_wait,
+    )
+    return client, transport
+
+
+def test_a_create_that_timed_out_reading_the_answer_is_not_sent_again() -> None:
+    client, transport = _raising_client(httpx.ReadTimeout("no answer"))
+    with pytest.raises(QboError, match="may or may not have been applied"):
+        client.create("bill", {"DocNumber": "INV1"})
+    assert transport.calls == 1
+
+
+def test_a_create_that_never_connected_is_retried() -> None:
+    client, transport = _raising_client(httpx.ConnectError("no route to host"))
+    with pytest.raises(QboError, match="unreachable after"):
+        client.create("bill", {"DocNumber": "INV1"})
+    assert transport.calls == MAX_ATTEMPTS
+
+
 # --- what it will not do ----------------------------------------------------
 
 

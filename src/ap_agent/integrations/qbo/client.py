@@ -51,6 +51,18 @@ a 400 just sends the same bad request again, and retrying a 401 burns the rate
 limit while the credential stays wrong.
 """
 
+REFUSED_BEFORE_PROCESSING: Final = frozenset({429})
+"""The only failures a create may be retried after: QuickBooks turned the request
+away before doing anything with it.
+
+A 500 or a read timeout on a POST says nothing about whether the record was
+made. Retrying one is how a single bill becomes two, so a create that fails
+that way raises instead, and the caller looks before it writes again.
+"""
+
+_NOT_SENT: Final = (httpx.ConnectError, httpx.ConnectTimeout)
+"""Transport errors that mean the request never reached QuickBooks."""
+
 
 class QboError(APAgentError):
     """A QuickBooks request failed.
@@ -114,8 +126,13 @@ class QboClient:
         There is no ``update`` and no ``delete``. Neither is needed by anything
         in this system, and a client that cannot express them is a client no
         future bug can use to express them.
+
+        Not retried after a failure that may have been applied - see
+        :data:`REFUSED_BEFORE_PROCESSING`. The caller's idempotency check is
+        what makes a second attempt safe, and it runs before the next attempt,
+        not inside this one.
         """
-        return self._request("POST", entity.lower(), json=payload)
+        return self._request("POST", entity.lower(), json=payload, repeatable=False)
 
     # --- transport -----------------------------------------------------
 
@@ -126,6 +143,7 @@ class QboClient:
         *,
         params: dict[str, str] | None = None,
         json: dict[str, Any] | None = None,
+        repeatable: bool = True,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/{path}"
         query = {"minorversion": MINOR_VERSION, **(params or {})}
@@ -141,6 +159,11 @@ class QboClient:
                 response = self._send(method, url, headers=headers, params=query, json=json)
             except httpx.HTTPError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                if not repeatable and not isinstance(exc, _NOT_SENT):
+                    msg = (
+                        f"QuickBooks {method} {path} may or may not have been applied: {last_error}"
+                    )
+                    raise QboError(msg) from exc
                 if attempt == MAX_ATTEMPTS:
                     break
                 self._back_off(attempt, None)
@@ -150,7 +173,10 @@ class QboClient:
                 parsed: dict[str, Any] = response.json()
                 return parsed
 
-            if response.status_code in RETRYABLE_STATUS and attempt < MAX_ATTEMPTS:
+            retryable = response.status_code in (
+                RETRYABLE_STATUS if repeatable else REFUSED_BEFORE_PROCESSING
+            )
+            if retryable and attempt < MAX_ATTEMPTS:
                 log.warning(
                     "qbo_retrying",
                     status=response.status_code,

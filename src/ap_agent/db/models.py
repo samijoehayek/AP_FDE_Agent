@@ -12,9 +12,10 @@ Four decisions worth reading before adding a fifth table:
   not.
 * Money is ``Numeric(18, 2)`` and currency travels with it. There is no
   application-wide currency constant.
-* ``erp_writes`` exists so rule 5 of ``CLAUDE.md`` has somewhere to live. Every
-  ERP write claims a unique idempotency key before it calls out, so a retry after
-  a timeout finds the prior row instead of posting twice.
+* Rule 5 of ``CLAUDE.md``: every ERP write claims a unique idempotency key before
+  it calls out. For a bill the key is ``invoices.erp_idempotency_key`` (revision
+  ``0007``), because it names the bill - one per vendor and number - rather than
+  the call. ``erp_writes``, the per-call ledger, is not written yet.
 * Approvals are rows, not callbacks. A four-day approval must survive a deploy.
 * ``payloads`` is content-addressed: the primary key is the sha256 of the bytes,
   so every ``output_ref`` on the trail can be resolved to what was hashed, and
@@ -110,6 +111,11 @@ class Invoice(Base):
     po_number: Mapped[str | None] = mapped_column(String(_ID_LEN), nullable=True)
     erp_bill_id: Mapped[str | None] = mapped_column(String(_ID_LEN), nullable=True)
     """The ERP's id for the bill this invoice became. Set once, by create_bill."""
+    erp_idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    """``bill:<vendor_id>:<normalised number>``, written before QuickBooks is called.
+
+    Unique: one bill per vendor and number, whichever invoice id asks for it.
+    """
     record_ref: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("payloads.sha256"), nullable=True
     )
@@ -142,6 +148,8 @@ class Invoice(Base):
         UniqueConstraint("vendor_id", "invoice_number"),
         # One invoice per document. Running the same file again resumes it.
         UniqueConstraint("document_sha256"),
+        # One bill per vendor and invoice number. Revision 0007.
+        UniqueConstraint("erp_idempotency_key"),
         Index("ix_invoices_state", "state"),
         Index("ix_invoices_vendor_id", "vendor_id"),
         CheckConstraint("total IS NULL OR total >= 0", name="total_non_negative"),

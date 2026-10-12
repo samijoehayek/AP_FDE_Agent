@@ -75,7 +75,7 @@ Rules are not honour-system. Most of them fail a test if broken:
 | 2 | `tests/contracts/test_strictness.py::test_no_contract_carries_bank_details`, plus `extra="forbid"` on every contract |
 | 3 | `tests/tools/test_tool_contracts.py::test_no_forbidden_tool_exists` and its siblings |
 | 4 | `IllegalTransition` from `transition()`; `audit_events` is append-only in the schema (revision `0002`, verified against a live database) and the audit write is the loop's job; one row per `(run_id, step_seq)` (revision `0006`, and the JSONL writer), so a recovered run cannot record a transition twice - `tests/db/test_durable_live.py` kills a run between its row and its save |
-| 5 | `tests/tools/test_tool_contracts.py::test_external_writes_require_an_idempotency_key`; `erp_writes` table |
+| 5 | `tests/tools/test_tool_contracts.py::test_external_writes_require_an_idempotency_key`; `create_bill` writes its key to `invoices.erp_idempotency_key` (unique, revision `0007`) before QuickBooks is called and looks for the bill before creating it - `tests/db/test_durable_live.py` kills a run after QuickBooks made the bill |
 | 6 | `.gitignore`, the `no-data-committed` pre-commit hook, gitleaks in CI |
 | 7 | Nothing automated. This one is on you. |
 
@@ -85,7 +85,7 @@ Rules are not honour-system. Most of them fail a test if broken:
 except `ingest_document`, `extract_invoice_vision`, `extract_invoice_text`,
 `compute_extraction_confidence`, `lookup_vendor`, `get_purchase_order`,
 `get_receipts`, `compute_match`, `classify_exception`, `find_duplicates`,
-`request_approval` and `notify` raise
+`request_approval`, `notify` and `create_bill` raise
 `NotImplementedError` under a docstring describing the responsibility and the
 constraints. `classify_exception` is the second and last model seat: it is shown
 codes and numbers, never document text, and its answer is checked in code.
@@ -116,8 +116,12 @@ whose events are all in `HUMAN_ONLY_EVENTS`. No stub edge crosses the gate.
 **Runs are durable** (`loop/durable.py`): a run is a DBOS workflow and each loop
 iteration is two steps, *decide* and *commit*. DBOS steps are at least once, not
 exactly once, so commit is written to be repeated: its row's `(run_id,
-step_seq)` is fixed by decide and a second write there is refused. The
-states after APPROVED, and GL coding before it, are still crossed by
+step_seq)` is fixed by decide and a second write there is refused.
+**`create_bill` is real** (`POST@v1`): from APPROVED only, it writes the key
+`bill:<vendor_id>:<normalised number>` to the invoice, asks QuickBooks for a
+bill with that DocNumber from that vendor, and creates one only if none is
+there. It posts no tax and no account-coded line yet; those go to a person. The
+states after POSTED, and GL coding before approval, are still crossed by
 `STUB_TRANSITIONS` - enumerated in `states/machine.py` and asserted in
 `tests/states/test_stub_transitions.py`. The owner is writing those by hand. Do
 not fill them in speculatively. If a session's task genuinely requires one of

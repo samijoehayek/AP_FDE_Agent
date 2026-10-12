@@ -28,7 +28,8 @@ EXPECTED_STUB_EDGES: set[tuple[str, str]] = {
     # which cites no purchase orders - stops dead at NON_PO.
     ("NON_PO", "CODED"),
     ("MATCHED", "CODED"),
-    ("APPROVED", "POSTED"),
+    # APPROVED -> POSTED is gone: create_bill is real, and an approved invoice
+    # leaves with a bill in QuickBooks or goes to a person.
     ("POSTED", "SCHEDULED"),
     ("SCHEDULED", "PAID"),
     ("PAID", "RECONCILED"),
@@ -45,6 +46,19 @@ def test_the_stub_edges_are_exactly_these() -> None:
 def test_every_stub_edge_uses_the_stub_event() -> None:
     """A stub must be identifiable in the trail, not disguised as a real event."""
     assert all(event == InvoiceEvent.STUB_OK.value for (_src, event) in STUB_TRANSITIONS)
+
+
+def test_posting_is_no_longer_scaffolding() -> None:
+    """An approved invoice reaches POSTED only on POST, the one event create_bill earns.
+
+    The edge out of APPROVED is the one with consequences: a stub there would
+    record a liability QuickBooks never heard of.
+    """
+    assert (InvoiceState.APPROVED, InvoiceEvent.STUB_OK.value) not in TRANSITIONS
+    assert {event for (src, event) in TRANSITIONS if src is InvoiceState.APPROVED} == {
+        InvoiceEvent.POST.value,
+        InvoiceEvent.POST_FAILED.value,
+    }
 
 
 def test_vendor_resolution_is_no_longer_scaffolding() -> None:

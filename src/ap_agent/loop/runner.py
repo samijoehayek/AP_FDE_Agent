@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ap_agent.contracts.audit import (
@@ -72,6 +73,7 @@ from ap_agent.payloads import (
 )
 from ap_agent.persistence import (
     CURRENT_APPROVAL_STORE,
+    CURRENT_INVOICE_STORE,
     ApprovalDecisionRefusedError,
     ApprovalStore,
     DedupIndex,
@@ -105,6 +107,15 @@ from ap_agent.tools.compute_match import (
     ComputeMatchInput,
     ComputeMatchOutput,
     compute_match,
+)
+from ap_agent.tools.create_bill import (
+    DOC_NUMBER_PATTERN,
+    BillConflictError,
+    BillLine,
+    CreateBillInput,
+    CreateBillOutput,
+    create_bill,
+    idempotency_key_for,
 )
 from ap_agent.tools.extract_invoice_text import (
     ExtractInvoiceTextInput,
@@ -150,7 +161,6 @@ from ap_agent.tools.request_approval import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from decimal import Decimal
 
     from pydantic import BaseModel
 
@@ -177,6 +187,7 @@ CLASSIFY_RULE_ID = "CLASSIFY@v1"
 DEDUP_RULE_ID = "DEDUP@v1"
 APPROVAL_RULE_ID = "APPROVAL-MATRIX@v1"
 APPROVAL_REFRESH_RULE_ID = "APPROVAL-REFRESH@v1"
+POST_RULE_ID = "POST@v1"
 STUB_RULE_ID = "STUB"
 
 HALT_NO_TOOL = "halt_no_tool"
@@ -291,6 +302,11 @@ def _default_classify(payload: ClassifyExceptionInput) -> ClassifyExceptionOutpu
     return classify_exception(payload)
 
 
+def _default_create_bill(payload: CreateBillInput) -> CreateBillOutput:
+    """Dispatch through the module attribute. See :func:`_default_ingest`."""
+    return create_bill(payload)
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Everything the loop needs from the outside world.
@@ -331,6 +347,7 @@ class RunContext:
         _default_request_approval
     )
     notify: Callable[[NotifyInput], NotifyOutput] = _default_notify
+    create_bill: Callable[[CreateBillInput], CreateBillOutput] = _default_create_bill
     """Where every ``output_ref`` is stored. In memory unless the caller says
     otherwise; ``just run`` passes the Postgres store."""
     now: Callable[[], datetime] = utc_now
@@ -518,6 +535,10 @@ def decide(record: InvoiceRecord) -> Action:  # noqa: PLR0911 - one arm per stat
             return Action(
                 kind=ActionKind.APPROVAL_REFRESH, by="rule", rule_id=APPROVAL_REFRESH_RULE_ID
             )
+        case InvoiceState.APPROVED:
+            # The one write with consequences. Chosen here and nowhere else;
+            # the step asks the transition table before it calls anything.
+            return Action(kind=ActionKind.CREATE_BILL, by="rule", rule_id=POST_RULE_ID)
         case InvoiceState.EXCEPTION:
             # The one way out of EXCEPTION. The seat explains; the rule routes
             # to a person whatever the seat says, or fails to say.
@@ -671,6 +692,9 @@ def apply(  # noqa: PLR0911 - one arm per action kind
 
         case ActionKind.APPROVAL_REFRESH:
             return _approval_refresh_step(record, ctx, trail)
+
+        case ActionKind.CREATE_BILL:
+            return _post_step(record, ctx, trail)
 
         case _:
             return _stub_step(record)
@@ -1347,6 +1371,151 @@ def _request_approval_step(
             result_summary=f"approval_id={opened.approval_id}",
             decision_basis=requirement.basis,
         ),
+    )
+
+
+class UnpostableError(APAgentError):
+    """This invoice cannot become a bill as it stands. A person decides what it should be."""
+
+
+def _post_step(
+    record: InvoiceRecord, ctx: RunContext, trail: StepTrail
+) -> tuple[InvoiceRecord, StepResult]:
+    """``POST@v1``: the approved invoice becomes an unpaid bill in QuickBooks, once.
+
+    The transition table is asked first: POST leaves APPROVED and nothing else,
+    so from any other state this raises before a single call. ``create_bill``
+    then re-reads the state and the approval for itself, writes the key, looks
+    for the bill, and creates it only if it is not there.
+
+    Two outcomes route to a person through POST_FAILED: an invoice that cannot
+    be expressed as a bill (:class:`UnpostableError`) and a key that names
+    somebody else's bill (``BillConflictError``). A QuickBooks failure is
+    neither - it raises, the invoice stays APPROVED, and the next run looks
+    before it writes.
+    """
+    transition(record.state, InvoiceEvent.POST.value)
+    if ctx.store is None:
+        msg = "posting needs the invoice store: the key is written there before QuickBooks is"
+        raise APAgentError(msg)
+    try:
+        payload = bill_for(record)
+    except UnpostableError as exc:
+        return record, StepResult(
+            event=InvoiceEvent.POST_FAILED.value,
+            decision_basis=f"rule={POST_RULE_ID}, not_posted: {exc}"[:MAX_BASIS_CHARS],
+        )
+
+    invoices = CURRENT_INVOICE_STORE.set(ctx.store)
+    approvals = CURRENT_APPROVAL_STORE.set(ctx.approvals)
+    try:
+        out = _call(trail, ActionKind.CREATE_BILL, "rule", ctx.create_bill)(payload)
+    except BillConflictError as exc:
+        return record, StepResult(
+            event=InvoiceEvent.POST_FAILED.value,
+            decision_basis=(f"rule={POST_RULE_ID}, key={payload.idempotency_key}, conflict: {exc}")[
+                :MAX_BASIS_CHARS
+            ],
+        )
+    finally:
+        CURRENT_APPROVAL_STORE.reset(approvals)
+        CURRENT_INVOICE_STORE.reset(invoices)
+
+    how = "found" if out.already_existed else "created"
+    ref = trail.ref(out)
+    trail.call(
+        ToolCallRecord(
+            kind=ActionKind.CREATE_BILL,
+            by="rule",
+            event_type=AuditEventType.ERP_WRITE,
+            summary=how,
+            output_ref=ref,
+            result_summary=f"erp_bill_id={out.erp_bill_id}",
+            basis=f"key={out.idempotency_key}, {how}, erp_bill_id={out.erp_bill_id}",
+        )
+    )
+    posted = record.model_copy(
+        update={"erp_bill_id": out.erp_bill_id, "erp_idempotency_key": out.idempotency_key}
+    )
+    return posted, StepResult(
+        event=InvoiceEvent.POST.value,
+        output_ref=ref,
+        result_summary=f"erp_bill_id={out.erp_bill_id}",
+        decision_basis=(
+            f"rule={POST_RULE_ID}, key={out.idempotency_key}, {how}, "
+            f"erp_bill_id={out.erp_bill_id}, total={payload.total} {payload.currency}, "
+            f"lines={len(payload.lines)}, approval_id={payload.approval_id}"
+        )[:MAX_BASIS_CHARS],
+    )
+
+
+def bill_for(record: InvoiceRecord) -> CreateBillInput:
+    """The bill this approved invoice should become - or why it cannot become one.
+
+    Every line must be paired by the match to a purchase-order line that names
+    a QuickBooks item: a line booked to an account needs GL coding, which is
+    not built. Tax is not posted yet, so an invoice carrying any is refused
+    rather than booked short. The amounts are the invoice's, which the match
+    held within tolerance and the approvers signed; the descriptions are the
+    order's.
+
+    Raises:
+        UnpostableError: With the reason, for the decision row.
+    """
+    extraction, order, result = record.extraction, record.purchase_order, record.match_result
+    if extraction is None or record.vendor_id is None or record.approval_id is None:
+        msg = "no extraction, resolved vendor or approval on the record"
+        raise UnpostableError(msg)
+    if order is None or result is None:
+        msg = "no purchase order: a line needs an item, and GL coding is not built"
+        raise UnpostableError(msg)
+    if extraction.tax_total != 0:
+        msg = f"tax_total={extraction.tax_total}: tax is not posted yet"
+        raise UnpostableError(msg)
+    if extraction.currency != order.currency:
+        msg = f"invoice in {extraction.currency}, order in {order.currency}"
+        raise UnpostableError(msg)
+    doc_number = normalise_invoice_number(extraction.invoice_number)
+    if not DOC_NUMBER_PATTERN.fullmatch(doc_number):
+        msg = f"invoice number normalises to {doc_number!r}; QuickBooks takes 1-21 letters/digits"
+        raise UnpostableError(msg)
+
+    order_lines = {line.line_no: line for line in order.lines}
+    paired = {
+        line.invoice_line_index: line.line_no
+        for line in result.lines
+        if line.invoice_line_index is not None and line.line_no is not None
+    }
+    lines: list[BillLine] = []
+    for index, item in enumerate(extraction.line_items):
+        ordered = order_lines.get(paired.get(index, 0))
+        if ordered is None or ordered.item_ref is None:
+            msg = f"invoice line {index} is not paired to an order line with an item"
+            raise UnpostableError(msg)
+        lines.append(
+            BillLine(
+                item_ref=ordered.item_ref,
+                description=ordered.description,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                amount=item.extended_price,
+            )
+        )
+    if not lines or sum((line.amount for line in lines), Decimal(0)) != extraction.total:
+        msg = f"the lines do not add up to the total {extraction.total}"
+        raise UnpostableError(msg)
+
+    return CreateBillInput(
+        idempotency_key=idempotency_key_for(record.vendor_id, doc_number),
+        invoice_id=str(record.invoice_id),
+        vendor_id=record.vendor_id,
+        doc_number=doc_number,
+        approval_id=record.approval_id,
+        currency=extraction.currency,
+        total=extraction.total,
+        txn_date=effective_date(record),
+        due_date=extraction.due_date,
+        lines=lines,
     )
 
 
@@ -2061,6 +2230,7 @@ _RULE_STEP_KINDS: frozenset[ActionKind] = frozenset(
         ActionKind.MATCH_PREP,
         ActionKind.COMPUTE_EXTRACTION_CONFIDENCE,
         ActionKind.LOOKUP_VENDOR,
+        ActionKind.CREATE_BILL,
     }
 )
 """Kinds whose *step* is a decision over several calls rather than one call.

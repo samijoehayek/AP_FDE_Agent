@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
 from ap_agent.contracts.dedup import DedupEntry
@@ -33,6 +34,7 @@ from ap_agent.persistence import (
     NUMBER_CLAIMING_STATES,
     ApprovalDecisionRefusedError,
     ApprovalView,
+    ErpKeyTakenError,
     UnknownInvoiceError,
     outcome,
 )
@@ -130,6 +132,8 @@ class PostgresInvoiceStore:
             # The column refuses negatives; a credit note's total stays on the record.
             "total": total if total is not None and total >= 0 else None,
             "po_number": record.purchase_order.po_number if record.purchase_order else None,
+            # Set once: a record that somehow lacks the id never clears it.
+            "erp_bill_id": func.coalesce(Invoice.erp_bill_id, record.erp_bill_id),
             "updated_at": func.now(),
         }
         with self.sessions() as session, session.begin():
@@ -229,6 +233,34 @@ class PostgresInvoiceStore:
             finally:
                 if held:
                     connection.execute(select(func.pg_advisory_unlock(key)))
+
+    def claim_erp_key(self, invoice_id: str, key: str) -> None:
+        """Write the key, in its own committed transaction, before QuickBooks is called.
+
+        Committed before the call returns so a process that dies inside the
+        call has left it behind. The unique constraint (revision 0007) is what
+        refuses a second invoice.
+        """
+        try:
+            with self.sessions() as session, session.begin():
+                claimed = session.execute(
+                    update(Invoice)
+                    .where(
+                        Invoice.invoice_id == invoice_id,
+                        or_(
+                            Invoice.erp_idempotency_key.is_(None),
+                            Invoice.erp_idempotency_key == key,
+                        ),
+                    )
+                    .values(erp_idempotency_key=key)
+                    .returning(Invoice.invoice_id)
+                ).scalar_one_or_none()
+        except IntegrityError as exc:
+            msg = f"bill key {key} is held by another invoice"
+            raise ErpKeyTakenError(msg) from exc
+        if claimed is None:
+            msg = f"{invoice_id} already holds a different bill key, or does not exist"
+            raise ErpKeyTakenError(msg)
 
     def unfinished_run(self, invoice_id: str) -> str | None:
         """The run on this invoice with no ``ended_at``. At most one: revision 0006."""
@@ -433,4 +465,6 @@ def _view(session: Session, approval_id: str) -> ApprovalView | None:
         status=status,
         approvals=approvals,
         rejected_by=rejected_by,
+        amount=row.amount,
+        currency=row.currency,
     )

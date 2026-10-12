@@ -237,8 +237,6 @@ STUB_TRANSITIONS: dict[tuple[InvoiceState, str], InvoiceState] = {
     (_S.NON_PO, _E.STUB_OK): _S.CODED,
     # TEMP STUB: GL coding is not implemented (propose_gl_coding).
     (_S.MATCHED, _E.STUB_OK): _S.CODED,
-    # TEMP STUB: the ERP write is not implemented (create_bill).
-    (_S.APPROVED, _E.STUB_OK): _S.POSTED,
     # TEMP STUB: payment scheduling is not implemented (mark_ready_for_payment).
     (_S.POSTED, _E.STUB_OK): _S.SCHEDULED,
     # TEMP STUB: payment confirmation comes from outside this system entirely.
@@ -255,6 +253,10 @@ real" and "what is scaffolding" can be told apart at a glance, and so a test can
 enumerate them. ``tests/states/test_stub_transitions.py`` lists every one, which
 means deleting a stub is a deliberate act with a failing test to confirm it -
 not something that happens by accident while editing nearby lines.
+
+APPROVED is no longer on this list either. ``create_bill`` is real, so an
+approved invoice leaves on POST, with a bill in QuickBooks, or on POST_FAILED,
+to a person. A stub there recorded a liability that was never booked.
 
 DUPLICATE_CHECKED is no longer on this list. ``compute_match`` is real, so an
 invoice leaves that state on MATCH or MATCH_EXCEPTION or not at all - and the

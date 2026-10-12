@@ -38,11 +38,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CURRENT_APPROVAL_STORE",
+    "CURRENT_INVOICE_STORE",
     "NUMBER_CLAIMING_STATES",
     "ApprovalDecisionRefusedError",
     "ApprovalStore",
     "ApprovalView",
     "DedupIndex",
+    "ErpKeyTakenError",
     "InMemoryApprovalStore",
     "InMemoryDedupIndex",
     "InMemoryInvoiceStore",
@@ -67,6 +69,10 @@ class UnknownInvoiceError(LookupError):
     """The store has no invoice with this id."""
 
 
+class ErpKeyTakenError(ValueError):
+    """The bill's idempotency key is held by another invoice, or this one holds another key."""
+
+
 class ApprovalDecisionRefusedError(ValueError):
     """A decision the approvals store will not record: decided already, or a second vote."""
 
@@ -87,6 +93,9 @@ class ApprovalView:
     approvals: tuple[str, ...]
     """Who has approved, in order. Distinct people, by construction."""
     rejected_by: str | None = None
+    amount: Decimal | None = None
+    """What the approvers were shown. ``create_bill`` posts this amount or nothing."""
+    currency: str | None = None
 
 
 def outcome(required: int, approvals: int, rejected: bool) -> ApprovalStatus:
@@ -141,6 +150,16 @@ class InvoiceStore(Protocol):
         """Hold the invoice for one process while the block runs. Yields False if taken.
 
         Not a wait: a second process is told the invoice is busy and stops.
+        """
+        ...
+
+    def claim_erp_key(self, invoice_id: str, key: str) -> None:
+        """Write the bill's idempotency key to the invoice, before QuickBooks is called.
+
+        A second claim of the same key by the same invoice changes nothing.
+
+        Raises:
+            ErpKeyTakenError: Another invoice holds the key, or this one holds another.
         """
         ...
 
@@ -202,6 +221,13 @@ class ApprovalStore(Protocol):
         ...
 
 
+CURRENT_INVOICE_STORE: ContextVar[InvoiceStore] = ContextVar("current_invoice_store")
+"""The invoice store for the run in progress, bound for ``create_bill``.
+
+The tool re-reads the invoice's state from here rather than trusting its
+caller, and writes the bill's key here before it calls QuickBooks.
+"""
+
 CURRENT_APPROVAL_STORE: ContextVar[ApprovalStore] = ContextVar("current_approval_store")
 """The approval store for the run in progress.
 
@@ -235,6 +261,8 @@ class InMemoryInvoiceStore:
     documents: dict[str, str] = field(default_factory=dict[str, str])
     runs: dict[str, dict[str, object]] = field(default_factory=dict[str, dict[str, object]])
     extractions: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    erp_keys: dict[str, str] = field(default_factory=dict[str, str])
+    """``key -> invoice_id``: the unique constraint revision 0007 puts on the column."""
 
     def find_by_document(self, sha256: str) -> InvoiceRecord | None:
         """The invoice for this document, or None."""
@@ -284,6 +312,19 @@ class InMemoryInvoiceStore:
     def lock(self, invoice_id: str) -> Generator[bool]:  # noqa: ARG002 - one process, no contention
         """Always held: an in-memory store has one process."""
         yield True
+
+    def claim_erp_key(self, invoice_id: str, key: str) -> None:
+        """Claim the key for this invoice, as the unique column would."""
+        holder = self.erp_keys.get(key)
+        held = next((k for k, owner in self.erp_keys.items() if owner == invoice_id), None)
+        if holder not in {None, invoice_id} or held not in {None, key}:
+            msg = (
+                f"bill key {key} is held by invoice {holder}"
+                if holder
+                else f"{invoice_id} holds {held}"
+            )
+            raise ErpKeyTakenError(msg)
+        self.erp_keys[key] = invoice_id
 
     def unfinished_run(self, invoice_id: str) -> str | None:
         """The run on this invoice that has not ended, or None."""
@@ -384,7 +425,7 @@ class InMemoryApprovalStore:
         config_version: str,
     ) -> tuple[ApprovalView, bool]:
         """Open the request, or return the existing one under this id."""
-        del amount, currency, config_version
+        del config_version
         if approval_id in self.requests:
             return self.requests[approval_id].view, False
         from ap_agent.contracts.audit import utc_now  # noqa: PLC0415 - avoids a cycle at import
@@ -397,6 +438,8 @@ class InMemoryApprovalStore:
             approver_role=requirement.approver_role,
             status="pending",
             approvals=(),
+            amount=amount,
+            currency=currency,
         )
         self.requests[approval_id] = _StoredApproval(view)
         return view, True

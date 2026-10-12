@@ -109,7 +109,6 @@ stateDiagram-v2
     [*] --> RECEIVED
     APPROVED --> POSTED: post
     APPROVED --> EXCEPTION: post_failed
-    APPROVED --> POSTED: stub_ok
     CODED --> CANCELLED: cancel
     CODED --> PENDING_APPROVAL: request_approval
     DUPLICATE_CHECKED --> CANCELLED: cancel
@@ -192,7 +191,7 @@ stateDiagram-v2
 | Table | Holds | Note |
 | --- | --- | --- |
 | `documents` | One row per distinct file, keyed by SHA-256 | Identity is the bytes |
-| `invoices` | Current state, the extracted header, `po_number`, `erp_bill_id`, and `record_ref` to the latest full record | Unique `(vendor_id, invoice_number)` — the duplicate control the database enforces — and unique `document_sha256`: one invoice per file |
+| `invoices` | Current state, the extracted header, `po_number`, `erp_bill_id`, `erp_idempotency_key`, and `record_ref` to the latest full record | Unique `(vendor_id, invoice_number)` — the duplicate control the database enforces — and unique `document_sha256`: one invoice per file. Unique `erp_idempotency_key` (revision `0007`): one bill per vendor and number, written before QuickBooks is called |
 | `payloads` | Bytes keyed by their SHA-256 | What every `output_ref` resolves to. Insert and read only |
 | `extractions` | Which readings belong to an invoice, by payload ref; a person's corrections | The golden set grows from the corrections |
 | `runs` | One row per loop invocation: start, end, steps, last step. `run_id` is the DBOS workflow id | At most one unfinished run per invoice (partial unique index): an unfinished run is one DBOS can recover, and `just run` attaches to it |
@@ -200,7 +199,7 @@ stateDiagram-v2
 | `approvals` | One durable request per invoice: how many approvers, of what role, and how it ended | A four-day approval must survive a deploy |
 | `approval_decisions` | One row per person per request | Unique `(approval_id, decided_by)`: two approvers are two people. Insert only |
 | `dedup_index` | What `find_duplicates` compares | Insert only |
-| `erp_writes` | The idempotency ledger | A key is claimed before the call goes out |
+| `erp_writes` | The idempotency ledger | Not written yet. `create_bill`'s key lives on `invoices`, because it names the bill rather than the call; see DECISIONS 2026-10-12 |
 
 The application role holds **no DELETE on any table we own** (revision `0004`;
 rule 3). `tests/db/test_live_grants.py` checks every grant by trying it as that
@@ -220,6 +219,23 @@ A run that halts for a person ends its workflow; `just decide` starts a new one.
 Each process drives one run under the executor id `run:<run_id>`, holding a
 Postgres advisory lock on the invoice, and recovers only that run
 (`just run <document>` or `just recover`).
+
+### Posting a bill
+
+`POST@v1` is the only step that writes to QuickBooks, and it runs from APPROVED
+only: the step asks the transition table first, and `create_bill` re-reads the
+invoice's state and its approval from the stores before it calls anything. The
+bill's key is `bill:<vendor_id>:<normalised invoice number>`; in QuickBooks it
+is the bill's `VendorRef` and `DocNumber`. The key is written to the invoice and
+committed, then QuickBooks is asked for a bill under it, then - only if there is
+none - the bill is created. A process that dies after QuickBooks answered has
+left the bill and the key behind, and the step that runs again finds the bill.
+A bill under the key for a different total, or the key held by another invoice,
+goes to a person through POST_FAILED. So does an invoice that cannot be posted
+yet: tax, or a line not paired to a purchase-order item. The bill's lines are
+the invoice's numbers with the order's descriptions; nothing a vendor typed is
+sent. The QuickBooks client does not retry a create after a failure that may
+have been applied (a 5xx, a read timeout) - the next attempt looks first.
 
 ## Audit trail
 

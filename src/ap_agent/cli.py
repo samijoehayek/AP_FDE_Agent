@@ -680,6 +680,7 @@ def run_invoice(
     typer.echo(f"audit rows  : {len(rows)}")
     typer.echo(f"audit trail : {writer.path_for(invoice_id)}")
     typer.echo(f"chain intact: {writer.verify(invoice_id)}")
+    _print_bill(final)
     _print_run_date(final)
     _print_staleness(final)
     if final.validation_flags:
@@ -742,8 +743,8 @@ def decide(
     The only way a person's decision enters the system: the row's actor is
     ``--by``. A vote that does not complete an approval is recorded and the
     invoice keeps waiting. Anything that moves the invoice is followed by a run,
-    so an approved invoice goes on as far as it can - which, until create_bill
-    is real, is the stubs to CLOSED.
+    so an approved invoice goes on as far as it can: POST@v1 makes or finds its
+    bill in QuickBooks, and the stubs after POSTED take it to CLOSED.
     """
     event = DECIDE_ACTIONS.get(action)
     if event is None:
@@ -804,6 +805,7 @@ def decide(
     typer.secho(f"final state : {final.state.value}", fg=colour)
     typer.echo(f"audit trail : {writer.path_for(invoice_id)}")
     typer.echo(f"chain intact: {writer.verify(invoice_id)}")
+    _print_bill(final)
     _print_explanation(final)
     _print_approval(final, ctx.approvals)
 
@@ -847,6 +849,12 @@ def recover(
             run_durably(invoice_id, ctx, DEFAULT_MAX_STEPS)
         final = store.load(invoice_id)
         typer.echo(f"recovered   : run {run_id} on {invoice_id} -> {final.state.value}")
+
+
+def _print_bill(final: InvoiceRecord) -> None:
+    """The QuickBooks bill this invoice became, once POST@v1 has made or found it."""
+    if final.erp_bill_id is not None:
+        typer.echo(f"erp bill    : {final.erp_bill_id} (key {final.erp_idempotency_key})")
 
 
 def _print_explanation(final: InvoiceRecord) -> None:

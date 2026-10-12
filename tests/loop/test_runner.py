@@ -379,7 +379,7 @@ def ctx(tmp_path: Path) -> RunContext:
         (InvoiceState.DUPLICATE_CHECKED, ActionKind.MATCH_PREP, "rule"),
         (InvoiceState.CODED, ActionKind.REQUEST_APPROVAL, "rule"),
         (InvoiceState.PENDING_APPROVAL, ActionKind.APPROVAL_REFRESH, "rule"),
-        (InvoiceState.APPROVED, ActionKind.STUB, "rule"),
+        (InvoiceState.APPROVED, ActionKind.CREATE_BILL, "rule"),
     ],
 )
 def test_decide_routes_by_state(
@@ -1136,7 +1136,7 @@ def test_no_stub_step_does_anything() -> None:
 
 def test_a_stub_step_changes_nothing_on_the_record(record: InvoiceRecord, ctx: RunContext) -> None:
     """Every remaining stub advances the state and touches nothing else."""
-    for state in (InvoiceState.MATCHED, InvoiceState.APPROVED, InvoiceState.POSTED):
+    for state in (InvoiceState.MATCHED, InvoiceState.POSTED):
         parked = record.model_copy(update={"state": state, "vendor_country": "IN"})
         updated, result = apply(decide(parked), parked, ctx)
         assert result.event == "stub_ok"
@@ -2257,7 +2257,7 @@ def test_approval_needs_two_different_people_then_the_invoice_moves(tmp_path: Pa
         row.decision_basis or ""
     )
 
-    assert run(approved, ctx).state is InvoiceState.CLOSED, "the stubs after the gate"
+    assert decide(approved).kind is ActionKind.CREATE_BILL, "past the gate: the bill is next"
 
 
 def test_one_rejection_rejects(tmp_path: Path) -> None:

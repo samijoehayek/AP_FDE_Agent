@@ -31,6 +31,7 @@ from reportlab.pdfgen.canvas import Canvas
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.pool import NullPool
 from tests.loop.test_runner import happy_context, make_extraction
+from tests.qbo_fake import FakeQbo
 from typer.testing import CliRunner
 from ulid import ULID
 
@@ -45,6 +46,7 @@ from ap_agent.db.base import create_session_factory
 from ap_agent.db.store import PostgresApprovalStore, PostgresDedupIndex, PostgresInvoiceStore
 from ap_agent.loop import durable
 from ap_agent.payloads import PostgresPayloadStore
+from ap_agent.persistence import ErpKeyTakenError
 from ap_agent.states.machine import InvoiceState
 from ap_agent.tools.ingest_document import ingest_document
 
@@ -100,11 +102,13 @@ class Invoice:
         store.create(record, document_sha256=self.sha, byte_size=len(content), storage_uri="x")
         self.invoice_id = str(record.invoice_id)
         self.run_id = f"run-{ULID()}"
-        self.number = f"DUR-{ULID()}"
+        self.post_run_id = f"run-{ULID()}"
+        # Short enough to be a bill's DocNumber once normalised (21 characters).
+        self.number = f"DUR-{str(ULID())[-10:]}"
         self.audit_dir = tmp_path
 
-    def child(self, mode: str) -> subprocess.CompletedProcess[str]:
-        """Run the child in ``mode`` against this invoice and run."""
+    def child(self, mode: str, run_id: str | None = None) -> subprocess.CompletedProcess[str]:
+        """Run the child in ``mode`` against this invoice and ``run_id`` (the first run's)."""
         argv = [
             "uv",
             "run",
@@ -112,7 +116,7 @@ class Invoice:
             str(CHILD),
             mode,
             self.invoice_id,
-            self.run_id,
+            run_id or self.run_id,
             str(self.audit_dir),
             self.number,
         ]
@@ -131,6 +135,11 @@ class Invoice:
             if row.event_type is AuditEventType.STATE_TRANSITION
         ]
 
+    @property
+    def qbo(self) -> FakeQbo:
+        """The ledger the child processes share."""
+        return FakeQbo(path=self.audit_dir / "qbo.json")
+
     def model_calls(self) -> int:
         return Counter(row.event_type for row in self.trail.read(self.invoice_id))[
             AuditEventType.MODEL_CALL
@@ -143,7 +152,12 @@ def invoice(tmp_path: Path) -> Iterator[Invoice]:
     created = Invoice(PostgresInvoiceStore(sessions, PostgresPayloadStore(sessions)), tmp_path)
     yield created
     with _engine("database_migration_url").begin() as owner:
-        params = {"i": created.invoice_id, "r": created.run_id, "s": created.sha}
+        params = {
+            "i": created.invoice_id,
+            "r": created.run_id,
+            "p": created.post_run_id,
+            "s": created.sha,
+        }
         for statement in (
             (
                 "DELETE FROM approval_decisions WHERE approval_id IN "
@@ -155,10 +169,10 @@ def invoice(tmp_path: Path) -> Iterator[Invoice]:
             "DELETE FROM dedup_index WHERE invoice_id = :i",
             "DELETE FROM invoices WHERE invoice_id = :i",
             "DELETE FROM documents WHERE sha256 = :s",
-            "DELETE FROM dbos.operation_outputs WHERE workflow_uuid = :r",
-            "DELETE FROM dbos.workflow_input WHERE workflow_uuid = :r",
-            "DELETE FROM dbos.workflow_output WHERE workflow_uuid = :r",
-            "DELETE FROM dbos.workflow_status WHERE workflow_uuid = :r",
+            "DELETE FROM dbos.operation_outputs WHERE workflow_uuid IN (:r, :p)",
+            "DELETE FROM dbos.workflow_input WHERE workflow_uuid IN (:r, :p)",
+            "DELETE FROM dbos.workflow_output WHERE workflow_uuid IN (:r, :p)",
+            "DELETE FROM dbos.workflow_status WHERE workflow_uuid IN (:r, :p)",
         ):
             owner.execute(sa.text(statement), params)
 
@@ -209,6 +223,82 @@ def test_a_run_killed_inside_a_step_runs_that_step_again_and_still_moves_once(
     assert invoice.model_calls() == 3, "at least once: the step ran again, and both runs cost"
     assert invoice.trail.verify(invoice.invoice_id)
     assert invoice.store.load(invoice.invoice_id).state is InvoiceState.PENDING_APPROVAL
+
+
+def test_a_run_killed_after_quickbooks_made_the_bill_recovers_with_that_one_bill(
+    invoice: Invoice,
+) -> None:
+    """Piece 5's crash: the bill exists, nothing here knows it, the process is gone.
+
+    The recovering process runs the post step again - DBOS never checkpointed
+    it - and finds the bill by its DocNumber instead of making a second.
+    """
+    assert invoice.child("finish").returncode == 0
+    assert invoice.store.load(invoice.invoice_id).state is InvoiceState.PENDING_APPROVAL
+
+    killed = invoice.child("approve-kill-post", invoice.post_run_id)
+
+    assert killed.returncode == KILLED, killed.stderr
+    assert len(invoice.qbo.bills) == 1, "QuickBooks holds the bill"
+    approved = invoice.store.load(invoice.invoice_id)
+    assert approved.state is InvoiceState.APPROVED
+    assert approved.erp_bill_id is None, "and nothing here knows it"
+    assert durable.workflow_status(invoice.post_run_id) == "PENDING"
+
+    recovered = invoice.child("finish", invoice.post_run_id)
+
+    assert recovered.returncode == 0, recovered.stderr
+    (bill,) = invoice.qbo.bills
+    rows = invoice.trail.read(invoice.invoice_id)
+    (erp,) = [row for row in rows if row.event_type is AuditEventType.ERP_WRITE]
+    assert erp.decision == "found", "found by DocNumber, not made again"
+    posts = [t for t in invoice.transitions() if t[0] is InvoiceState.APPROVED]
+    assert posts == [(InvoiceState.APPROVED, InvoiceState.POSTED)]
+    assert invoice.trail.verify(invoice.invoice_id)
+    final = invoice.store.load(invoice.invoice_id)
+    assert final.state is InvoiceState.CLOSED
+    assert final.erp_bill_id == bill["Id"]
+    with _engine("database_url").connect() as app:
+        stored = app.execute(
+            sa.text("SELECT erp_bill_id, erp_idempotency_key FROM invoices WHERE invoice_id = :i"),
+            {"i": invoice.invoice_id},
+        ).one()
+    assert stored.erp_bill_id == bill["Id"]
+    assert stored.erp_idempotency_key == f"bill:62:{bill['DocNumber']}"
+
+
+def test_two_invoices_cannot_hold_one_bill_key(invoice: Invoice) -> None:
+    """Revision 0007: the key is unique across invoices, whatever the code does."""
+    key = f"bill:62:{ULID()}"[:40]
+    invoice.store.claim_erp_key(invoice.invoice_id, key)
+    invoice.store.claim_erp_key(invoice.invoice_id, key)  # the same invoice again: fine
+    with pytest.raises(ErpKeyTakenError, match="different bill key"):
+        invoice.store.claim_erp_key(invoice.invoice_id, key + "X")
+    with _engine("database_url").connect() as app:
+        transaction = app.begin()
+        try:
+            other, document = str(ULID()), "e" * 64
+            app.execute(
+                sa.text(
+                    "INSERT INTO documents (sha256, storage_uri, media_type, byte_size) "
+                    "VALUES (:h, 'file:///other', 'application/pdf', 1)"
+                ),
+                {"h": document},
+            )
+            app.execute(
+                sa.text(
+                    "INSERT INTO invoices (invoice_id, document_sha256, state) "
+                    "VALUES (:o, :h, 'APPROVED')"
+                ),
+                {"o": other, "h": document},
+            )
+            with pytest.raises(IntegrityError, match="uq_invoices_erp_idempotency_key"):
+                app.execute(
+                    sa.text("UPDATE invoices SET erp_idempotency_key = :k WHERE invoice_id = :o"),
+                    {"k": key, "o": other},
+                )
+        finally:
+            transaction.rollback()
 
 
 def test_a_second_process_is_turned_away_while_the_invoice_is_held(invoice: Invoice) -> None:

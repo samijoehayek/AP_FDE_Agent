@@ -8,6 +8,7 @@ files.
 
 from __future__ import annotations
 
+import importlib
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -18,12 +19,15 @@ from PIL import Image, ImageFilter
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+from tests.qbo_fake import FakeQbo
 
 from ap_agent.config import get_settings
 from ap_agent.contracts.invoice import InvoiceExtraction, LineItem
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+CREATE_BILL_MODULE = importlib.import_module("ap_agent.tools.create_bill")
 
 SENTINEL_API_KEY = "sk-ant-api00-TEST-SENTINEL-not-a-real-key"
 """What the suite sees instead of a real key. Any request carrying it 401s."""
@@ -60,6 +64,20 @@ def no_live_api_credentials() -> Iterator[None]:
     yield
     patcher.undo()
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def fake_qbo(monkeypatch: pytest.MonkeyPatch) -> FakeQbo:
+    """Every test's QuickBooks, as far as ``create_bill`` can reach: a fake.
+
+    Autouse for the same reason as the credential sentinel above. A bill
+    posted by a test would not fail anything; it would sit in the sandbox
+    looking exactly like a real one.
+    """
+    fake = FakeQbo()
+    # By module path: the package re-exports the function under the module's name.
+    monkeypatch.setattr(CREATE_BILL_MODULE, "_client", lambda: fake)
+    return fake
 
 
 @pytest.fixture

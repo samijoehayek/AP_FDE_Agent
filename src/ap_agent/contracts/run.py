@@ -404,6 +404,17 @@ class InvoiceRecord(StrictModel):
         description="How many times a person has sent this invoice back through the match "
         "from PENDING_HUMAN. Bounded by loop_limits.max_rematches.",
     )
+    erp_idempotency_key: str | None = Field(
+        default=None,
+        max_length=128,
+        description="bill:<vendor_id>:<normalised invoice number>. The key create_bill "
+        "wrote to the invoice before calling QuickBooks.",
+    )
+    erp_bill_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="QuickBooks' id for the bill this invoice became. Set by POST@v1.",
+    )
 
     @property
     def date_candidates(self) -> list[date]:
